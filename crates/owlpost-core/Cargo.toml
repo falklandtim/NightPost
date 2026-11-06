@@ -1,0 +1,21 @@
+[package]
+name = "owlpost-core"
+description = "Mail sync engine, storage and models for OwlPost"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
+imap = "2.4.1"
+native-tls = "0.2"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls", "hostname"] }
+mail-parser = "0.11"
+html2text = "0.15"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+directories = "6"
