@@ -5,13 +5,13 @@ use crate::icons::{self, Icon, Item};
 use crate::onboarding::{AccountSetup, SetupAction};
 use crate::prefs::{ListSettings, Prefs, PrefsAction, SwipeAction, Tab, QUICK_ACTIONS_MIN_WIDTH};
 use crate::style::{self, Colors};
-use crate::worker::{Cmd, Event, FolderUse, Worker};
+use crate::worker::{AttachmentDo, Cmd, Event, FolderUse, PushState, Worker};
 use chrono::{DateTime, Utc};
 use eframe::egui::{self, Key, RichText, Sense};
 use owlpost_core::snooze::{self, SnoozePreset};
 use owlpost_core::theme::{self, Theme};
 use owlpost_core::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub const SHORTCUTS: &[(&str, &str)] = &[
@@ -169,6 +169,15 @@ pub struct OwlPostApp {
     /// Text typed into the Move / Label picker.
     picker_query: String,
     sigs: SignatureBook,
+    /// Attachments being downloaded: (message, attachment index).
+    downloading: HashSet<(MessageId, usize)>,
+    /// Push (IMAP IDLE) status per account.
+    push: HashMap<AccountId, PushState>,
+    /// A Google OAuth client is saved in the keychain.
+    google_ready: bool,
+    /// A "Sign in with Google" under way: its cancel flag and, once the
+    /// browser is open, the sign-in URL.
+    google: Option<(std::sync::Arc<std::sync::atomic::AtomicBool>, Option<String>)>,
 }
 
 const THEME_KEY: &str = "owlpost.theme";
@@ -247,6 +256,11 @@ impl OwlPostApp {
             list_default_width: 400.0,
             picker_query: String::new(),
             sigs: SignatureBook::default(),
+            downloading: HashSet::new(),
+            push: HashMap::new(),
+            // Tests never read the real keychain.
+            google_ready: !cfg!(test) && owlpost_core::oauth::GoogleClient::load().is_some(),
+            google: None,
         };
         app.reload();
         if app.accounts.iter().any(|a| !a.demo) {
@@ -580,6 +594,37 @@ impl OwlPostApp {
                 }
                 Event::Changed => changed = true,
                 Event::Error(e) => self.toast(e, true),
+                Event::Notice(s) => self.toast(s, false),
+                Event::GoogleWaiting(url) => {
+                    if let Some(g) = &mut self.google {
+                        g.1 = Some(url);
+                    }
+                }
+                Event::GoogleDone(r) => {
+                    self.google = None;
+                    match r {
+                        Ok(msg) => {
+                            if !msg.is_empty() {
+                                self.toast(msg, false);
+                            }
+                            self.reload();
+                        }
+                        Err(e) => {
+                            if !e.contains("cancelled") {
+                                self.toast(format!("Google sign-in: {e}"), true);
+                            }
+                            for s in [&mut self.welcome].into_iter().chain(self.setup.as_mut()) {
+                                s.error = Some(e.clone());
+                            }
+                        }
+                    }
+                }
+                Event::Push(id, st) => {
+                    self.push.insert(id, st);
+                }
+                Event::AttachmentDone(id, i) => {
+                    self.downloading.remove(&(id, i));
+                }
                 Event::Sent(s) => {
                     self.status.clear();
                     self.toast(s, false);
@@ -1569,6 +1614,8 @@ impl OwlPostApp {
                     .unwrap_or_default();
                 let thread_ref = (open.account_id, open.thread_key.clone());
                 let mut remove_label: Option<Folder> = None;
+                let mut attachment_req: Option<(Message, usize, AttachmentClick)> = None;
+                let downloading = self.downloading.clone();
                 let account = self.accounts.iter().find(|a| a.id == open.account_id).cloned();
 
                 let Some(open) = &mut self.open else { return };
@@ -1599,7 +1646,10 @@ impl OwlPostApp {
                         let n = open.messages.len();
                         for (i, m) in open.messages.iter().enumerate() {
                             let expanded = open.expanded.get(i).copied().unwrap_or(true);
-                            let r = message_card(ui, &col, m, expanded, i + 1 == n);
+                            let (r, clicked) = message_card(ui, &col, m, expanded, i + 1 == n, &downloading);
+                            if let Some((idx, what)) = clicked {
+                                attachment_req = Some((m.clone(), idx, what));
+                            }
                             if r && i + 1 != n {
                                 if let Some(e) = open.expanded.get_mut(i) {
                                     *e = !*e;
@@ -1620,10 +1670,49 @@ impl OwlPostApp {
                 if let Some(f) = remove_label {
                     self.set_label(thread_ref.0, &thread_ref.1, &f, false);
                 }
+                if let Some((m, idx, what)) = attachment_req {
+                    self.attachment(m, idx, what);
+                }
                 if let Some(mode) = ctx.memory_mut(|m| m.data.remove_temp::<u8>(egui::Id::new("reply_click"))) {
                     self.compose_reply(mode);
                 }
             });
+    }
+
+    /// Start "Sign in with Google" (one at a time).
+    fn google_sign_in(&mut self, target: Option<AccountId>) {
+        if self.google.is_some() {
+            return;
+        }
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.worker.send(Cmd::GoogleSignIn(target, cancel.clone()));
+        self.google = Some((cancel, None));
+    }
+
+    fn cancel_google(&mut self) {
+        if let Some((cancel, _)) = self.google.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Open or save a received attachment (downloaded on a worker thread).
+    fn attachment(&mut self, m: Message, index: usize, what: AttachmentClick) {
+        let Some(a) = m.attachments.get(index) else { return };
+        let what = match what {
+            AttachmentClick::Open => AttachmentDo::Open,
+            AttachmentClick::SaveToDownloads => AttachmentDo::SaveToDownloads,
+            AttachmentClick::SaveAs => {
+                let mut dialog = rfd::FileDialog::new().set_title("Save Attachment").set_file_name(engine::safe_filename(&a.filename));
+                if let Some(d) = directories::UserDirs::new().and_then(|u| u.download_dir().map(|d| d.to_path_buf())) {
+                    dialog = dialog.set_directory(d);
+                }
+                let Some(path) = dialog.save_file() else { return };
+                AttachmentDo::SaveTo(path)
+            }
+        };
+        if self.downloading.insert((m.id, index)) {
+            self.worker.send(Cmd::Attachment(Box::new(m), index, what));
+        }
     }
 
     fn snooze_popup(&mut self, ui: &mut egui::Ui, btn: &egui::Response, col: &Colors, snoozed: Option<DateTime<Utc>>) {
@@ -1665,7 +1754,7 @@ impl OwlPostApp {
                 if !self.snooze_custom.trim().is_empty() {
                     match &parsed {
                         Ok(t) => {
-                            ui.label(RichText::new(format!("→ {}", snooze::describe(*t))).small().color(col.success));
+                            ui.label(RichText::new(format!("until {}", snooze::describe(*t))).small().color(col.success));
                         }
                         Err(_) => {
                             ui.label(RichText::new("Not sure when that is").small().color(col.error));
@@ -1725,8 +1814,16 @@ impl OwlPostApp {
         }
         // Add-account window.
         if let Some(setup) = &mut self.setup {
+            setup.google_ready = self.google_ready;
+            setup.google_waiting = self.google.is_some();
             match setup.window(ctx, &col) {
                 SetupAction::Submit(a, pw) => self.worker.send(Cmd::AddAccount(a, pw)),
+                SetupAction::Google => self.google_sign_in(None),
+                SetupAction::CancelGoogle => self.cancel_google(),
+                SetupAction::GoogleSettings => {
+                    self.setup = None;
+                    self.prefs = Some(Prefs::new(Tab::Accounts));
+                }
                 SetupAction::Cancel => self.setup = None,
                 SetupAction::Demo => {
                     let _ = demo::seed(&self.store);
@@ -1738,6 +1835,9 @@ impl OwlPostApp {
         }
         // Preferences.
         if let Some(prefs) = &mut self.prefs {
+            prefs.push = self.push.clone();
+            prefs.google_ready = self.google_ready;
+            prefs.google_waiting = self.google.as_ref().map(|g| g.1.clone());
             let act = prefs.ui(ctx, &col, &self.themes, &self.theme_id, &self.accounts, &mut self.list_settings, &self.sigs);
             match act {
                 PrefsAction::None => {}
@@ -1779,6 +1879,22 @@ impl OwlPostApp {
                     let _ = self.store.remove_account(id);
                     self.set_selection(Selection::Unified(FolderRole::Inbox));
                 }
+                PrefsAction::SaveGoogleClient(id, secret) => {
+                    let r = owlpost_core::oauth::GoogleClient { id, secret }.save();
+                    self.google_ready = r.is_ok() || self.google_ready;
+                    if let Some(p) = &mut self.prefs {
+                        p.message = Some(match r {
+                            Ok(()) => (true, "Google sign-in is set up — use Sign in with Google to add or switch an account".into()),
+                            Err(e) => (false, format!("{e:#}")),
+                        });
+                    }
+                }
+                PrefsAction::ClearGoogleClient => {
+                    owlpost_core::oauth::GoogleClient::clear();
+                    self.google_ready = false;
+                }
+                PrefsAction::GoogleSignIn(target) => self.google_sign_in(target),
+                PrefsAction::CancelGoogle => self.cancel_google(),
                 PrefsAction::SaveAccount(a) => {
                     let _ = self.store.update_account(&a);
                     if let Some(p) = &mut self.prefs {
@@ -1996,8 +2112,26 @@ fn nav_item(ui: &mut egui::Ui, col: &Colors, icon: &str, label: &str, count: i64
 }
 
 /// Returns true when the header was clicked (toggle expand).
-fn message_card(ui: &mut egui::Ui, col: &Colors, m: &Message, expanded: bool, is_last: bool) -> bool {
+/// What was asked of an attachment chip in the reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachmentClick {
+    Open,
+    SaveToDownloads,
+    SaveAs,
+}
+
+/// One message in the reader. Returns whether its header was clicked
+/// (to fold it) and any attachment that was clicked.
+fn message_card(
+    ui: &mut egui::Ui,
+    col: &Colors,
+    m: &Message,
+    expanded: bool,
+    is_last: bool,
+    downloading: &HashSet<(MessageId, usize)>,
+) -> (bool, Option<(usize, AttachmentClick)>) {
     let mut toggled = false;
+    let mut clicked = None;
     egui::Frame::new()
         .fill(col.bg)
         .stroke(egui::Stroke::new(1.0_f32, col.border))
@@ -2041,23 +2175,65 @@ fn message_card(ui: &mut egui::Ui, col: &Colors, m: &Message, expanded: bool, is
                 if !m.attachments.is_empty() {
                     ui.add_space(10.0);
                     ui.horizontal_wrapped(|ui| {
-                        for a in &m.attachments {
-                            egui::Frame::new()
-                                .fill(col.bg_secondary)
-                                .stroke(egui::Stroke::new(1.0_f32, col.border))
-                                .corner_radius(6)
-                                .inner_margin(egui::Margin::symmetric(10, 6))
-                                .show(ui, |ui| {
-                                    ui.label(format!("📎 {}", a.filename));
-                                    ui.label(RichText::new(human_size(a.size)).small().color(col.subtle));
-                                });
+                        for (i, a) in m.attachments.iter().enumerate() {
+                            if let Some(what) = attachment_chip(ui, col, a, downloading.contains(&(m.id, i)), (m.id, i)) {
+                                clicked = Some((i, what));
+                            }
                         }
                     });
                 }
             }
         });
-    toggled
+    (toggled, clicked)
 }
+
+/// A received attachment: click to open, right-click for Save options.
+fn attachment_chip(ui: &mut egui::Ui, col: &Colors, a: &Attachment, busy: bool, salt: (MessageId, usize)) -> Option<AttachmentClick> {
+    let id = ui.id().with(("attachment", salt));
+    let hovered = ui.ctx().memory(|mem| mem.data.get_temp::<bool>(id)).unwrap_or(false);
+    let fill = if hovered { style::blend(col.text, col.bg_secondary, 0.07) } else { col.bg_secondary };
+    let inner = egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0_f32, col.border))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if busy {
+                    ui.add(egui::Spinner::new().size(14.0).color(col.subtle));
+                } else {
+                    ui.label(RichText::new("📎").color(col.subtle));
+                }
+                ui.label(RichText::new(&a.filename).color(col.text));
+                ui.label(RichText::new(human_size(a.size)).small().color(col.subtle));
+            });
+        });
+    let r = ui
+        .interact(inner.response.rect, id.with("click"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(if busy { "Downloading…" } else { "Click to open · right-click to save" });
+    ui.ctx().memory_mut(|mem| mem.data.insert_temp(id, r.hovered()));
+    let mut what = None;
+    if r.clicked() && !busy {
+        what = Some(AttachmentClick::Open);
+    }
+    r.context_menu(|ui| {
+        if ui.button("Open").clicked() {
+            what = Some(AttachmentClick::Open);
+            ui.close();
+        }
+        if ui.button("Save to Downloads").clicked() {
+            what = Some(AttachmentClick::SaveToDownloads);
+            ui.close();
+        }
+        if ui.button("Save As…").clicked() {
+            what = Some(AttachmentClick::SaveAs);
+            ui.close();
+        }
+    });
+    what
+}
+
 
 /// Render a plain-text body: quoted lines dimmed, links clickable.
 fn body(ui: &mut egui::Ui, col: &Colors, text: &str) {
@@ -2142,8 +2318,13 @@ impl OwlPostApp {
         if self.accounts.is_empty() {
             let col = self.colors.clone();
             egui::CentralPanel::default().frame(egui::Frame::new().fill(col.bg_secondary)).show(ctx, |ui| {
+                self.welcome.google_ready = self.google_ready;
+                self.welcome.google_waiting = self.google.is_some();
                 egui::ScrollArea::vertical().show(ui, |ui| match self.welcome.welcome(ui, &col) {
                     SetupAction::Submit(a, pw) => self.worker.send(Cmd::AddAccount(a, pw)),
+                    SetupAction::Google => self.google_sign_in(None),
+                    SetupAction::CancelGoogle => self.cancel_google(),
+                    SetupAction::GoogleSettings => self.prefs = Some(Prefs::new(Tab::Accounts)),
                     SetupAction::Demo => {
                         let _ = demo::seed(&self.store);
                         self.reload();
@@ -2200,6 +2381,12 @@ mod ui_tests {
         c.apply(&h.ctx);
         install_image_loaders(&h.ctx);
         h
+    }
+
+    fn save_ui(h: &mut Harness<'static>, name: &str) {
+        if let Ok(img) = h.render() {
+            img.save(shots_dir().join(format!("{name}.png"))).unwrap();
+        }
     }
 
     fn save(h: &mut Harness<'static, OwlPostApp>, name: &str) {
@@ -2550,6 +2737,120 @@ mod ui_tests {
         h.state_mut().composers[0].attachments.pop();
         h.run_steps(2);
         assert_eq!(h.state().composers[0].draft().attachments.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_received_attachment() {
+        use egui_kittest::kittest::Queryable;
+        let cache = std::env::temp_dir().join(format!("sp-ui-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        std::env::set_var("OWLPOST_CACHE", &cache);
+        let mut h = harness("owlpost-light");
+        h.run_steps(3);
+        let idx = h.state().rows.iter().position(|r| r.t.subject.contains("receipt")).unwrap();
+        h.state_mut().select(idx);
+        h.run_steps(3);
+        let at = h.get_by_label("receipt.pdf").rect().center();
+        h.hover_at(at);
+        h.run_steps(2);
+        save(&mut h, "attachment-hover");
+        // Click: downloaded (a stand-in for demo mail), cached, then opened.
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        h.run_steps(1);
+        assert_eq!(h.state().downloading.len(), 1, "shows as downloading");
+        for _ in 0..100 {
+            h.run_steps(1);
+            if h.state().downloading.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(h.state().downloading.is_empty());
+        assert!(h.state().toasts.iter().all(|t| !t.error), "{:?}", h.state().toasts.iter().map(|t| &t.text).collect::<Vec<_>>());
+        let cached: Vec<_> = std::fs::read_dir(cache.join("attachments")).unwrap().flatten().flat_map(|d| std::fs::read_dir(d.path()).unwrap().flatten()).collect();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].file_name(), "receipt.pdf");
+        assert!(std::fs::read(cached[0].path()).unwrap().starts_with(b"%PDF"));
+        // Right-click offers the save options.
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: true, modifiers: Default::default() });
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: false, modifiers: Default::default() });
+        h.run_steps(2);
+        assert!(h.query_by_label("Save to Downloads").is_some() && h.query_by_label("Save As…").is_some());
+        save(&mut h, "attachment-menu");
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn push_status_lines() {
+        use crate::worker::PushState;
+        let palette = theme::discover().into_iter().find(|t| t.id == "owlpost-light").unwrap().palette();
+        let col = Colors::new(palette);
+        let states = [
+            Some(PushState::Live),
+            Some(PushState::Connecting),
+            Some(PushState::Retrying("connecting to imap.mail.me.com:993: timed out".into())),
+            Some(PushState::Unavailable("the server doesn't support it".into())),
+        ];
+        let mut h = Harness::builder().with_size(egui::vec2(360.0, 120.0)).build_ui(move |ui| {
+            col.apply(ui.ctx());
+            for st in &states {
+                crate::prefs::push_line(ui, &col, st.as_ref());
+            }
+        });
+        h.run_steps(2);
+        save_ui(&mut h, "push-status");
+        use egui_kittest::kittest::Queryable;
+        for text in ["New mail: instant (push)", "New mail: connecting push…", "New mail: reconnecting push…", "New mail: every 5 minutes"] {
+            assert!(h.query_by_label(text).is_some(), "{text}");
+        }
+    }
+
+    #[test]
+    fn google_sign_in_screens() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness("owlpost-light");
+        h.run_steps(2);
+        assert!(!h.state().google_ready, "tests never read the real keychain");
+        h.state_mut().prefs = Some(Prefs::new(Tab::Accounts));
+        h.run_steps(3);
+        assert!(h.query_by_label("Client ID").is_some());
+        assert!(h.query_by_label("How to create a Google client").is_some());
+        save(&mut h, "prefs-google-setup");
+        // Set up: the sign-in button appears.
+        h.state_mut().google_ready = true;
+        h.run_steps(3);
+        assert!(h.query_by_label("Sign in with Google…").is_some());
+        save(&mut h, "prefs-google-ready");
+        // Signing in: waiting for the browser.
+        h.state_mut().google = Some((Default::default(), Some("https://accounts.google.com/o/oauth2/v2/auth?x".into())));
+        h.run_steps(3);
+        assert!(h.query_by_label("Finish signing in in your browser…").is_some());
+        save(&mut h, "prefs-google-waiting");
+        h.state_mut().cancel_google();
+        h.state_mut().prefs = None;
+        // The add-account window for Gmail.
+        h.state_mut().setup = Some(AccountSetup { provider: Some(owlpost_core::presets::Provider::Gmail), ..Default::default() });
+        h.run_steps(3);
+        assert!(h.query_by_label("Sign in with Google").is_some());
+        assert!(h.query_by_label("…or connect with an app password:").is_some());
+        save(&mut h, "setup-gmail-google");
+    }
+
+    #[test]
+    fn unused_download_names() {
+        let dir = std::env::temp_dir().join(format!("sp-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(crate::worker::unused_path(&dir, "a.pdf"), dir.join("a.pdf"));
+        std::fs::write(dir.join("a.pdf"), b"x").unwrap();
+        assert_eq!(crate::worker::unused_path(&dir, "a.pdf"), dir.join("a (2).pdf"));
+        std::fs::write(dir.join("a (2).pdf"), b"x").unwrap();
+        assert_eq!(crate::worker::unused_path(&dir, "a.pdf"), dir.join("a (3).pdf"));
+        std::fs::write(dir.join("README"), b"x").unwrap();
+        assert_eq!(crate::worker::unused_path(&dir, "README"), dir.join("README (2)"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

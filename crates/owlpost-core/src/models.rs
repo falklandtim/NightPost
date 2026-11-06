@@ -17,6 +17,32 @@ pub enum Security {
     None,
 }
 
+/// How an account signs in to its IMAP and SMTP servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Auth {
+    /// A password (for iCloud and Gmail, an app-specific password), kept in the keychain.
+    #[default]
+    Password,
+    /// "Sign in with Google" (OAuth 2.0): a refresh token in the keychain,
+    /// exchanged for short-lived access tokens (XOAUTH2).
+    Google,
+}
+
+impl Auth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Auth::Password => "password",
+            Auth::Google => "google",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "google" => Auth::Google,
+            _ => Auth::Password,
+        }
+    }
+}
+
 impl Security {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -64,6 +90,8 @@ pub struct Account {
     pub signature: String,
     /// Demo accounts are seeded locally and never touch the network.
     pub demo: bool,
+    #[serde(default)]
+    pub auth: Auth,
 }
 
 impl Account {

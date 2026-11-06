@@ -16,6 +16,10 @@ pub struct AccountSetup {
     pub advanced: bool,
     pub busy: bool,
     pub error: Option<String>,
+    /// A Google OAuth client is set up (set by the app).
+    pub google_ready: bool,
+    /// A Google sign-in is waiting for the browser (set by the app).
+    pub google_waiting: bool,
 }
 
 pub enum SetupAction {
@@ -23,6 +27,11 @@ pub enum SetupAction {
     Submit(Box<Account>, String),
     Demo,
     Cancel,
+    /// Start "Sign in with Google" in the browser.
+    Google,
+    CancelGoogle,
+    /// Open Preferences → Accounts to set up the Google client.
+    GoogleSettings,
 }
 
 impl Default for AccountSetup {
@@ -38,6 +47,8 @@ impl Default for AccountSetup {
             advanced: false,
             busy: false,
             error: None,
+            google_ready: false,
+            google_waiting: false,
         }
     }
 }
@@ -105,6 +116,7 @@ impl AccountSetup {
             color: p.color().into(),
             signature: String::new(),
             demo: false,
+            auth: owlpost_core::Auth::Password,
         }
     }
 
@@ -160,20 +172,44 @@ impl AccountSetup {
             }
             ui.add_space(14.0);
             if welcome
-                && ui.link("Just looking? Explore OwlPost with a demo mailbox →").clicked() {
+                && ui.link("Just looking? Explore OwlPost with a demo mailbox").clicked() {
                     act = SetupAction::Demo;
                 }
             return act;
         };
 
         ui.horizontal(|ui| {
-            if ui.button("← Back").clicked() {
+            if ui.button("Back").clicked() {
                 self.provider = None;
                 self.error = None;
             }
             ui.label(RichText::new(provider.label()).strong().size(16.0));
         });
         ui.add_space(8.0);
+        if provider == Provider::Gmail {
+            ui.horizontal(|ui| {
+                if self.google_waiting {
+                    ui.spinner();
+                    ui.label("Finish signing in in your browser…");
+                    if ui.button("Cancel").clicked() {
+                        act = SetupAction::CancelGoogle;
+                    }
+                } else if self.google_ready {
+                    if style::primary_button(ui, col, "Sign in with Google").on_hover_text("Sign in in your browser — no app password needed").clicked() {
+                        self.error = None;
+                        act = SetupAction::Google;
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Button::new("Sign in with Google"));
+                    if ui.link("Set up Google sign-in first").on_hover_text("Preferences > Accounts").clicked() {
+                        act = SetupAction::GoogleSettings;
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.label(RichText::new("…or connect with an app password:").small().color(col.subtle));
+            ui.add_space(4.0);
+        }
         let form_w = 420.0;
         ui.allocate_ui(egui::vec2(form_w, 0.0), |ui| {
             egui::Grid::new("acct").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
@@ -199,6 +235,15 @@ impl AccountSetup {
             });
             ui.add_space(4.0);
             ui.label(RichText::new(provider.password_help()).small().color(col.subtle));
+            match provider {
+                Provider::ICloud => {
+                    ui.hyperlink_to("Create an app-specific password at account.apple.com ↗", "https://account.apple.com/account/manage");
+                }
+                Provider::Gmail => {
+                    ui.hyperlink_to("Create an app password at myaccount.google.com ↗", "https://myaccount.google.com/apppasswords");
+                }
+                _ => {}
+            }
             ui.add_space(6.0);
             ui.checkbox(&mut self.advanced, "Show server settings");
             if self.advanced {

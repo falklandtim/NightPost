@@ -17,20 +17,28 @@ type Session = imap::Session<native_tls::TlsStream<TcpStream>>;
 pub const INITIAL_WINDOW: usize = 300;
 const FETCH_CHUNK: usize = 25;
 
+/// Connect and sign in, by password or Google sign-in as the account uses.
 pub fn connect(account: &Account) -> Result<Session> {
-    let password = credentials::get_password(&account.email)?;
-    connect_with(account, &password)
+    match account.auth {
+        Auth::Password => connect_with(account, &credentials::get_password(&account.email)?),
+        Auth::Google => crate::oauth::imap_login(open_client(account)?, account).with_context(|| format!("signing in {}", account.email)),
+    }
 }
 
-pub fn connect_with(account: &Account, password: &str) -> Result<Session> {
+fn open_client(account: &Account) -> Result<imap::Client<native_tls::TlsStream<TcpStream>>> {
     let tls = native_tls::TlsConnector::builder().build()?;
     let s = &account.imap;
-    let client = match s.security {
+    match s.security {
         Security::Tls => imap::connect((s.host.as_str(), s.port), &s.host, &tls),
         Security::StartTls => imap::connect_starttls((s.host.as_str(), s.port), &s.host, &tls),
         Security::None => return Err(anyhow!("unencrypted IMAP is not supported")),
     }
-    .with_context(|| format!("connecting to {}:{}", s.host, s.port))?;
+    .with_context(|| format!("connecting to {}:{}", s.host, s.port))
+}
+
+/// Connect with a password (account setup checks one before saving it).
+pub fn connect_with(account: &Account, password: &str) -> Result<Session> {
+    let client = open_client(account)?;
     let session = client
         .login(&account.username, password)
         .map_err(|(e, _)| anyhow!("IMAP login failed for {}: {e}", account.username))?;
@@ -48,6 +56,21 @@ pub fn test_login(account: &Account, password: &str) -> Result<()> {
 pub enum SyncProgress {
     Folder { account_id: AccountId, name: String, done: usize, total: usize },
     NewMessages { account_id: AccountId, count: usize },
+}
+
+/// Sync just the Inbox, after a push from the server. Falls back to a full
+/// sync if the folders haven't been discovered yet.
+pub fn sync_inbox(store: &Store, account: &Account) -> Result<usize> {
+    if account.demo {
+        return Ok(0);
+    }
+    let Some(inbox) = store.folder_by_role(account.id, FolderRole::Inbox)? else {
+        return sync_account(store, account, |_| {});
+    };
+    let mut session = connect(account)?;
+    let n = sync_folder(store, &mut session, account, &inbox)?;
+    let _ = session.logout();
+    Ok(n)
 }
 
 /// Full sync of one account: folder list, new messages, flag changes, deletions.
@@ -365,11 +388,15 @@ pub fn send(store: &Store, account: &Account, out: &OutgoingMessage) -> Result<S
     if account.demo {
         return demo_send(store, account, out);
     }
-    let password = credentials::get_password(&account.email)?;
-    let (id, raw) = smtp::send(account, &password, out)?;
+    // A password, or for Google sign-in a fresh access token.
+    let secret = match account.auth {
+        Auth::Password => credentials::get_password(&account.email)?,
+        Auth::Google => crate::oauth::access_token(account)?,
+    };
+    let (id, raw) = smtp::send(account, &secret, out)?;
     if !smtp::server_saves_sent_copy(account) {
         if let Some(sent) = store.folder_by_role(account.id, FolderRole::Sent)? {
-            match connect_with(account, &password) {
+            match connect(account) {
                 Ok(mut s) => {
                     if let Err(e) = s.append_with_flags(&sent.path, &raw, &[imap::types::Flag::Seen]) {
                         log::warn!("could not save to Sent: {e}");
@@ -398,9 +425,172 @@ fn demo_send(store: &Store, account: &Account, out: &OutgoingMessage) -> Result<
     Ok(id)
 }
 
+/// Where downloaded attachments are kept, e.g.
+/// `~/Library/Caches/co.timson.OwlPost/attachments`. It's a cache: the
+/// server keeps the real copy, and macOS may clear this folder.
+pub fn attachment_cache_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("OWLPOST_CACHE") {
+        return std::path::PathBuf::from(p).join("attachments");
+    }
+    directories::ProjectDirs::from("co", "timson", "OwlPost")
+        .map(|d| d.cache_dir().join("attachments"))
+        .unwrap_or_else(|| std::env::temp_dir().join("owlpost-attachments"))
+}
+
+/// A file name that's safe on every OS (no path separators or reserved
+/// characters), keeping the extension.
+pub fn safe_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_control() || r#"/\:*?"<>|"#.contains(c) { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').to_string();
+    if cleaned.is_empty() { "attachment".into() } else { cleaned }
+}
+
+/// The cached copy of attachment `index` of `m`: downloaded from the server
+/// the first time, then reused.
+pub fn attachment_file(store: &Store, account: &Account, m: &Message, index: usize) -> Result<std::path::PathBuf> {
+    attachment_file_in(&attachment_cache_dir(), store, account, m, index)
+}
+
+pub fn attachment_file_in(cache: &std::path::Path, store: &Store, account: &Account, m: &Message, index: usize) -> Result<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let meta = m.attachments.get(index).ok_or_else(|| anyhow!("that attachment no longer exists"))?;
+    // Keyed by Message-ID, so it survives the message moving folders.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (&m.message_id, m.account_id).hash(&mut h);
+    let dir = cache.join(format!("{:016x}-{index}", h.finish()));
+    let path = dir.join(safe_filename(&meta.filename));
+    if path.is_file() {
+        return Ok(path);
+    }
+    let data = if account.demo { demo_attachment(&meta.filename) } else { download_attachment(store, account, m, index)? };
+    std::fs::create_dir_all(&dir)?;
+    // Write then rename, so a half-finished download is never opened.
+    let tmp = dir.join(format!(".{}.part", std::process::id()));
+    std::fs::write(&tmp, &data)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Fetch the message again and pull out one attachment.
+fn download_attachment(store: &Store, account: &Account, m: &Message, index: usize) -> Result<Vec<u8>> {
+    let folder = store.folder(m.folder_id)?.ok_or_else(|| anyhow!("the message's folder no longer exists"))?;
+    let mut s = connect(account)?;
+    s.select(&folder.path)?;
+    let fetches = s.uid_fetch(m.uid.to_string(), "BODY.PEEK[]")?;
+    let raw = fetches
+        .iter()
+        .find_map(|f| f.body().map(<[u8]>::to_vec))
+        .ok_or_else(|| anyhow!("the message is no longer on the server — try syncing"))?;
+    let _ = s.logout();
+    attachment_from_raw(&raw, index, &m.attachments[index].filename)
+}
+
+/// Attachment `index` of a raw message (matched by name if the order differs).
+pub fn attachment_from_raw(raw: &[u8], index: usize, filename: &str) -> Result<Vec<u8>> {
+    let msg = mail_parser::MessageParser::default().parse(raw).ok_or_else(|| anyhow!("couldn't read the message"))?;
+    let name = |a: &mail_parser::MessagePart| mail_parser::MimeHeaders::attachment_name(a).unwrap_or("attachment").to_string();
+    let parts: Vec<_> = msg.attachments().collect();
+    let part = parts
+        .get(index)
+        .filter(|a| name(a) == filename)
+        .or_else(|| parts.iter().find(|a| name(a) == filename))
+        .ok_or_else(|| anyhow!("couldn't find {filename} in the message"))?;
+    Ok(part.contents().to_vec())
+}
+
+/// Demo accounts have no server: make a stand-in file to open.
+fn demo_attachment(filename: &str) -> Vec<u8> {
+    if filename.to_ascii_lowercase().ends_with(".pdf") {
+        // A minimal one-page PDF that says what it is.
+        let text = "(OwlPost demo attachment) Tj";
+        let content = format!("BT /F1 24 Tf 72 720 Td {text} ET");
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = vec![];
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1));
+        for off in offsets {
+            pdf.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1));
+        return pdf.into_bytes();
+    }
+    format!("This is a stand-in for {filename}, attached to a demo message in OwlPost.\n").into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachments_download_once_and_cache() {
+        let p = crate::test_db_path("sp-att");
+        let store = Store::open(&p).unwrap();
+        crate::demo::seed(&store).unwrap();
+        let account = store.accounts().unwrap().into_iter().find(|a| a.demo).unwrap();
+        let inbox = store.folder_by_role(account.id, FolderRole::Inbox).unwrap().unwrap();
+        let threads = store.threads(&MailboxView::Folder(inbox.id), "has:attachment", 10).unwrap();
+        let m = threads
+            .iter()
+            .flat_map(|t| store.thread_messages(account.id, &t.thread_key).unwrap())
+            .find(|m| m.attachments.iter().any(|a| a.filename.ends_with(".pdf")))
+            .expect("a demo message with a PDF");
+        let cache = std::env::temp_dir().join(format!("sp-att-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        let path = attachment_file_in(&cache, &store, &account, &m, 0).unwrap();
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), safe_filename(&m.attachments[0].filename));
+        assert!(std::fs::read(&path).unwrap().starts_with(b"%PDF-1.4"));
+        // Second time comes from the cache.
+        std::fs::write(&path, b"cached").unwrap();
+        assert_eq!(std::fs::read(attachment_file_in(&cache, &store, &account, &m, 0).unwrap()).unwrap(), b"cached");
+        assert!(attachment_file_in(&cache, &store, &account, &m, 5).is_err());
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn finds_attachments_in_raw_messages() {
+        use crate::smtp::{build, OutgoingAttachment, OutgoingMessage};
+        let account = Account {
+            id: 1,
+            display_name: "A".into(),
+            email: "a@example.com".into(),
+            username: "a@example.com".into(),
+            imap: ServerConfig { host: "imap.example.com".into(), port: 993, security: Security::Tls },
+            smtp: ServerConfig { host: "smtp.example.com".into(), port: 465, security: Security::Tls },
+            color: "#000".into(),
+            signature: String::new(),
+            demo: false,
+            auth: Auth::Password,
+        };
+        let out = OutgoingMessage {
+            to: vec![Contact::new("B", "b@example.com")],
+            body: "hi".into(),
+            attachments: vec![OutgoingAttachment::new("one.txt", b"first".to_vec()), OutgoingAttachment::new("two.bin", vec![0, 1, 2, 255])],
+            ..Default::default()
+        };
+        let raw = build(&account, &out).unwrap().1;
+        assert_eq!(attachment_from_raw(&raw, 1, "two.bin").unwrap(), [0, 1, 2, 255]);
+        assert_eq!(attachment_from_raw(&raw, 0, "one.txt").unwrap(), b"first");
+        // Order changed on the server: found by name.
+        assert_eq!(attachment_from_raw(&raw, 0, "two.bin").unwrap(), [0, 1, 2, 255]);
+        assert!(attachment_from_raw(&raw, 0, "missing.pdf").is_err());
+        assert_eq!(safe_filename("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(safe_filename("Q3: plan?.pdf"), "Q3_ plan_.pdf");
+        assert_eq!(safe_filename(""), "attachment");
+    }
 
     #[test]
     fn gmail_archive_keeps_labels() {

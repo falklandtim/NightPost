@@ -74,10 +74,10 @@ impl Provider {
     pub fn password_help(self) -> &'static str {
         match self {
             Provider::Gmail => "Google requires an App Password: turn on 2-Step Verification, then create one at myaccount.google.com/apppasswords. IMAP must be enabled in Gmail settings.",
-            Provider::ICloud => "iCloud requires an app-specific password: create one at account.apple.com → Sign-In and Security → App-Specific Passwords. Use your full @icloud.com address as the username.",
+            Provider::ICloud => "iCloud requires an app-specific password: create one at account.apple.com > Sign-In and Security > App-Specific Passwords. Use your full @icloud.com address as the username.",
             Provider::Outlook => "Use your account password, or an app password if two-step verification is on.",
-            Provider::Yahoo => "Yahoo requires an app password: Account Security → Generate app password.",
-            Provider::Fastmail => "Create an app password under Settings → Privacy & Security → App passwords.",
+            Provider::Yahoo => "Yahoo requires an app password: Account Security > Generate app password.",
+            Provider::Fastmail => "Create an app password under Settings > Privacy & Security > App passwords.",
             Provider::Custom => "Enter the IMAP and SMTP details from your mail provider.",
         }
     }

@@ -4,7 +4,8 @@ use crate::style::{self, Colors};
 use eframe::egui::{self, RichText};
 use owlpost_core::theme::{Theme, ThemeSource};
 use crate::composer::SignatureBook;
-use owlpost_core::{Account, AccountId, Signature};
+use crate::worker::PushState;
+use owlpost_core::{Account, AccountId, Auth, Signature};
 
 /// What a swipe on a conversation in the list does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,6 +100,15 @@ pub struct Prefs {
     pub message: Option<(bool, String)>,
     /// The signature open in the editor (an edited copy).
     pub sig_edit: Option<Signature>,
+    /// Push status per account (kept up to date by the app).
+    pub push: std::collections::HashMap<AccountId, PushState>,
+    /// A Google OAuth client is saved (set by the app).
+    pub google_ready: bool,
+    /// A Google sign-in is under way: the sign-in URL once the browser opened.
+    pub google_waiting: Option<Option<String>>,
+    google_id: String,
+    google_secret: String,
+    google_edit: bool,
 }
 
 pub enum PrefsAction {
@@ -114,12 +124,18 @@ pub enum PrefsAction {
     SaveSignature(Signature),
     DeleteSignature(i64),
     SetDefaultSignature(AccountId, Option<i64>),
+    /// Save the Google OAuth client (ID, secret).
+    SaveGoogleClient(String, String),
+    ClearGoogleClient,
+    /// Sign in with Google: a new account (None) or switch/renew one.
+    GoogleSignIn(Option<AccountId>),
+    CancelGoogle,
     Close,
 }
 
 impl Prefs {
     pub fn new(tab: Tab) -> Self {
-        Self { tab, install_path: String::new(), editing: None, message: None, sig_edit: None }
+        Self { tab, install_path: String::new(), editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false }
     }
 
     #[allow(clippy::too_many_arguments)] // one window, one call site
@@ -333,6 +349,10 @@ impl Prefs {
 
     fn accounts(&mut self, ui: &mut egui::Ui, col: &Colors, accounts: &[Account], sigs: &SignatureBook) -> PrefsAction {
         let mut act = PrefsAction::None;
+        if let Some(a) = self.google_section(ui, col) {
+            act = a;
+        }
+        ui.add_space(8.0);
         for a in accounts {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -345,6 +365,12 @@ impl Prefs {
                                 .small()
                                 .color(col.subtle),
                         );
+                        if !a.demo {
+                            push_line(ui, col, self.push.get(&a.id));
+                        }
+                        if a.auth == Auth::Google {
+                            ui.label(RichText::new("Signs in with Google").small().color(col.subtle));
+                        }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Remove").clicked() {
@@ -352,6 +378,19 @@ impl Prefs {
                         }
                         if ui.button("Edit").clicked() {
                             self.editing = Some(a.clone());
+                        }
+                        if !a.demo && a.is_gmail() && self.google_waiting.is_none() {
+                            let label = if a.auth == Auth::Google { "Sign in again" } else { "Use Google sign-in" };
+                            let tip = if a.auth == Auth::Google {
+                                "Sign in with Google again (if access was revoked or has expired)"
+                            } else {
+                                "Sign in with Google in your browser instead of an app password"
+                            };
+                            let r = ui.add_enabled(self.google_ready, egui::Button::new(label));
+                            let r = if self.google_ready { r.on_hover_text(tip) } else { r.on_disabled_hover_text("Set up Google sign-in above first") };
+                            if r.clicked() {
+                                act = PrefsAction::GoogleSignIn(Some(a.id));
+                            }
                         }
                     });
                 });
@@ -547,4 +586,113 @@ fn list_settings(ui: &mut egui::Ui, col: &Colors, list: &mut ListSettings) {
         .small()
         .color(col.subtle),
     );
+}
+
+impl Prefs {
+    /// Google sign-in: the OAuth client (set up once), and the sign-in button.
+    fn google_section(&mut self, ui: &mut egui::Ui, col: &Colors) -> Option<PrefsAction> {
+        let mut act = None;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Sign in with Google").strong());
+            if let Some(url) = &self.google_waiting {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Finish signing in in your browser…");
+                    if ui.button("Cancel").clicked() {
+                        act = Some(PrefsAction::CancelGoogle);
+                    }
+                    if let Some(url) = url {
+                        if ui.small_button("Copy link").on_hover_text("If the browser didn't open, paste this into it").clicked() {
+                            ui.ctx().copy_text(url.clone());
+                        }
+                    }
+                });
+                return;
+            }
+            if self.google_ready && !self.google_edit {
+                ui.label(
+                    RichText::new("Gmail and Google Workspace accounts can sign in through Google in your browser — no app passwords.")
+                        .small()
+                        .color(col.subtle),
+                );
+                ui.horizontal(|ui| {
+                    if style::primary_button(ui, col, "Sign in with Google…").on_hover_text("Add a Gmail or Google Workspace account").clicked() {
+                        act = Some(PrefsAction::GoogleSignIn(None));
+                    }
+                    if ui.button("Change client…").clicked() {
+                        self.google_edit = true;
+                    }
+                });
+                return;
+            }
+            ui.label(
+                RichText::new(
+                    "Google needs each app to have its own sign-in client. Create one (free, about 10 minutes) and paste its details here. \
+                     They're kept in the keychain.",
+                )
+                .small()
+                .color(col.subtle),
+            );
+            egui::CollapsingHeader::new("How to create a Google client").default_open(!self.google_ready).show(ui, |ui| {
+                for (i, step) in [
+                    "Open console.cloud.google.com and create a project (e.g. \"OwlPost\").",
+                    "Go to Google Auth Platform > Branding and fill in the app name and your email.",
+                    "Audience: choose Internal for a Google Workspace domain (no review, no warnings). For @gmail.com choose External, add yourself as a test user, then Publish app so sign-in doesn't expire after 7 days (Google will show an \"unverified app\" warning — click Advanced > Continue).",
+                    "Data Access > Add or remove scopes > add https://mail.google.com/ by hand.",
+                    "Clients > Create client > Application type: Desktop app.",
+                    "Copy the Client ID and Client secret below.",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    ui.label(RichText::new(format!("{}. {step}", i + 1)).small());
+                }
+                ui.hyperlink_to("Open Google Cloud Console ↗", "https://console.cloud.google.com/auth/clients");
+            });
+            egui::Grid::new("google_client").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Client ID");
+                ui.add(egui::TextEdit::singleline(&mut self.google_id).hint_text("….apps.googleusercontent.com").desired_width(360.0));
+                ui.end_row();
+                ui.label("Client secret");
+                ui.add(egui::TextEdit::singleline(&mut self.google_secret).password(true).hint_text("GOCSPX-…").desired_width(360.0));
+                ui.end_row();
+            });
+            ui.horizontal(|ui| {
+                let ok = !self.google_id.trim().is_empty() && !self.google_secret.trim().is_empty();
+                if ui.add_enabled(ok, egui::Button::new("Save")).clicked() {
+                    act = Some(PrefsAction::SaveGoogleClient(self.google_id.trim().to_string(), self.google_secret.trim().to_string()));
+                    self.google_edit = false;
+                    self.google_secret.clear();
+                }
+                if self.google_ready {
+                    if ui.button("Cancel").clicked() {
+                        self.google_edit = false;
+                    }
+                    if ui.button("Remove client").on_hover_text("Accounts using Google sign-in will stop connecting").clicked() {
+                        act = Some(PrefsAction::ClearGoogleClient);
+                        self.google_edit = false;
+                    }
+                }
+            });
+        });
+        act
+    }
+}
+
+/// "● New mail: instant (push)" and friends, under each account.
+pub(crate) fn push_line(ui: &mut egui::Ui, col: &Colors, st: Option<&PushState>) {
+    let (dot, text, tip) = match st {
+        Some(PushState::Live) => (col.success, "New mail: instant (push)".to_string(), "Connected with IMAP IDLE: the server tells OwlPost about new mail as it arrives.".to_string()),
+        Some(PushState::Retrying(e)) => (col.warning, "New mail: reconnecting push…".to_string(), format!("{e}\n\nMail is still checked every 5 minutes meanwhile.")),
+        Some(PushState::Unavailable(why)) => (col.very_subtle, "New mail: every 5 minutes".to_string(), format!("Push isn't available: {why}. OwlPost checks for new mail every 5 minutes instead.")),
+        Some(PushState::Connecting) | None => (col.very_subtle, "New mail: connecting push…".to_string(), "Setting up push (IMAP IDLE).".to_string()),
+    };
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().circle_filled(r.center(), 3.5, dot);
+        ui.label(RichText::new(text).small().color(col.subtle));
+    })
+    .response
+    .on_hover_text(tip);
 }

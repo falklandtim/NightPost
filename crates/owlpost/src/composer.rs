@@ -622,6 +622,7 @@ mod tests {
             color: "#3693f3".into(),
             signature: String::new(),
             demo: true,
+            auth: owlpost_core::Auth::Password,
         }
     }
 

@@ -278,6 +278,7 @@ pub fn seed(store: &Store) -> Result<()> {
         color: color.into(),
         signature: "— Alex".into(),
         demo: true,
+        auth: Auth::Password,
     };
     let mut personal_acc = mk("Alex Rivera", ME_PERSONAL, "#3693f3", "imap.mail.me.com", "smtp.mail.me.com");
     personal_acc.id = store.add_account(&personal_acc)?;

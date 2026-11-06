@@ -4,7 +4,9 @@
 pub mod credentials;
 pub mod demo;
 pub mod engine;
+pub mod idle;
 pub mod mcp;
+pub mod oauth;
 pub mod models;
 pub mod parse;
 pub mod presets;

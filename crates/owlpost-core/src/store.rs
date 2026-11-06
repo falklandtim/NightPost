@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     smtp_security TEXT NOT NULL,
     color         TEXT NOT NULL,
     signature     TEXT NOT NULL DEFAULT '',
-    demo          INTEGER NOT NULL DEFAULT 0
+    demo          INTEGER NOT NULL DEFAULT 0,
+    auth          TEXT NOT NULL DEFAULT 'password'
 );
 CREATE TABLE IF NOT EXISTS folders (
     id           INTEGER PRIMARY KEY,
@@ -126,6 +127,14 @@ impl Store {
             > 0;
         if !has_html {
             store.conn.execute_batch("ALTER TABLE signatures ADD COLUMN html INTEGER NOT NULL DEFAULT 0")?;
+        }
+        // …and before Google sign-in, the auth column.
+        let has_auth: bool = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name='auth'", [], |r| r.get::<_, i64>(0))?
+            > 0;
+        if !has_auth {
+            store.conn.execute_batch("ALTER TABLE accounts ADD COLUMN auth TEXT NOT NULL DEFAULT 'password'")?;
         }
         store.migrate_signatures()?;
         Ok(store)
@@ -229,13 +238,13 @@ impl Store {
     pub fn add_account(&self, a: &Account) -> Result<AccountId> {
         self.conn.execute(
             "INSERT INTO accounts (display_name,email,username,imap_host,imap_port,imap_security,
-                smtp_host,smtp_port,smtp_security,color,signature,demo)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                smtp_host,smtp_port,smtp_security,color,signature,demo,auth)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 a.display_name, a.email, a.username,
                 a.imap.host, a.imap.port, a.imap.security.as_str(),
                 a.smtp.host, a.smtp.port, a.smtp.security.as_str(),
-                a.color, "", a.demo
+                a.color, "", a.demo, a.auth.as_str()
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -250,13 +259,13 @@ impl Store {
     pub fn update_account(&self, a: &Account) -> Result<()> {
         self.conn.execute(
             "UPDATE accounts SET display_name=?2, username=?3, imap_host=?4, imap_port=?5,
-                imap_security=?6, smtp_host=?7, smtp_port=?8, smtp_security=?9, color=?10
+                imap_security=?6, smtp_host=?7, smtp_port=?8, smtp_security=?9, color=?10, auth=?11
              WHERE id=?1",
             params![
                 a.id, a.display_name, a.username,
                 a.imap.host, a.imap.port, a.imap.security.as_str(),
                 a.smtp.host, a.smtp.port, a.smtp.security.as_str(),
-                a.color
+                a.color, a.auth.as_str()
             ],
         )?;
         Ok(())
@@ -271,7 +280,7 @@ impl Store {
         let mut st = self.conn.prepare(
             "SELECT id,display_name,email,username,imap_host,imap_port,imap_security,
                     smtp_host,smtp_port,smtp_security,color,
-                    '', demo
+                    '', demo, auth
              FROM accounts ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
@@ -293,6 +302,7 @@ impl Store {
                 color: r.get(10)?,
                 signature: r.get(11)?,
                 demo: r.get(12)?,
+                auth: Auth::parse(&r.get::<_, String>(13)?),
             })
         })?;
         let mut accounts: Vec<Account> = rows.collect::<rusqlite::Result<_>>()?;

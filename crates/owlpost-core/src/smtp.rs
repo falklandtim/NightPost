@@ -3,7 +3,7 @@
 use crate::models::{Account, Contact, Security};
 use anyhow::{anyhow, Context, Result};
 use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{SmtpTransport, Transport};
 use serde::{Deserialize, Serialize};
 
@@ -208,6 +208,10 @@ pub fn send(account: &Account, password: &str, out: &OutgoingMessage) -> Result<
     }
     .port(s.port)
     .credentials(creds)
+    .authentication(match account.auth {
+        crate::models::Auth::Google => vec![Mechanism::Xoauth2],
+        crate::models::Auth::Password => vec![Mechanism::Plain, Mechanism::Login],
+    })
     .timeout(Some(std::time::Duration::from_secs(60)))
     .build();
     transport.send_raw(&envelope, &raw).context("SMTP send failed")?;
@@ -249,6 +253,7 @@ mod tests {
             color: "#000".into(),
             signature: String::new(),
             demo: false,
+            auth: Auth::Password,
         };
         let out = OutgoingMessage {
             to: vec![Contact::new("Ann", "ann@example.com")],

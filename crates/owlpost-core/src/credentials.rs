@@ -33,6 +33,43 @@ pub fn get_password(email: &str) -> Result<String> {
 pub fn delete_password(email: &str) -> Result<()> {
     let _ = keyring::Entry::new(SERVICE, email)?.delete_credential();
     let _ = keyring::Entry::new(LEGACY_SERVICE, email)?.delete_credential();
+    delete_refresh_token(email);
+    Ok(())
+}
+
+/// Remove just the password (an account that switched to Google sign-in).
+pub fn forget_password(email: &str) {
+    for service in [SERVICE, LEGACY_SERVICE] {
+        if let Ok(e) = keyring::Entry::new(service, email) {
+            let _ = e.delete_credential();
+        }
+    }
+}
+
+/// A Google sign-in's refresh token, kept apart from any password.
+pub fn set_refresh_token(email: &str, token: &str) -> Result<()> {
+    set_secret(&format!("google-oauth:{}", email.to_ascii_lowercase()), token)
+}
+
+pub fn get_refresh_token(email: &str) -> Result<String> {
+    get_secret(&format!("google-oauth:{}", email.to_ascii_lowercase()))
+}
+
+pub fn delete_refresh_token(email: &str) {
+    let _ = delete_secret(&format!("google-oauth:{}", email.to_ascii_lowercase()));
+}
+
+/// Any other secret OwlPost keeps (e.g. the Google OAuth client).
+pub fn set_secret(key: &str, value: &str) -> Result<()> {
+    keyring::Entry::new(SERVICE, key)?.set_password(value).context("saving to the system keychain")
+}
+
+pub fn get_secret(key: &str) -> Result<String> {
+    keyring::Entry::new(SERVICE, key)?.get_password().with_context(|| format!("nothing saved for {key} in the system keychain"))
+}
+
+pub fn delete_secret(key: &str) -> Result<()> {
+    let _ = keyring::Entry::new(SERVICE, key)?.delete_credential();
     Ok(())
 }
 

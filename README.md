@@ -13,6 +13,8 @@ It has one binary with no Electron, a local SQLite cache, a built-in MCP server,
 - **Quick actions on hover**: widen the message list (at least 420 points) and hovering over a conversation shows mark read/unread, archive, trash, snooze and pin buttons, as in Mailspring.
 - **Compose in its own window**: new messages, replies and forwards each open a separate window. Closing a window that has text in it asks before discarding the draft.
 - **Attachments**: click **Attach** in the composer or drag files onto its window. Each file shows as a chip with a thumbnail (for photos) and its size; × removes it. When you attach JPEG or PNG photos, an **Image size** menu offers Actual Size, Large (2048 px), Medium (1280 px) and Small (640 px), measured on the longest side. Photos are resized in the background and turned upright from their camera rotation, and the chip shows the new size next to the original. The composer shows the total message size and blocks Send above 25 MB, the limit at Gmail and iCloud. The MCP `send_email` tool takes an `attachments` list of file paths.
+- **Push mail (IMAP IDLE)**: each account keeps a connection open on its Inbox, and the server reports new mail, or messages read or deleted elsewhere, as it happens. OwlPost then syncs just the Inbox, usually within a couple of seconds. Other folders sync every 5 minutes. The connection is re-issued every 8 minutes to keep home routers from dropping it and to check it's still alive. It reconnects with backoff after failures and starts over after the Mac wakes from sleep. Preferences → Accounts shows each account's status: *instant (push)*, *reconnecting*, or *every 5 minutes* for STARTTLS accounts and servers without IDLE.
+- **Received attachments**: click an attachment in a message to open it in its usual app (Preview, Pages…). Right-click it for **Save to Downloads**, which never overwrites an existing file and shows the saved file in Finder, or **Save As…**. Sync keeps only each attachment's name and size; the file itself is fetched from the server the first time you open it. It's then cached in `~/Library/Caches/co.timson.OwlPost/attachments`, which macOS may clear at any time. The server keeps the real copy.
 - **Move & label**: move a conversation to any folder (`v`, the folder button, or right-click → Move to), and add or remove Gmail labels (`l`, the tag button, or right-click → Label). Both pickers are searchable and can create a new folder or label. Labels show as removable chips on the open conversation. On Gmail, Archive and Move only take a conversation out of the Inbox, so its other labels stay.
 - **Signatures**: Preferences → Signatures lets you create named signatures and choose a default for each account. Each signature has a **Plain text / HTML** toggle. HTML signatures appear as readable text while you write, and the message is sent with both a text and an HTML version, with your real HTML in the HTML version (the MCP `send_email` and `reply` tools do the same). HTML signatures are drawn in the composer and in Preferences, with bold and italic text, links, and images loaded from the web. Pasting a whole page copied from another app (such as Canary) is fine: on Save, OwlPost keeps only the signature and removes page styles, such as Canary's dark-mode colour inversion, which would otherwise restyle the whole email. Images load even when the host labels them with the wrong file type, as Dropbox share links do. The composer has a signature picker that swaps the signature in place, and changing the From account switches to that account's default.
 - Archive, trash, spam, star, mark unread, reply, reply all and forward, with address autocomplete.
@@ -36,7 +38,27 @@ The app icon lives in `crates/owlpost/assets/icon-1024.png`. After changing it, 
 
 ## Connecting Gmail and iCloud
 
-Both providers need an **app password** rather than your normal password:
+### Gmail and Google Workspace: Sign in with Google
+
+OwlPost can sign in to Google accounts in your browser with OAuth 2.0, as Mailspring does. Your Google password never reaches OwlPost, and you can revoke access at any time at myaccount.google.com → Security → Third-party apps. The sign-in is stored as a refresh token in the Keychain; IMAP, push and SMTP use short-lived access tokens (XOAUTH2).
+
+Google requires every app to have its own OAuth client, so you create one once (free, about 10 minutes):
+
+1. At [console.cloud.google.com](https://console.cloud.google.com/auth/clients), create a project (e.g. "OwlPost").
+2. **Google Auth Platform → Branding**: enter the app name and your email.
+3. **Audience**:
+   - **Google Workspace domain**: choose **Internal**. There's no review and no warning screen, and sign-in doesn't expire. It works only for accounts in your Workspace.
+   - **Personal @gmail.com**: choose **External**, add yourself as a test user, then **Publish app**. While it's left in Testing, sign-in expires every 7 days. Google shows an "unverified app" warning when you sign in; click Advanced → Continue. Unverified apps are limited to 100 users.
+4. **Data Access → Add or remove scopes**: add `https://mail.google.com/` by hand.
+5. **Clients → Create client → Desktop app**, then paste the Client ID and Client secret into **Preferences → Accounts → Sign in with Google**. Google doesn't treat a desktop app's secret as confidential, but OwlPost keeps it in the Keychain anyway.
+
+Then use **Sign in with Google…** to add an account, or **Use Google sign-in** on an existing Gmail account to switch it over (its app password is removed from the Keychain). The add-account window also offers it when you pick Gmail.
+
+To share OwlPost with other people without each of them creating a client, the app would need Google's verification for the restricted `mail.google.com` scope, which includes a yearly security assessment.
+
+### App passwords
+
+Otherwise, both providers accept an **app password** in place of your normal password. iCloud only works this way: Apple has no sign-in that third-party mail apps can use.
 
 | Provider | Create an app password | Servers (pre-filled) |
 |---|---|---|
@@ -79,4 +101,4 @@ Data lives in `~/Library/Application Support/co.timson.OwlPost/` (override with 
 
 ## Not yet implemented
 
-HTML message rendering (bodies are shown as text), attachment download, IMAP IDLE push (it polls every 5 minutes), Gmail OAuth (app passwords for now), server-side snooze that syncs across devices, drafts sync, and send-later or read receipts.
+HTML message rendering (bodies are shown as text), server-side snooze that syncs across devices, drafts sync, and send-later or read receipts.

@@ -4,8 +4,10 @@
 use crossbeam_channel::{Receiver, Sender};
 use owlpost_core::engine::{self, SyncProgress};
 use owlpost_core::smtp::OutgoingMessage;
-use owlpost_core::{credentials, Account, AccountId, FolderId, FolderRole, Store};
+use owlpost_core::{credentials, Account, AccountId, Auth, FolderId, FolderRole, Message, MessageId, Store};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub enum Cmd {
@@ -23,6 +25,23 @@ pub enum Cmd {
     Send(AccountId, OutgoingMessage),
     /// Verify credentials, save the password to the keychain, then add.
     AddAccount(Box<Account>, String),
+    /// Download attachment `usize` of a message (or use the cached copy),
+    /// then open or save it.
+    Attachment(Box<Message>, usize, AttachmentDo),
+    /// "Sign in with Google": opens the browser, waits for it, then adds the
+    /// account or switches an existing one to Google sign-in. Setting the
+    /// flag cancels.
+    GoogleSignIn(Option<AccountId>, Arc<AtomicBool>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttachmentDo {
+    /// Open in the default app (Preview, Pages…).
+    Open,
+    /// Copy into Downloads (without overwriting) and show it in Finder.
+    SaveToDownloads,
+    /// Save to a path chosen in a Save dialog.
+    SaveTo(PathBuf),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,6 +60,73 @@ pub enum Event {
     AccountAdded(AccountId),
     AccountFailed(String),
     SnoozesWoke(usize),
+    /// Something finished that's worth a (non-error) toast.
+    Notice(String),
+    /// An attachment download finished (successfully or not).
+    AttachmentDone(MessageId, usize),
+    Push(AccountId, PushState),
+    /// Google's sign-in page is open in the browser (the URL, to copy).
+    GoogleWaiting(String),
+    /// Google sign-in finished: Ok(message) or Err(reason).
+    GoogleDone(Result<String, String>),
+}
+
+/// A request for the sync thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncReq {
+    /// Every account, every folder (the timer, Refresh, waking from sleep).
+    All,
+    /// One account, every folder.
+    Account(AccountId),
+    /// One account's Inbox: the server pushed a change.
+    Inbox(AccountId),
+}
+
+/// Requests merged into one round of syncing.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SyncPlan {
+    pub all: bool,
+    pub accounts: std::collections::BTreeSet<AccountId>,
+    pub inboxes: std::collections::BTreeSet<AccountId>,
+}
+
+impl From<SyncReq> for SyncPlan {
+    fn from(r: SyncReq) -> Self {
+        let mut p = SyncPlan::default();
+        p.add(r);
+        p
+    }
+}
+
+impl SyncPlan {
+    pub fn add(&mut self, r: SyncReq) {
+        match r {
+            SyncReq::All => self.all = true,
+            SyncReq::Account(a) => {
+                self.accounts.insert(a);
+            }
+            SyncReq::Inbox(a) => {
+                self.inboxes.insert(a);
+            }
+        }
+    }
+
+    /// This account gets a full sync (which includes its Inbox).
+    pub fn covers_fully(&self, a: AccountId) -> bool {
+        self.all || self.accounts.contains(&a)
+    }
+}
+
+/// Push connection state for one account, shown in Preferences > Accounts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PushState {
+    Connecting,
+    /// Connected and waiting: new mail arrives within seconds.
+    Live,
+    /// Lost the connection; trying again (checking on the timer meanwhile).
+    Retrying(String),
+    /// This server or account can't push; checking every 5 minutes.
+    Unavailable(String),
 }
 
 const SYNC_EVERY: Duration = Duration::from_secs(5 * 60);
@@ -55,7 +141,7 @@ impl Worker {
     pub fn spawn(db: PathBuf, ctx: eframe::egui::Context) -> Self {
         let (tx, cmd_rx) = crossbeam_channel::unbounded::<Cmd>();
         let (ev_tx, rx) = crossbeam_channel::unbounded::<Event>();
-        let (sync_tx, sync_rx) = crossbeam_channel::unbounded::<Option<AccountId>>();
+        let (sync_tx, sync_rx) = crossbeam_channel::unbounded::<SyncReq>();
 
         // Sync thread: one sync at a time, coalescing requests.
         {
@@ -85,20 +171,33 @@ impl Worker {
                                 ctx.request_repaint();
                             }
                         }
-                        let target = match req {
-                            Some(t) => t,
-                            None if last.elapsed() >= SYNC_EVERY => None,
+                        let mut plan = match req {
+                            Some(r) => SyncPlan::from(r),
+                            None if last.elapsed() >= SYNC_EVERY => SyncPlan::from(SyncReq::All),
                             None => continue,
                         };
-                        // Drain duplicates.
-                        while sync_rx.try_recv().is_ok() {}
-                        last = Instant::now();
-                        let accounts: Vec<Account> = store
-                            .accounts()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter(|a| !a.demo && target.map(|t| t == a.id).unwrap_or(true))
-                            .collect();
+                        // Merge whatever else queued up meanwhile.
+                        while let Ok(r) = sync_rx.try_recv() {
+                            plan.add(r);
+                        }
+                        let all_accounts: Vec<Account> = store.accounts().unwrap_or_default().into_iter().filter(|a| !a.demo).collect();
+                        // Pushed changes: just the Inbox, quietly.
+                        for a in all_accounts.iter().filter(|a| plan.inboxes.contains(&a.id) && !plan.covers_fully(a.id)) {
+                            match engine::sync_inbox(&store, a) {
+                                Ok(_) => {
+                                    let _ = ev.send(Event::Changed);
+                                    ctx.request_repaint();
+                                }
+                                Err(e) => log::warn!("push sync of {} failed: {e:#}", a.email),
+                            }
+                        }
+                        if !plan.all && plan.accounts.is_empty() {
+                            continue;
+                        }
+                        if plan.all {
+                            last = Instant::now();
+                        }
+                        let accounts: Vec<Account> = all_accounts.into_iter().filter(|a| plan.covers_fully(a.id)).collect();
                         let mut new = 0;
                         let mut errors = vec![];
                         for a in accounts {
@@ -129,6 +228,9 @@ impl Worker {
                 .expect("spawn sync thread");
         }
 
+        // Push: an IMAP IDLE connection per account, kept alive by a supervisor.
+        push::spawn(db.clone(), sync_tx.clone(), ev_tx.clone(), ctx.clone());
+
         // Command dispatcher: each action runs on its own short-lived thread.
         std::thread::Builder::new()
             .name("actions".into())
@@ -136,10 +238,10 @@ impl Worker {
                 for cmd in cmd_rx {
                     match cmd {
                         Cmd::SyncAll => {
-                            let _ = sync_tx.send(None);
+                            let _ = sync_tx.send(SyncReq::All);
                         }
                         Cmd::SyncAccount(id) => {
-                            let _ = sync_tx.send(Some(id));
+                            let _ = sync_tx.send(SyncReq::Account(id));
                         }
                         other => {
                             let db = db.clone();
@@ -164,7 +266,151 @@ impl Worker {
     }
 }
 
-fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Sender<Option<AccountId>>) {
+/// The whole "Sign in with Google" round trip. Returns what to tell the user.
+fn google_sign_in(store: &Store, target: Option<AccountId>, cancel: &AtomicBool, ev: &Sender<Event>, sync_tx: &Sender<SyncReq>) -> anyhow::Result<String> {
+    use owlpost_core::oauth;
+    use owlpost_core::presets::Provider;
+    let client = oauth::GoogleClient::load().ok_or_else(|| anyhow::anyhow!("add your Google client ID in Preferences > Accounts first"))?;
+    let existing = match target {
+        Some(id) => Some(store.account(id)?.ok_or_else(|| anyhow::anyhow!("that account no longer exists"))?),
+        None => None,
+    };
+    let pending = oauth::begin(&client, existing.as_ref().map(|a| a.email.as_str()))?;
+    let _ = ev.send(Event::GoogleWaiting(pending.url.clone()));
+    open_url(&pending.url)?;
+    let signed = pending.finish(&client, cancel, oauth::SIGN_IN_TIMEOUT)?;
+    // Re-signing in an account must be the same Google account.
+    if let Some(a) = &existing {
+        if !a.email.eq_ignore_ascii_case(&signed.email) {
+            anyhow::bail!("you signed in as {}, but this account is {} — try again and pick {}", signed.email, a.email, a.email);
+        }
+    }
+    oauth::store_sign_in(&signed)?;
+    let account = existing.or(store.account_by_email(&signed.email)?);
+    match account {
+        Some(mut a) => {
+            let was = a.auth;
+            a.auth = Auth::Google;
+            store.update_account(&a)?;
+            if was == Auth::Password {
+                // The app password isn't needed any more.
+                credentials::forget_password(&a.email);
+            }
+            let _ = sync_tx.send(SyncReq::Account(a.id));
+            Ok(format!("{} now signs in with Google", a.email))
+        }
+        None => {
+            let p = Provider::Gmail;
+            let acc = Account {
+                id: 0,
+                display_name: if signed.name.is_empty() { signed.email.split('@').next().unwrap_or("").to_string() } else { signed.name.clone() },
+                email: signed.email.clone(),
+                username: signed.email.clone(),
+                imap: p.imap().expect("gmail preset"),
+                smtp: p.smtp().expect("gmail preset"),
+                color: p.color().into(),
+                signature: String::new(),
+                demo: false,
+                auth: Auth::Google,
+            };
+            let mut session = engine::connect(&acc).map_err(|e| anyhow::anyhow!("signed in, but Gmail refused the connection — is IMAP turned on for this account? ({e:#})"))?;
+            let _ = session.logout();
+            let id = store.add_account(&acc)?;
+            let _ = ev.send(Event::AccountAdded(id));
+            let _ = sync_tx.send(SyncReq::Account(id));
+            // AccountAdded already announces it.
+            Ok(String::new())
+        }
+    }
+}
+
+fn open_url(url: &str) -> anyhow::Result<()> {
+    use std::process::Command;
+    if cfg!(test) {
+        return Ok(());
+    }
+    let status = if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).status()
+    } else if cfg!(target_os = "windows") {
+        Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).status()
+    } else {
+        Command::new("xdg-open").arg(url).status()
+    }?;
+    if !status.success() {
+        anyhow::bail!("couldn't open the browser");
+    }
+    Ok(())
+}
+
+/// Fetch (or reuse) an attachment, then do `what` with it. Returns a
+/// message to show when there's something to say.
+fn attachment(store: &Store, m: &Message, index: usize, what: AttachmentDo) -> anyhow::Result<Option<String>> {
+    let account = store.account(m.account_id)?.ok_or_else(|| anyhow::anyhow!("the account no longer exists"))?;
+    let path = engine::attachment_file(store, &account, m, index)?;
+    match what {
+        AttachmentDo::Open => {
+            open_file(&path, false)?;
+            Ok(None)
+        }
+        AttachmentDo::SaveTo(dest) => {
+            std::fs::copy(&path, &dest)?;
+            Ok(Some(format!("Saved {}", dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())))
+        }
+        AttachmentDo::SaveToDownloads => {
+            let dir = directories::UserDirs::new()
+                .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
+                .ok_or_else(|| anyhow::anyhow!("couldn't find your Downloads folder"))?;
+            let dest = unused_path(&dir, &engine::safe_filename(&m.attachments[index].filename));
+            std::fs::copy(&path, &dest)?;
+            let _ = open_file(&dest, true);
+            Ok(Some(format!("Saved {} to Downloads", dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())))
+        }
+    }
+}
+
+/// `dir/name`, or `dir/name (2).ext`… if that's taken: never overwrite.
+pub fn unused_path(dir: &std::path::Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    (2..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !p.exists()).expect("some name is free")
+}
+
+/// Open a file in its default app, or (`reveal`) show it in Finder / the file manager.
+fn open_file(path: &std::path::Path, reveal: bool) -> anyhow::Result<()> {
+    use std::process::Command;
+    if cfg!(test) {
+        // Tests check the download, not that Preview pops up.
+        return if path.is_file() { Ok(()) } else { Err(anyhow::anyhow!("missing {}", path.display())) };
+    }
+    let status = if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        if reveal {
+            c.arg("-R");
+        }
+        c.arg(path).status()
+    } else if cfg!(target_os = "windows") {
+        if reveal {
+            Command::new("explorer").arg(format!("/select,{}", path.display())).status()
+        } else {
+            Command::new("cmd").args(["/C", "start", ""]).arg(path).status()
+        }
+    } else {
+        let target = if reveal { path.parent().unwrap_or(path) } else { path };
+        Command::new("xdg-open").arg(target).status()
+    }?;
+    if !status.success() && !cfg!(target_os = "windows") {
+        anyhow::bail!("no app is set up to open this kind of file");
+    }
+    Ok(())
+}
+
+fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Sender<SyncReq>) {
     let store = match Store::open(db) {
         Ok(s) => s,
         Err(e) => {
@@ -177,6 +423,18 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
     };
     let result: anyhow::Result<()> = (|| {
         match cmd {
+            Cmd::Attachment(m, index, what) => {
+                let name = m.attachments.get(index).map(|a| a.filename.clone()).unwrap_or_default();
+                let r = attachment(&store, &m, index, what);
+                let _ = ev.send(Event::AttachmentDone(m.id, index));
+                match r {
+                    Ok(Some(notice)) => {
+                        let _ = ev.send(Event::Notice(notice));
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(e.context(format!("Couldn't open {name}"))),
+                }
+            }
             Cmd::SetUnread(a, key, unread) => engine::set_thread_unread(&store, &account(a)?, &key, unread)?,
             Cmd::SetStarred(a, key, starred) => engine::set_thread_starred(&store, &account(a)?, &key, starred)?,
             Cmd::Move(a, key, role) => {
@@ -230,12 +488,16 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
                 match store.add_account(&acc) {
                     Ok(id) => {
                         let _ = ev.send(Event::AccountAdded(id));
-                        let _ = sync_tx.send(Some(id));
+                        let _ = sync_tx.send(SyncReq::Account(id));
                     }
                     Err(e) => {
                         let _ = ev.send(Event::AccountFailed(format!("{e:#}")));
                     }
                 }
+            }
+            Cmd::GoogleSignIn(target, cancel) => {
+                let r = google_sign_in(&store, target, &cancel, ev, sync_tx);
+                let _ = ev.send(Event::GoogleDone(r.map_err(|e| format!("{e:#}"))));
             }
             Cmd::SyncAll | Cmd::SyncAccount(_) => unreachable!(),
         }
@@ -244,5 +506,189 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
     if let Err(e) = result {
         let _ = ev.send(Event::Error(format!("{e:#}")));
         let _ = ev.send(Event::Changed);
+    }
+}
+
+/// Push mail: one IDLE thread per account, watched by a supervisor that
+/// starts threads for new accounts, stops them for removed ones, replaces
+/// any that stop responding, and restarts everything after the Mac sleeps.
+mod push {
+    use super::{Event, PushState, SyncReq};
+    use crossbeam_channel::Sender;
+    use owlpost_core::idle::{self, IdleEvent};
+    use owlpost_core::{AccountId, FolderRole, Store};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant, SystemTime};
+
+    const CHECK: Duration = Duration::from_secs(30);
+    /// A thread that hasn't been heard from for this long is replaced.
+    const STALE: Duration = Duration::from_secs(idle::CYCLE.as_secs() + 3 * 60);
+
+    #[derive(Clone)]
+    struct Watch {
+        generation: u64,
+        beat: Instant,
+        /// The server can't push: don't keep retrying.
+        unsupported: bool,
+    }
+
+    type Watches = Arc<Mutex<HashMap<AccountId, Watch>>>;
+
+    pub fn spawn(db: PathBuf, sync_tx: Sender<SyncReq>, ev: Sender<Event>, ctx: eframe::egui::Context) {
+        let watches: Watches = Default::default();
+        let notify = move |ev: &Sender<Event>, id: AccountId, st: PushState| {
+            let _ = ev.send(Event::Push(id, st));
+            ctx.request_repaint();
+        };
+        let _ = std::thread::Builder::new().name("push".into()).spawn(move || {
+            let Ok(store) = Store::open(&db) else { return };
+            let mut next_gen = 1u64;
+            let mut told_no_push = std::collections::HashSet::new();
+            let mut last_wall = SystemTime::now();
+            loop {
+                // A big jump in the wall clock means the Mac slept: every
+                // connection is probably dead, so start over and catch up.
+                let now = SystemTime::now();
+                let slept = now.duration_since(last_wall).map(|d| d > CHECK * 3).unwrap_or(false);
+                last_wall = now;
+                if slept {
+                    log::info!("woke from sleep: reconnecting push");
+                    watches.lock().unwrap().clear();
+                    let _ = sync_tx.send(SyncReq::All);
+                }
+                let accounts = store.accounts().unwrap_or_default();
+                {
+                    let mut w = watches.lock().unwrap();
+                    // Removed accounts: forgetting them stops their threads.
+                    w.retain(|id, _| accounts.iter().any(|a| a.id == *id));
+                }
+                for a in accounts.iter().filter(|a| !a.demo) {
+                    if !idle::can_push(a) {
+                        if told_no_push.insert(a.id) {
+                            notify(&ev, a.id, PushState::Unavailable("this account connects with STARTTLS rather than TLS".into()));
+                        }
+                        continue;
+                    }
+                    let start = {
+                        let mut w = watches.lock().unwrap();
+                        match w.get(&a.id) {
+                            Some(x) if x.unsupported || x.beat.elapsed() < STALE => None,
+                            _ => {
+                                next_gen += 1;
+                                w.insert(a.id, Watch { generation: next_gen, beat: Instant::now(), unsupported: false });
+                                Some(next_gen)
+                            }
+                        }
+                    };
+                    if let Some(generation) = start {
+                        let (db, sync_tx, ev, watches, notify) = (db.clone(), sync_tx.clone(), ev.clone(), watches.clone(), notify.clone());
+                        let id = a.id;
+                        let _ = std::thread::Builder::new()
+                            .name(format!("push-{id}"))
+                            .spawn(move || run(&db, id, generation, &watches, &sync_tx, &|st| notify(&ev, id, st)));
+                    }
+                }
+                std::thread::sleep(CHECK);
+            }
+        });
+    }
+
+    /// This thread is still the current one for the account; also records
+    /// that it's alive.
+    fn current(watches: &Watches, id: AccountId, generation: u64) -> bool {
+        let mut w = watches.lock().unwrap();
+        match w.get_mut(&id) {
+            Some(x) if x.generation == generation => {
+                x.beat = Instant::now();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn run(db: &std::path::Path, id: AccountId, generation: u64, watches: &Watches, sync_tx: &Sender<SyncReq>, notify: &dyn Fn(PushState)) {
+        let Ok(store) = Store::open(db) else { return };
+        let mut failures = 0u32;
+        while current(watches, id, generation) {
+            let Ok(Some(account)) = store.account(id) else { return };
+            // Folders come from the first full sync; wait for it.
+            let inbox = match store.folder_by_role(id, FolderRole::Inbox) {
+                Ok(Some(f)) => f.path,
+                _ => {
+                    std::thread::sleep(Duration::from_secs(10));
+                    continue;
+                }
+            };
+            notify(PushState::Connecting);
+            let result = idle::connect(&account).and_then(|mut session| {
+                if !idle::supports_idle(&mut session)? {
+                    return Err(anyhow::anyhow!(Unsupported));
+                }
+                notify(PushState::Live);
+                failures = 0;
+                // Catch up on anything that arrived while disconnected.
+                let _ = sync_tx.send(SyncReq::Inbox(id));
+                let r = idle::watch(&mut session, &inbox, idle::CYCLE, |event| {
+                    if event == IdleEvent::Changed {
+                        let _ = sync_tx.send(SyncReq::Inbox(id));
+                    }
+                    current(watches, id, generation)
+                });
+                let _ = session.logout();
+                r
+            });
+            match result {
+                Ok(()) => return, // replaced or account removed
+                Err(e) if e.is::<Unsupported>() => {
+                    if let Some(w) = watches.lock().unwrap().get_mut(&id) {
+                        w.unsupported = true;
+                    }
+                    notify(PushState::Unavailable("the server doesn't support it".into()));
+                    return;
+                }
+                Err(e) => {
+                    failures += 1;
+                    let wait = idle::backoff(failures);
+                    log::warn!("push for {} dropped: {e:#}; retrying in {}s", account.email, wait.as_secs());
+                    notify(PushState::Retrying(format!("{e:#}")));
+                    // Sleep in short steps so a replacement or removal ends this thread promptly.
+                    let until = Instant::now() + wait;
+                    while Instant::now() < until {
+                        std::thread::sleep(Duration::from_secs(1));
+                        if !current(watches, id, generation) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct Unsupported;
+    impl std::fmt::Display for Unsupported {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the server doesn't support IDLE")
+        }
+    }
+    impl std::error::Error for Unsupported {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_requests_merge() {
+        let mut p = SyncPlan::from(SyncReq::Inbox(1));
+        p.add(SyncReq::Inbox(1));
+        p.add(SyncReq::Inbox(2));
+        p.add(SyncReq::Account(2));
+        assert!(!p.all && !p.covers_fully(1) && p.covers_fully(2));
+        assert_eq!(p.inboxes.len(), 2, "duplicates collapse");
+        p.add(SyncReq::All);
+        assert!(p.covers_fully(1) && p.covers_fully(99));
     }
 }
