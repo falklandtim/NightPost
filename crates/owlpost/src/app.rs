@@ -32,6 +32,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("k  /  ↑", "Previous conversation"),
     ("/", "Search"),
     ("g i", "Go to Inbox"),
+    ("⌘ Z", "Undo (move, archive, trash, label, snooze, pin…)"),
     ("⌘ ,", "Preferences"),
     ("⌘ W", "Close composer / Preferences"),
     ("⌘ ↩", "Send (in composer)"),
@@ -109,6 +110,77 @@ struct Row {
     snoozed_until: Option<DateTime<Utc>>,
 }
 
+/// One entry in the laid-out message list.
+#[derive(Clone, Debug, PartialEq)]
+enum ListItem {
+    /// A section heading: "Pinned", "Today", "October"…
+    Header(String),
+    /// `rows[i]`.
+    Row(usize),
+}
+
+/// Height of a section heading in the list.
+const HEADER_H: f32 = 30.0;
+/// Space above the first item.
+const LIST_TOP: f32 = 4.0;
+
+/// The date group a conversation falls in, Canary-style.
+fn date_group(when: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    use chrono::Datelike;
+    let (d, today) = (when.with_timezone(&chrono::Local).date_naive(), now.with_timezone(&chrono::Local).date_naive());
+    let days = (today - d).num_days();
+    let week_start = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
+    if days <= 0 {
+        "Today".into()
+    } else if days == 1 {
+        "Yesterday".into()
+    } else if d >= week_start {
+        "Earlier this week".into()
+    } else if d >= week_start - chrono::Duration::days(7) {
+        "Last week".into()
+    } else if d.year() == today.year() && d.month() == today.month() {
+        "Earlier this month".into()
+    } else if d.year() == today.year() {
+        d.format("%B").to_string()
+    } else {
+        d.format("%B %Y").to_string()
+    }
+}
+
+/// Lay out the list: a Pinned section, then conversations grouped by day.
+/// Each entry comes with its top y (from the top of the list) and height.
+fn list_layout(rows: &[Row], grouped: bool, hidden_pinned: usize, now: DateTime<Utc>) -> Vec<(f32, f32, ListItem)> {
+    let mut out = Vec::with_capacity(rows.len() + 8);
+    let mut y = LIST_TOP;
+    let mut push = |out: &mut Vec<(f32, f32, ListItem)>, item: ListItem| {
+        let h = if matches!(item, ListItem::Header(_)) { HEADER_H } else { ROW_H };
+        out.push((y, h, item));
+        y += h;
+    };
+    if !grouped {
+        for i in 0..rows.len() {
+            push(&mut out, ListItem::Row(i));
+        }
+        return out;
+    }
+    if hidden_pinned > 0 || rows.iter().any(|r| r.t.pinned) {
+        push(&mut out, ListItem::Header("Pinned".into()));
+    }
+    for (i, _) in rows.iter().enumerate().filter(|(_, r)| r.t.pinned) {
+        push(&mut out, ListItem::Row(i));
+    }
+    let mut last: Option<String> = None;
+    for (i, r) in rows.iter().enumerate().filter(|(_, r)| !r.t.pinned) {
+        let g = date_group(r.t.last_date, now);
+        if last.as_ref() != Some(&g) {
+            push(&mut out, ListItem::Header(g.clone()));
+            last = Some(g);
+        }
+        push(&mut out, ListItem::Row(i));
+    }
+    out
+}
+
 struct OpenThread {
     account_id: AccountId,
     thread_key: String,
@@ -122,7 +194,41 @@ struct Toast {
     text: String,
     error: bool,
     at: Instant,
+    /// Shows an Undo button (for the latest undoable action).
+    undo: bool,
 }
+
+/// Something ⌘Z can take back.
+#[derive(Clone, Debug)]
+enum Undo {
+    /// A thread moved into `dest` out of `sources` (archive, trash, move…).
+    Moved { a: AccountId, k: String, dest: FolderId, sources: Vec<FolderId>, what: String },
+    /// A label added (or removed).
+    Label { a: AccountId, k: String, folder: FolderId, added: bool, name: String },
+    Snoozed { a: AccountId, k: String },
+    /// Pin toggled; undoing toggles it back.
+    Pin { a: AccountId, k: String },
+    /// Read state changed: each thread with what it was before.
+    Unread { items: Vec<(AccountId, String, bool)> },
+    Star { a: AccountId, k: String, was: bool },
+}
+
+impl Undo {
+    fn describe(&self) -> String {
+        match self {
+            Undo::Moved { what, .. } => what.clone(),
+            Undo::Label { added, name, .. } => format!("{} “{name}”", if *added { "label" } else { "label removal" }),
+            Undo::Snoozed { .. } => "snooze".into(),
+            Undo::Pin { .. } => "pin".into(),
+            Undo::Unread { items } if items.len() > 1 => "mark as read".into(),
+            Undo::Unread { items } => if items.first().is_some_and(|i| i.2) { "mark as read".into() } else { "mark as unread".into() },
+            Undo::Star { .. } => "star".into(),
+        }
+    }
+}
+
+/// How many actions ⌘Z can go back.
+const UNDO_DEPTH: usize = 30;
 
 pub struct OwlPostApp {
     store: Store,
@@ -149,6 +255,8 @@ pub struct OwlPostApp {
     status: String,
     syncing: bool,
     toasts: Vec<Toast>,
+    /// Most recent last.
+    undo: Vec<Undo>,
     snooze_custom: String,
     pending_g: Option<Instant>,
     last_reload: Instant,
@@ -162,6 +270,19 @@ pub struct OwlPostApp {
     /// the title bar (0 when the system title bar is shown).
     pub titlebar_inset: f32,
     list_settings: ListSettings,
+    /// Pinned conversations left out of the list while Pinned is hidden.
+    hidden_pinned: usize,
+    /// The web view for HTML email (created on the first frame).
+    mail_view: Option<crate::mail_view::MailView>,
+    mail_view_tried: bool,
+    /// Show emails as designed (HTML) rather than as text.
+    html_email: bool,
+    /// Where the web view goes this frame (the reading pane below the subject).
+    web_rect: Option<egui::Rect>,
+    /// Conversations whose remote images the user chose to load.
+    remote_images: HashSet<(AccountId, String)>,
+    /// Keys pressed in the web view, fed to egui next frame.
+    pending_input: Vec<egui::Event>,
     swipe: Option<Swipe>,
     last_wheel_x: Option<Instant>,
     /// Initial width of the message list (it's resizable afterwards).
@@ -187,6 +308,7 @@ const LEGACY_LIST_KEY: &str = "springpost.list";
 /// Height of a conversation in the list: names, subject and two preview lines.
 const ROW_H: f32 = 94.0;
 const LIST_KEY: &str = "owlpost.list";
+const HTML_KEY: &str = "owlpost.html";
 
 impl OwlPostApp {
     pub fn new(cc: &eframe::CreationContext<'_>, store: Store, demo: bool) -> Self {
@@ -194,11 +316,22 @@ impl OwlPostApp {
         // Built-in theme ids were renamed along with the app.
         let saved = get(THEME_KEY, LEGACY_THEME_KEY).map(|id| id.replace("springpost-", "owlpost-"));
         let mut app = Self::with_context(&cc.egui_ctx, saved, store, demo);
+        if let Some(h) = cc.storage.and_then(|s| s.get_string(HTML_KEY)) {
+            app.html_email = h != "0";
+        }
         if let Some(l) = get(LIST_KEY, LEGACY_LIST_KEY) {
             app.list_settings = ListSettings::decode(&l);
         }
         if cfg!(target_os = "macos") {
             app.titlebar_inset = 76.0;
+        }
+        // Debug builds: OWLPOST_OPEN=<words> opens a matching conversation at
+        // launch (for checking the message view by hand).
+        #[cfg(debug_assertions)]
+        if let Ok(q) = std::env::var("OWLPOST_OPEN") {
+            if let Some(i) = app.rows.iter().position(|r| r.t.subject.contains(q.as_str())) {
+                app.select(i);
+            }
         }
         app
     }
@@ -217,6 +350,10 @@ impl OwlPostApp {
         let colors = Colors::new(themes.iter().find(|t| t.id == theme_id).map(Theme::palette).unwrap_or_else(|| themes[0].palette()));
         colors.apply(ctx);
         let worker = Worker::spawn(store.path().to_path_buf(), ctx.clone());
+        // Tests never touch the real keychain.
+        if !cfg!(test) {
+            worker.send(Cmd::CheckGoogle);
+        }
         let mut app = Self {
             store,
             worker,
@@ -242,6 +379,7 @@ impl OwlPostApp {
             status: String::new(),
             syncing: false,
             toasts: vec![],
+            undo: vec![],
             snooze_custom: String::new(),
             pending_g: None,
             last_reload: Instant::now(),
@@ -251,6 +389,13 @@ impl OwlPostApp {
             list_right: 620.0,
             titlebar_inset: 0.0,
             list_settings: ListSettings::default(),
+            hidden_pinned: 0,
+            mail_view: None,
+            mail_view_tried: false,
+            html_email: true,
+            web_rect: None,
+            remote_images: HashSet::new(),
+            pending_input: vec![],
             swipe: None,
             last_wheel_x: None,
             list_default_width: 400.0,
@@ -258,8 +403,9 @@ impl OwlPostApp {
             sigs: SignatureBook::default(),
             downloading: HashSet::new(),
             push: HashMap::new(),
-            // Tests never read the real keychain.
-            google_ready: !cfg!(test) && owlpost_core::oauth::GoogleClient::load().is_some(),
+            // Checked in the background (a keychain read can wait on a
+            // macOS permission prompt); see Event::GoogleReady.
+            google_ready: false,
             google: None,
         };
         app.reload();
@@ -273,7 +419,57 @@ impl OwlPostApp {
     // ----- data -------------------------------------------------------------
 
     fn toast(&mut self, text: impl Into<String>, error: bool) {
-        self.toasts.push(Toast { text: text.into(), error, at: Instant::now() });
+        self.toasts.push(Toast { text: text.into(), error, at: Instant::now(), undo: false });
+    }
+
+    /// Remember an action for ⌘Z and say what happened, with an Undo button.
+    fn did(&mut self, text: impl Into<String>, undo: Undo) {
+        self.undo.push(undo);
+        if self.undo.len() > UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+        for t in &mut self.toasts {
+            t.undo = false;
+        }
+        self.toasts.push(Toast { text: text.into(), error: false, at: Instant::now(), undo: true });
+    }
+
+    /// ⌘Z: take back the most recent action.
+    fn undo_last(&mut self) {
+        let Some(u) = self.undo.pop() else {
+            self.toast("Nothing to undo", false);
+            return;
+        };
+        for t in &mut self.toasts {
+            t.undo = false;
+        }
+        match &u {
+            Undo::Moved { a, k, dest, sources, .. } => {
+                self.worker.send(Cmd::Restore(*a, k.clone(), *dest, sources.clone()));
+            }
+            Undo::Label { a, k, folder, added, .. } => {
+                self.worker.send(Cmd::Label(*a, k.clone(), *folder, !added));
+            }
+            Undo::Snoozed { a, k } => {
+                let _ = self.store.unsnooze(*a, k);
+                self.snoozed_count = self.store.snoozed_count().unwrap_or(0);
+            }
+            Undo::Pin { a, k } => {
+                let _ = if self.store.is_pinned(*a, k).unwrap_or(false) { self.store.unpin(*a, k) } else { self.store.pin(*a, k) };
+            }
+            Undo::Unread { items } => {
+                for (a, k, was) in items {
+                    let _ = self.store.set_thread_unread(*a, k, *was);
+                    self.worker.send(Cmd::SetUnread(*a, k.clone(), *was));
+                }
+            }
+            Undo::Star { a, k, was } => {
+                let _ = self.store.set_thread_starred(*a, k, *was);
+                self.worker.send(Cmd::SetStarred(*a, k.clone(), *was));
+            }
+        }
+        self.toast(format!("Undid {}", u.describe()), false);
+        self.reload();
     }
 
     fn view(&self) -> Option<MailboxView> {
@@ -331,6 +527,13 @@ impl OwlPostApp {
                 })
                 .collect(),
         };
+        // A hidden Pinned section keeps its conversations out of the list
+        // (and out of j/k), until "Show".
+        self.hidden_pinned = 0;
+        if self.list_settings.hide_pinned && self.filter != ListFilter::Pinned && self.selection != Selection::Snoozed {
+            self.hidden_pinned = self.rows.iter().filter(|r| r.t.pinned).count();
+            self.rows.retain(|r| !r.t.pinned);
+        }
         self.selected = keep.and_then(|(a, k)| self.rows.iter().position(|r| r.t.account_id == a && r.t.thread_key == k));
         if let Some(o) = &self.open {
             let (a, k) = (o.account_id, o.thread_key.clone());
@@ -414,18 +617,26 @@ impl OwlPostApp {
             self.toast(format!("This account has no {} folder", role.label()), true);
             return;
         }
+        // Where it's going and what it leaves, so ⌘Z can bring it back.
+        let plan = self.accounts.iter().find(|x| x.id == a).and_then(|acc| {
+            let target = engine::folder_for_role(&self.store, acc, role).ok()?;
+            Some((target.id, engine::move_plan(&self.store, acc, k, target.id, None).ok()?))
+        });
         self.worker.send(Cmd::Move(a, k.to_string(), role));
         self.remove_row(a, k);
-        self.toast(
-            match role {
-                FolderRole::Archive => "Archived",
-                FolderRole::Trash => "Moved to Trash",
-                FolderRole::Spam => "Reported as spam",
-                FolderRole::Inbox => "Moved to Inbox",
-                _ => "Moved",
-            },
-            false,
-        );
+        let (text, what) = match role {
+            FolderRole::Archive => ("Archived", "archive"),
+            FolderRole::Trash => ("Moved to Trash", "move to Trash"),
+            FolderRole::Spam => ("Reported as spam", "spam report"),
+            FolderRole::Inbox => ("Moved to Inbox", "move to Inbox"),
+            _ => ("Moved", "move"),
+        };
+        match plan {
+            Some((dest, sources)) if !sources.is_empty() => {
+                self.did(text, Undo::Moved { a, k: k.to_string(), dest, sources, what: what.into() });
+            }
+            _ => self.toast(text, false),
+        }
     }
 
     /// Drop a conversation from the list; if it was open, open the next one.
@@ -448,14 +659,16 @@ impl OwlPostApp {
         let Some((a, k)) = self.current() else { return };
         let starred = !self.open.as_ref().map(|o| o.messages.iter().any(|m| m.starred)).unwrap_or(false);
         let _ = self.store.set_thread_starred(a, &k, starred);
-        self.worker.send(Cmd::SetStarred(a, k, starred));
+        self.worker.send(Cmd::SetStarred(a, k.clone(), starred));
+        self.undo.push(Undo::Star { a, k, was: !starred });
         self.reload();
     }
 
     fn act_unread(&mut self) {
         let Some((a, k)) = self.current() else { return };
         let _ = self.store.set_thread_unread(a, &k, true);
-        self.worker.send(Cmd::SetUnread(a, k, true));
+        self.worker.send(Cmd::SetUnread(a, k.clone(), true));
+        self.did("Marked as unread", Undo::Unread { items: vec![(a, k, false)] });
         self.open = None;
         self.selected = None;
         self.reload();
@@ -473,7 +686,7 @@ impl OwlPostApp {
             self.remove_current_and_advance();
             self.snoozed_count = self.store.snoozed_count().unwrap_or(0);
         }
-        self.toast(format!("Snoozed until {}", snooze::describe(until)), false);
+        self.did(format!("Snoozed until {}", snooze::describe(until)), Undo::Snoozed { a, k });
     }
 
     fn act_unsnooze(&mut self) {
@@ -490,7 +703,7 @@ impl OwlPostApp {
             self.toast(format!("Couldn't pin: {e:#}"), true);
             return;
         }
-        self.toast(if pinned { "Unpinned" } else { "Pinned to top" }, false);
+        self.did(if pinned { "Unpinned" } else { "Pinned to top" }, Undo::Pin { a, k: k.to_string() });
         self.reload();
     }
 
@@ -514,7 +727,11 @@ impl OwlPostApp {
         for (a, k) in &unread {
             self.set_row_unread(*a, k, false);
         }
-        self.toast(format!("Marked {} conversation{} as read", unread.len(), if unread.len() == 1 { "" } else { "s" }), false);
+        let n = unread.len();
+        self.did(
+            format!("Marked {n} conversation{} as read", if n == 1 { "" } else { "s" }),
+            Undo::Unread { items: unread.into_iter().map(|(a, k)| (a, k, true)).collect() },
+        );
         self.reload();
     }
 
@@ -595,6 +812,7 @@ impl OwlPostApp {
                 Event::Changed => changed = true,
                 Event::Error(e) => self.toast(e, true),
                 Event::Notice(s) => self.toast(s, false),
+                Event::GoogleReady(ready) => self.google_ready = ready,
                 Event::GoogleWaiting(url) => {
                     if let Some(g) = &mut self.google {
                         g.1 = Some(url);
@@ -684,6 +902,11 @@ impl OwlPostApp {
         }
         // Single-key shortcuts only when nothing is being typed into.
         if ctx.wants_keyboard_input() || self.setup.is_some() {
+            return;
+        }
+        // ⌘Z: undo the last action (text fields keep ⌘Z for their own undo).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z)) {
+            self.undo_last();
             return;
         }
         let text: String = ctx.input(|i| {
@@ -958,9 +1181,15 @@ impl OwlPostApp {
 
     fn move_to(&mut self, a: AccountId, k: &str, folder: &Folder) {
         let from = self.viewed_folder(a);
+        let sources = self.accounts.iter().find(|x| x.id == a).and_then(|acc| engine::move_plan(&self.store, acc, k, folder.id, from).ok()).unwrap_or_default();
         self.worker.send(Cmd::MoveTo(a, k.to_string(), folder.id, from));
         self.remove_row(a, k);
-        self.toast(format!("Moved to {}", folder_label(folder)), false);
+        let text = format!("Moved to {}", folder_label(folder));
+        if sources.is_empty() {
+            self.toast(text, false);
+        } else {
+            self.did(text, Undo::Moved { a, k: k.to_string(), dest: folder.id, sources, what: format!("move to {}", folder_label(folder)) });
+        }
     }
 
     fn set_label(&mut self, a: AccountId, k: &str, folder: &Folder, add: bool) {
@@ -968,7 +1197,11 @@ impl OwlPostApp {
         if !add && self.selection == Selection::Folder(folder.id) {
             self.remove_row(a, k);
         }
-        self.toast(format!("{} “{}”", if add { "Labelled" } else { "Removed label" }, folder_label(folder)), false);
+        let name = folder_label(folder);
+        self.did(
+            format!("{} “{name}”", if add { "Labelled" } else { "Removed label" }),
+            Undo::Label { a, k: k.to_string(), folder: folder.id, added: add, name },
+        );
     }
 
     /// Searchable Move / Label picker under a toolbar button (`v` / `l`).
@@ -1303,17 +1536,37 @@ impl OwlPostApp {
                 let swiping = self.swipe.is_some();
 
                 let row_h = ROW_H;
-                let n = self.rows.len();
                 let mut clicked = None;
                 let mut menu: Option<(AccountId, String, u8)> = None;
                 let mut folder_menu: Option<(AccountId, String, Folder, FolderUse, bool)> = None;
+                let mut toggle_pinned = false;
                 let multi = self.accounts.len() > 1;
-                egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_source(egui::scroll_area::ScrollSource { mouse_wheel: !swiping, ..egui::scroll_area::ScrollSource::ALL }).show_rows(ui, row_h, n, |ui, range| {
+                let grouped = self.selection != Selection::Snoozed;
+                let layout = list_layout(&self.rows, grouped, self.hidden_pinned, Utc::now());
+                let total = layout.last().map(|(y, h, _)| y + h).unwrap_or(0.0) + 12.0;
+                egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_source(egui::scroll_area::ScrollSource { mouse_wheel: !swiping, ..egui::scroll_area::ScrollSource::ALL }).show_viewport(ui, |ui, viewport| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    for i in range {
+                    let width = ui.available_width();
+                    let origin = ui.max_rect().min;
+                    ui.allocate_space(egui::vec2(width, total));
+                    for (y, h, item) in &layout {
+                        if y + h < viewport.top() || *y > viewport.bottom() {
+                            continue;
+                        }
+                        let i = match item {
+                            ListItem::Header(title) => {
+                                let r = egui::Rect::from_min_size(origin + egui::vec2(0.0, *y), egui::vec2(width, *h));
+                                if section_header(ui, &col, r, title, (title == "Pinned").then_some(self.hidden_pinned)) {
+                                    toggle_pinned = true;
+                                }
+                                continue;
+                            }
+                            ListItem::Row(i) => *i,
+                        };
                         let t = self.rows[i].t.clone();
                         let snoozed_until = self.rows[i].snoozed_until;
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click_and_drag());
+                        let rect = egui::Rect::from_min_size(origin + egui::vec2(0.0, *y), egui::vec2(width, row_h));
+                        let resp = ui.interact(rect, ui.id().with(("row", t.account_id, &t.thread_key)), Sense::click_and_drag());
                         if self.selected == Some(i) && ui.ctx().input(|inp| inp.key_pressed(Key::ArrowDown) || inp.key_pressed(Key::ArrowUp) || inp.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "j" || t == "k"))) {
                             ui.scroll_to_rect(rect, None);
                         }
@@ -1381,18 +1634,14 @@ impl OwlPostApp {
                         // Canary-style: no dividers, a rounded highlight inset from the edges.
                         p.rect_filled(rect_c, 0.0, col.list);
                         if bg != col.list {
-                            p.rect_filled(rect_c.shrink2(egui::vec2(6.0, 2.0)), 8.0, bg);
+                            p.rect_filled(rect_c.shrink2(egui::vec2(8.0, 2.0)), 9.0, bg);
                         }
                         let rect = rect_c;
-                        let left = rect.left() + 16.0;
                         let top = rect.top();
-                        if t.unread {
-                            p.circle_filled(egui::pos2(rect.left() + 9.0, top + 30.0), 3.5, if selected { fg } else { col.unread });
-                        }
                         let latest = t.participants.last().cloned().unwrap_or_default();
-                        style::paint_avatar(&p, egui::pos2(left + 18.0, top + 30.0), &latest.name, &latest.email, 36.0);
-                        let x = left + 48.0;
-                        let mut right = rect.right() - 16.0;
+                        style::paint_avatar(&p, egui::pos2(rect.left() + 36.0, top + 29.0), &latest.name, &latest.email, 34.0);
+                        let x = rect.left() + 62.0;
+                        let mut right = rect.right() - 20.0;
 
                         // Line 1: people … date ▌(account colour)
                         if multi {
@@ -1412,6 +1661,11 @@ impl OwlPostApp {
                         let me = self.accounts.iter().find(|a| a.id == t.account_id);
                         let (first, rest, from_me) = participants_parts(&t.participants, me);
                         let mut nx = x;
+                        // Unread: a dot before the name, as in Canary.
+                        if t.unread {
+                            p.circle_filled(egui::pos2(nx + 4.0, top + 19.0), 4.0, if selected { fg } else { col.unread });
+                            nx += 13.0;
+                        }
                         if from_me {
                             // You sent the latest message.
                             icons::paint(&p, egui::pos2(nx + 6.0, top + 19.0), 12.0, Icon::Reply, sub);
@@ -1425,18 +1679,19 @@ impl OwlPostApp {
                         }
 
                         // Line 2: subject … pin, attachment, star, count
-                        let mut ix = rect.right() - 16.0;
+                        let mut ix = rect.right() - 20.0;
                         let mut badge = |p: &egui::Painter, w: f32, draw: &dyn Fn(&egui::Painter, egui::Pos2)| {
                             draw(p, egui::pos2(ix - w / 2.0, top + 39.0));
                             ix -= w + 4.0;
                         };
                         if t.count > 1 {
-                            let g = p.layout_no_wrap(t.count.to_string(), egui::FontId::proportional(12.5), fg);
-                            let w = g.size().x + 1.0;
+                            // The message count in a small grey box, as in Canary.
+                            let g = p.layout_no_wrap(t.count.to_string(), egui::FontId::proportional(11.5), fg);
+                            let w = (g.size().x + 9.0).max(17.0);
+                            let boxed = if selected { fg.gamma_multiply(0.25) } else { style::blend(col.text, bg, 0.09) };
                             badge(&p, w, &|p, c| {
-                                let pos = egui::pos2(c.x - w / 2.0, c.y - g.size().y / 2.0);
-                                p.galley(pos, g.clone(), fg);
-                                p.galley(pos + egui::vec2(0.6, 0.0), g.clone(), fg);
+                                p.rect_filled(egui::Rect::from_center_size(c, egui::vec2(w, 16.0)), 3.0, boxed);
+                                p.galley(egui::pos2(c.x - g.size().x / 2.0, c.y - g.size().y / 2.0), g.clone(), fg);
                             });
                         }
                         if t.has_attachments {
@@ -1461,7 +1716,7 @@ impl OwlPostApp {
                         }
 
                         // Lines 3–4: a two-line preview.
-                        style::paragraph(&p, egui::pos2(x, top + 51.0), &t.snippet, egui::FontId::proportional(12.5), sub, rect.right() - 16.0 - x, 2);
+                        style::paragraph(&p, egui::pos2(x, top + 51.0), &t.snippet, egui::FontId::proportional(12.5), sub, rect.right() - 20.0 - x, 2);
 
                         // Quick actions on hover, in a wide enough list.
                         if show_quick && hovered {
@@ -1474,12 +1729,12 @@ impl OwlPostApp {
                             ];
                             let (seg, h) = (28.0, 30.0);
                             let w = seg * items.len() as f32 + 6.0;
-                            let qr = egui::Rect::from_min_size(egui::pos2(rect.right() - 16.0 - w, rect.center().y - h / 2.0), egui::vec2(w, h));
+                            let qr = egui::Rect::from_min_size(egui::pos2(rect.right() - 20.0 - w, rect.center().y - h / 2.0), egui::vec2(w, h));
                             // Cover the right-hand end of the row, fading in from the left.
                             // Stay inside the row's rounded highlight.
-                            let hl = rect.shrink2(egui::vec2(6.0, 2.0));
+                            let hl = rect.shrink2(egui::vec2(8.0, 2.0));
                             let cover = egui::Rect::from_min_max(egui::pos2(qr.left() - 8.0, hl.top()), hl.right_bottom());
-                            p.rect_filled(cover, egui::CornerRadius { nw: 0, sw: 0, ne: 8, se: 8 }, bg);
+                            p.rect_filled(cover, egui::CornerRadius { nw: 0, sw: 0, ne: 9, se: 9 }, bg);
                             let fade = egui::Rect::from_min_max(egui::pos2(cover.left() - 28.0, cover.top()), egui::pos2(cover.left(), cover.bottom()));
                             let mut mesh = egui::Mesh::default();
                             let clear = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 0);
@@ -1543,6 +1798,10 @@ impl OwlPostApp {
                         self.select(i);
                     }
                 }
+                if toggle_pinned {
+                    self.list_settings.hide_pinned = !self.list_settings.hide_pinned;
+                    self.reload();
+                }
                 match folder_menu {
                     Some((a, k, f, FolderUse::Move, _)) => self.move_to(a, &k, &f),
                     Some((a, k, f, FolderUse::Label, add)) => self.set_label(a, &k, &f, add),
@@ -1573,6 +1832,7 @@ impl OwlPostApp {
             SwipeAction::ToggleRead => {
                 let unread = self.rows.iter().find(|r| r.t.account_id == a && r.t.thread_key == k).map(|r| r.t.unread).unwrap_or(false);
                 self.set_row_unread(a, k, !unread);
+                self.did(if unread { "Marked as read" } else { "Marked as unread" }, Undo::Unread { items: vec![(a, k.to_string(), unread)] });
                 self.reload();
             }
             SwipeAction::Snooze => {
@@ -1618,9 +1878,14 @@ impl OwlPostApp {
                 let downloading = self.downloading.clone();
                 let account = self.accounts.iter().find(|a| a.id == open.account_id).cloned();
 
+                // HTML email: the subject stays here and the web view shows
+                // the conversation below it.
+                let web = self.html_email && self.mail_view.is_some();
                 let Some(open) = &mut self.open else { return };
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    egui::Frame::new().inner_margin(egui::Margin { left: 24, right: 24, top: 18, bottom: 24 }).show(ui, |ui| {
+                let mut draw = |ui: &mut egui::Ui| {
+                    // Generous space around the conversation, like Canary.
+                    let margin = egui::Margin { left: 36, right: 36, top: 22, bottom: if web { 10 } else { 36 } };
+                    egui::Frame::new().inner_margin(margin).show(ui, |ui| {
                         let max_w = ui.available_width().min(860.0);
                         ui.set_max_width(max_w);
                         ui.label(RichText::new(&subject).size(21.0).strong().color(col.heading));
@@ -1642,10 +1907,16 @@ impl OwlPostApp {
                                 chip(ui, &format!("⏰ Snoozed until {}", snooze::describe(u)), col.snooze);
                             }
                         });
-                        ui.add_space(10.0);
+                        if web {
+                            return;
+                        }
+                        ui.add_space(20.0);
                         let n = open.messages.len();
                         for (i, m) in open.messages.iter().enumerate() {
                             let expanded = open.expanded.get(i).copied().unwrap_or(true);
+                            if i > 0 {
+                                ui.add_space(6.0);
+                            }
                             let (r, clicked) = message_card(ui, &col, m, expanded, i + 1 == n, &downloading);
                             if let Some((idx, what)) = clicked {
                                 attachment_req = Some((m.clone(), idx, what));
@@ -1666,7 +1937,15 @@ impl OwlPostApp {
                             }
                         });
                     });
-                });
+                };
+                let mut web_rect = None;
+                if web {
+                    draw(ui);
+                    web_rect = Some(ui.available_rect_before_wrap());
+                } else {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| draw(ui));
+                }
+                self.web_rect = web_rect;
                 if let Some(f) = remove_label {
                     self.set_label(thread_ref.0, &thread_ref.1, &f, false);
                 }
@@ -1677,6 +1956,67 @@ impl OwlPostApp {
                     self.compose_reply(mode);
                 }
             });
+    }
+
+    /// Act on clicks and keys from the HTML message view.
+    fn mail_view_events(&mut self, ctx: &egui::Context) {
+        use crate::mail_view::ViewEvent;
+        let events = self.mail_view.as_ref().map(|v| v.events()).unwrap_or_default();
+        for e in events {
+            match e {
+                ViewEvent::OpenLink(url) => {
+                    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+                        ctx.open_url(egui::OpenUrl::new_tab(url));
+                    }
+                }
+                ViewEvent::Attachment(id, i) => {
+                    if let Some(m) = self.open.as_ref().and_then(|o| o.messages.iter().find(|m| m.id == id)).cloned() {
+                        self.attachment(m, i, AttachmentClick::Open);
+                    }
+                }
+                ViewEvent::LoadImages => {
+                    if let Some(k) = self.current() {
+                        self.remote_images.insert(k);
+                    }
+                }
+                ViewEvent::Reply => self.compose_reply(0),
+                ViewEvent::ReplyAll => self.compose_reply(1),
+                ViewEvent::Forward => self.compose_reply(2),
+                ViewEvent::Key(k, cmd) => {
+                    self.pending_input.extend(crate::mail_view::key_events(&k, cmd));
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
+    /// Put the web view over the reading pane, or hide it while something
+    /// egui draws (a menu, Preferences) would be underneath it.
+    fn place_mail_view(&mut self, ctx: &egui::Context) {
+        let covered = self.prefs.is_some() || self.setup.is_some() || egui::Popup::is_any_open(ctx);
+        let (Some(view), Some(rect), Some(open)) = (self.mail_view.as_mut(), self.web_rect, self.open.as_ref()) else {
+            if let Some(v) = self.mail_view.as_mut() {
+                v.hide();
+            }
+            return;
+        };
+        if covered || !self.html_email {
+            view.hide();
+            return;
+        }
+        let key = (open.account_id, open.thread_key.clone());
+        let remote = self.remote_images.contains(&key);
+        let page_key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (&key, remote, &self.theme_id, open.messages.iter().map(|m| (m.id, m.starred, m.attachments.len())).collect::<Vec<_>>()).hash(&mut h);
+            h.finish()
+        };
+        let col = &self.colors;
+        view.show(rect, ctx.zoom_factor(), page_key, || {
+            let nonce = format!("{:x}", page_key ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7));
+            crate::mail_view::document(&crate::mail_view::Page { messages: &open.messages, expanded: &open.expanded, remote_images: remote, nonce: &nonce }, col)
+        });
     }
 
     /// Start "Sign in with Google" (one at a time).
@@ -1837,6 +2177,7 @@ impl OwlPostApp {
         if let Some(prefs) = &mut self.prefs {
             prefs.push = self.push.clone();
             prefs.google_ready = self.google_ready;
+            prefs.html_email = self.html_email;
             prefs.google_waiting = self.google.as_ref().map(|g| g.1.clone());
             let act = prefs.ui(ctx, &col, &self.themes, &self.theme_id, &self.accounts, &mut self.list_settings, &self.sigs);
             match act {
@@ -1895,6 +2236,7 @@ impl OwlPostApp {
                 }
                 PrefsAction::GoogleSignIn(target) => self.google_sign_in(target),
                 PrefsAction::CancelGoogle => self.cancel_google(),
+                PrefsAction::SetHtmlEmail(on) => self.html_email = on,
                 PrefsAction::SaveAccount(a) => {
                     let _ = self.store.update_account(&a);
                     if let Some(p) = &mut self.prefs {
@@ -1945,21 +2287,39 @@ impl OwlPostApp {
             }
         }
         // Toasts.
-        self.toasts.retain(|t| t.at.elapsed() < Duration::from_secs(if t.error { 8 } else { 4 }));
+        self.toasts.retain(|t| t.at.elapsed() < Duration::from_secs(if t.error || t.undo { 8 } else { 4 }));
         if !self.toasts.is_empty() {
+            // Over the message list: the reading pane may be a web view,
+            // which would cover anything egui draws there.
+            let screen = ctx.content_rect();
+            let x = if self.list_right > self.sidebar_right { (self.sidebar_right + self.list_right) / 2.0 } else { screen.center().x };
             egui::Area::new(egui::Id::new("toasts"))
-                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -20.0])
+                .pivot(egui::Align2::CENTER_BOTTOM)
+                .fixed_pos(egui::pos2(x, screen.bottom() - 20.0))
                 .order(egui::Order::Tooltip)
                 .show(ctx, |ui| {
+                    let mut undo_clicked = false;
                     for t in &self.toasts {
                         egui::Frame::new()
                             .fill(if t.error { col.error } else { egui::Color32::from_rgb(40, 44, 52) })
                             .corner_radius(8)
                             .inner_margin(egui::Margin::symmetric(16, 10))
                             .show(ui, |ui| {
-                                ui.label(RichText::new(&t.text).color(egui::Color32::WHITE));
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&t.text).color(egui::Color32::WHITE));
+                                    if t.undo {
+                                        ui.add_space(10.0);
+                                        let b = egui::Button::new(RichText::new("Undo").strong().color(egui::Color32::from_rgb(130, 180, 255))).frame(false);
+                                        if ui.add(b).on_hover_text("⌘Z").clicked() {
+                                            undo_clicked = true;
+                                        }
+                                    }
+                                });
                             });
                         ui.add_space(6.0);
+                    }
+                    if undo_clicked {
+                        self.undo_last();
                     }
                 });
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -1972,6 +2332,27 @@ pub fn install_image_loaders(ctx: &egui::Context) {
     egui_extras::install_image_loaders(ctx);
     // Tried first: decodes by content, so mislabelled images (Dropbox) still show.
     ctx.add_image_loader(std::sync::Arc::new(crate::html_view::SniffingImageLoader::default()));
+}
+
+/// A section heading in the message list ("Pinned", "Today"…). For Pinned,
+/// `pinned` is how many are hidden, and a Hide / Show button folds the
+/// section. Returns true when that button is clicked.
+fn section_header(ui: &mut egui::Ui, col: &Colors, rect: egui::Rect, title: &str, pinned: Option<usize>) -> bool {
+    let p = ui.painter_at(rect);
+    let y = rect.bottom() - 9.0;
+    let font = egui::FontId::proportional(12.5);
+    let text = match pinned {
+        Some(n) if n > 0 => format!("{title} · {n} hidden"),
+        _ => title.to_string(),
+    };
+    p.text(egui::pos2(rect.left() + 18.0, y), egui::Align2::LEFT_BOTTOM, text, font.clone(), col.subtle);
+    let Some(hidden) = pinned else { return false };
+    let label = if hidden > 0 { "Show" } else { "Hide" };
+    let g = p.layout_no_wrap(label.into(), font, col.subtle);
+    let br = egui::Rect::from_min_size(egui::pos2(rect.right() - 20.0 - g.size().x, y - g.size().y), g.size()).expand(4.0);
+    let r = ui.interact(br, ui.id().with(("section", title)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    p.galley(egui::pos2(br.left() + 4.0, br.top() + 4.0), g, if r.hovered() { col.text } else { col.subtle });
+    r.clicked()
 }
 
 fn swipe_color(col: &Colors, a: SwipeAction) -> egui::Color32 {
@@ -2134,10 +2515,10 @@ fn message_card(
     let mut clicked = None;
     egui::Frame::new()
         .fill(col.bg)
-        .stroke(egui::Stroke::new(1.0_f32, col.border))
-        .corner_radius(8)
-        .inner_margin(egui::Margin::same(16))
-        .shadow(egui::Shadow { offset: [0, 1], blur: 4, spread: 0, color: egui::Color32::from_black_alpha(18) })
+        .stroke(egui::Stroke::new(1.0_f32, style::blend(col.border, col.bg, 0.6)))
+        .corner_radius(10)
+        .inner_margin(egui::Margin { left: 26, right: 26, top: 20, bottom: 24 })
+        .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: egui::Color32::from_black_alpha(14) })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let header = ui.horizontal(|ui| {
@@ -2170,10 +2551,11 @@ fn message_card(
                 toggled = true;
             }
             if expanded {
-                ui.add_space(10.0);
-                body(ui, col, &m.body_text);
+                // Header, a hairline, then (like Canary) attachments above the text.
+                ui.add_space(12.0);
+                hairline(ui, col);
                 if !m.attachments.is_empty() {
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
                     ui.horizontal_wrapped(|ui| {
                         for (i, a) in m.attachments.iter().enumerate() {
                             if let Some(what) = attachment_chip(ui, col, a, downloading.contains(&(m.id, i)), (m.id, i)) {
@@ -2181,10 +2563,20 @@ fn message_card(
                             }
                         }
                     });
+                    ui.add_space(12.0);
+                    hairline(ui, col);
                 }
+                ui.add_space(20.0);
+                body(ui, col, &m.body_text);
             }
         });
     (toggled, clicked)
+}
+
+/// A thin full-width divider inside a message card.
+fn hairline(ui: &mut egui::Ui, col: &Colors) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().hline(r.x_range(), r.center().y, egui::Stroke::new(1.0_f32, style::blend(col.border, col.bg, 0.7)));
 }
 
 /// A received attachment: click to open, right-click for Save options.
@@ -2302,19 +2694,37 @@ fn human_size(b: usize) -> String {
 }
 
 impl eframe::App for OwlPostApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // The web view hangs off the native window, so it's made here.
+        if !self.mail_view_tried {
+            self.mail_view_tried = true;
+            self.mail_view = crate::mail_view::MailView::new(frame, self.colors.bg_secondary);
+        }
         self.frame(ctx);
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Shortcuts typed while a message (the web view) had focus.
+        for e in self.pending_input.drain(..) {
+            if let egui::Event::Key { modifiers, .. } = &e {
+                raw_input.modifiers = *modifiers;
+            }
+            raw_input.events.push(e);
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(THEME_KEY, self.theme_id.clone());
         storage.set_string(LIST_KEY, self.list_settings.encode());
+        storage.set_string(HTML_KEY, if self.html_email { "1" } else { "0" }.into());
     }
 }
 
 impl OwlPostApp {
     pub fn frame(&mut self, ctx: &egui::Context) {
         self.handle_events();
+        self.web_rect = None;
+        self.mail_view_events(ctx);
         if self.accounts.is_empty() {
             let col = self.colors.clone();
             egui::CentralPanel::default().frame(egui::Frame::new().fill(col.bg_secondary)).show(ctx, |ui| {
@@ -2333,6 +2743,7 @@ impl OwlPostApp {
                 });
             });
             self.windows(ctx);
+            self.place_mail_view(ctx);
             return;
         }
         self.handle_keys(ctx);
@@ -2341,6 +2752,7 @@ impl OwlPostApp {
         self.thread_list(ctx);
         self.reader(ctx);
         self.windows(ctx);
+        self.place_mail_view(ctx);
         // Keep relative times and snooze wake-ups fresh.
         ctx.request_repaint_after(Duration::from_secs(30));
     }
@@ -2462,7 +2874,9 @@ mod ui_tests {
 
     fn row_center(h: &Harness<'static, OwlPostApp>, i: usize) -> egui::Pos2 {
         let s = h.state();
-        egui::pos2((s.sidebar_right + s.list_right) / 2.0, 52.0 + ROW_H / 2.0 + ROW_H * i as f32)
+        let layout = list_layout(&s.rows, s.selection != Selection::Snoozed, s.hidden_pinned, Utc::now());
+        let y = layout.iter().find(|(_, _, it)| *it == ListItem::Row(i)).map(|(y, _, _)| *y).unwrap();
+        egui::pos2((s.sidebar_right + s.list_right) / 2.0, 52.0 + y + ROW_H / 2.0)
     }
 
     #[test]
@@ -2838,6 +3252,115 @@ mod ui_tests {
         assert!(h.query_by_label("Sign in with Google").is_some());
         assert!(h.query_by_label("…or connect with an app password:").is_some());
         save(&mut h, "setup-gmail-google");
+    }
+
+    #[test]
+    fn command_z_undoes() {
+        let mut h = harness("owlpost-light");
+        h.run_steps(3);
+        let in_list = |h: &Harness<'static, OwlPostApp>, k: &str| h.state().rows.iter().any(|r| r.t.thread_key == k);
+        let wait_for = |h: &mut Harness<'static, OwlPostApp>, k: &str, present: bool| {
+            for _ in 0..100 {
+                h.run_steps(1);
+                h.state_mut().reload();
+                if h.state().rows.iter().any(|r| r.t.thread_key == k) == present {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        // Archive with `e`, then ⌘Z.
+        let idx = h.state().rows.iter().position(|r| r.t.subject.contains("Dinner")).unwrap();
+        let key = h.state().rows[idx].t.thread_key.clone();
+        h.state_mut().select(idx);
+        h.run_steps(2);
+        h.event(egui::Event::Text("e".into()));
+        h.run_steps(2);
+        assert!(!in_list(&h, &key), "archived");
+        assert!(h.state().toasts.iter().any(|t| t.undo && t.text == "Archived"));
+        save(&mut h, "undo-toast");
+        assert!(wait_for(&mut h, &key, false), "the archive finishes");
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::Z);
+        h.run_steps(2);
+        assert!(wait_for(&mut h, &key, true), "⌘Z brings it back to the Inbox");
+        assert!(h.state().toasts.iter().any(|t| t.text == "Undid archive"));
+
+        // Trash straight after, then click Undo on the toast at once: the undo
+        // waits for the move to finish rather than racing it.
+        let idx = h.state().rows.iter().position(|r| r.t.thread_key == key).unwrap();
+        h.state_mut().select(idx);
+        h.run_steps(1);
+        h.state_mut().act_move(FolderRole::Trash);
+        h.state_mut().undo_last();
+        assert!(wait_for(&mut h, &key, true), "trash undone");
+        let acct = h.state().rows.iter().find(|r| r.t.thread_key == key).unwrap().t.account_id;
+        let trash = h.state().store.folder_by_role(acct, FolderRole::Trash).unwrap().unwrap();
+        for _ in 0..50 {
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!h.state().store.thread_folder_ids(acct, &key).unwrap().contains(&trash.id), "and out of the Trash");
+
+        // Snooze, pin and read state.
+        let idx = h.state().rows.iter().position(|r| r.t.thread_key == key).unwrap();
+        h.state_mut().select(idx);
+        h.run_steps(1);
+        h.state_mut().act_snooze(Utc::now() + chrono::Duration::hours(3));
+        assert!(!in_list(&h, &key));
+        h.state_mut().undo_last();
+        h.run_steps(1);
+        assert!(in_list(&h, &key), "unsnoozed");
+        h.state_mut().toggle_pin(acct, &key);
+        assert!(h.state().store.is_pinned(acct, &key).unwrap());
+        h.state_mut().undo_last();
+        assert!(!h.state().store.is_pinned(acct, &key).unwrap(), "unpinned again");
+        // Nothing left to undo.
+        while !h.state().undo.is_empty() {
+            h.state_mut().undo.pop();
+        }
+        h.state_mut().undo_last();
+        assert!(h.state().toasts.iter().any(|t| t.text == "Nothing to undo"));
+    }
+
+    #[test]
+    fn pinned_section_hides_and_shows() {
+        let mut h = harness("owlpost-light");
+        h.run_steps(3);
+        let (a, k) = (h.state().rows[2].t.account_id, h.state().rows[2].t.thread_key.clone());
+        h.state_mut().toggle_pin(a, &k);
+        h.run_steps(3);
+        let layout = list_layout(&h.state().rows, true, 0, Utc::now());
+        assert_eq!(layout[0].2, ListItem::Header("Pinned".into()));
+        assert_eq!(layout[1].2, ListItem::Row(0));
+        assert!(h.state().rows[0].t.pinned);
+        save(&mut h, "list-pinned");
+        // Click "Hide" in the Pinned header.
+        let s = h.state();
+        let at = egui::pos2(s.list_right - 30.0, 52.0 + LIST_TOP + HEADER_H - 14.0);
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        h.run_steps(2);
+        assert!(h.state().list_settings.hide_pinned);
+        assert_eq!(h.state().hidden_pinned, 1);
+        assert!(h.state().rows.iter().all(|r| !r.t.pinned), "pinned conversations are folded away");
+        save(&mut h, "list-pinned-hidden");
+        assert_eq!(ListSettings::decode(&h.state().list_settings.encode()), h.state().list_settings, "remembered");
+        assert!(!ListSettings::decode("trash,archive,1").hide_pinned, "older settings still load");
+    }
+
+    #[test]
+    fn date_groups() {
+        use chrono::{Local, TimeZone};
+        let now = Local.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap().with_timezone(&Utc); // a Saturday
+        let at = |d: u32, m: u32, y: i32| Local.with_ymd_and_hms(y, m, d, 9, 0, 0).unwrap().with_timezone(&Utc);
+        assert_eq!(date_group(at(7, 11, 2026), now), "Today");
+        assert_eq!(date_group(at(6, 11, 2026), now), "Yesterday");
+        assert_eq!(date_group(at(3, 11, 2026), now), "Earlier this week");
+        assert_eq!(date_group(at(28, 10, 2026), now), "Last week");
+        assert_eq!(date_group(at(2, 10, 2026), now), "October");
+        assert_eq!(date_group(at(2, 10, 2025), now), "October 2025");
     }
 
     #[test]

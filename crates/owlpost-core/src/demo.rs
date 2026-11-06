@@ -20,6 +20,36 @@ struct Seed {
     attachment: Option<&'static str>,
 }
 
+/// A designed (HTML) email, to show off HTML rendering: a table layout
+/// like real newsletters, with a remote image that stays blocked until
+/// "Load images".
+const NEWSLETTER_ID: &str = "nov-roast@kowhai.demo";
+const NEWSLETTER_HTML: &str = r##"<!doctype html><html><head><style>
+  .btn { background:#2f5d50; color:#fff !important; text-decoration:none; padding:12px 26px; border-radius:24px; font-weight:600; display:inline-block; }
+  h1 { font-family: Georgia, serif; font-weight: normal; }
+</style></head><body style="margin:0;background:#f3efe7;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3efe7;"><tr><td align="center" style="padding:24px 12px;">
+  <table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;background:#ffffff;border-radius:12px;overflow:hidden;">
+    <tr><td style="background:#2f5d50;color:#f3efe7;padding:18px 28px;font:600 13px/1 -apple-system,Helvetica,sans-serif;letter-spacing:.12em;">KŌWHAI COFFEE</td></tr>
+    <tr><td><img src="https://images.kowhai.demo/guji-hero.jpg" width="560" alt="Bag of Ethiopia Guji beans" style="display:block;width:100%;height:auto;background:#d9cbb2;min-height:120px;"></td></tr>
+    <tr><td style="padding:28px 28px 8px;color:#2b2b2b;font:15px/1.6 -apple-system,Helvetica,sans-serif;">
+      <h1 style="margin:0 0 12px;font-size:28px;color:#2f5d50;">November roast: Ethiopia Guji</h1>
+      <p style="margin:0 0 16px;">Bright, floral and juicy, with notes of <b>peach</b> and <b>jasmine</b>. Roasted on Mondays, at your door by Wednesday.</p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:8px 0 20px;border-top:1px solid #eee;border-bottom:1px solid #eee;">
+        <tr>
+          <td style="padding:12px 0;font:13px -apple-system,Helvetica,sans-serif;color:#777;">Origin<br><b style="color:#2b2b2b;">Guji, Ethiopia</b></td>
+          <td style="padding:12px 0;font:13px -apple-system,Helvetica,sans-serif;color:#777;">Process<br><b style="color:#2b2b2b;">Natural</b></td>
+          <td style="padding:12px 0;font:13px -apple-system,Helvetica,sans-serif;color:#777;">Roast<br><b style="color:#2b2b2b;">Light</b></td>
+        </tr>
+      </table>
+      <p style="text-align:center;margin:0 0 24px;"><a class="btn" href="https://kowhai.demo/guji">Shop the roast</a></p>
+    </td></tr>
+    <tr><td style="padding:16px 28px 24px;color:#999;font:12px/1.5 -apple-system,Helvetica,sans-serif;border-top:1px solid #f0f0f0;">Kōwhai Coffee · 12 Cuba St · <a href="https://kowhai.demo/unsubscribe" style="color:#999;">Unsubscribe</a></td></tr>
+  </table>
+</td></tr></table>
+<script>document.body.innerHTML = 'hacked';</script>
+</body></html>"##;
+
 const ME_PERSONAL: (&str, &str) = ("Alex Rivera", "alex@icloud.demo");
 const ME_WORK: (&str, &str) = ("Alex Rivera", "alex.rivera@gmail.demo");
 
@@ -101,6 +131,19 @@ fn personal() -> Vec<Seed> {
             reply_to: None,
             unread: false,
             starred: true,
+            attachment: None,
+        },
+        Seed {
+            folder: FolderRole::Inbox,
+            from: ("Kōwhai Coffee", "hello@kowhai.demo"),
+            to: ME_PERSONAL,
+            subject: "November roast: Ethiopia Guji is here",
+            body: "November roast: Ethiopia Guji\n\nBright, floral and juicy, with notes of peach and jasmine.\n\nShop the roast: https://kowhai.demo/guji\n\nKōwhai Coffee · 12 Cuba St",
+            hours_ago: 50,
+            id: NEWSLETTER_ID,
+            reply_to: None,
+            unread: false,
+            starred: false,
             attachment: None,
         },
     ]
@@ -249,7 +292,7 @@ fn seed_account(store: &Store, account: &Account, seeds: Vec<Seed>, roles: &[(&s
             date: Utc::now() - Duration::hours(s.hours_ago),
             snippet: crate::parse::make_snippet(s.body),
             body_text: s.body.to_string(),
-            body_html: None,
+            body_html: (s.id == NEWSLETTER_ID).then(|| NEWSLETTER_HTML.to_string()),
             attachments: s
                 .attachment
                 .map(|f| vec![Attachment { filename: f.into(), mime_type: "application/octet-stream".into(), size: 482_113 }])

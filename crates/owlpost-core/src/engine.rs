@@ -314,6 +314,54 @@ pub fn move_thread_to(store: &Store, account: &Account, thread_key: &str, target
     Ok(())
 }
 
+/// The folders a move to `target` would take the thread out of, so it can
+/// be undone (see [`restore_thread`]).
+pub fn move_plan(store: &Store, account: &Account, thread_key: &str, target: FolderId, from: Option<FolderId>) -> Result<Vec<FolderId>> {
+    Ok(move_sources(account, copies_by_folder(store, account, thread_key)?, from, target).into_iter().map(|((id, _, _), _)| id).collect())
+}
+
+/// Undo a move: bring the thread from `from` (where it was moved to) back
+/// into `to` (where it came from).
+///
+/// Gmail's All Mail is special: archiving there only removed the Inbox
+/// label, so it's restored by copying (adding the label back). Moving out
+/// of All Mail would delete the messages.
+pub fn restore_thread(store: &Store, account: &Account, thread_key: &str, to: &Folder, from: &Folder) -> Result<()> {
+    let copy_only = from.role == FolderRole::All;
+    if account.demo {
+        if copy_only {
+            store.copy_thread_local(account.id, thread_key, to.id)?;
+        } else {
+            store.move_thread_local_from(account.id, thread_key, &[from.id], to.id)?;
+        }
+        return Ok(());
+    }
+    let copies = copies_by_folder(store, account, thread_key)?;
+    let uids: Vec<u32> = copies.iter().filter(|((id, _, _), _)| *id == from.id).flat_map(|(_, u)| u.clone()).collect();
+    if uids.is_empty() {
+        return Err(anyhow!("the conversation is no longer in {}", from.name));
+    }
+    let mut s = connect(account)?;
+    s.select(&from.path)?;
+    let set = uid_set(&uids);
+    if copy_only {
+        s.uid_copy(&set, &to.path)?;
+    } else {
+        let has_move = s.capabilities()?.has_str("MOVE");
+        if has_move {
+            s.uid_mv(&set, &to.path)?;
+        } else {
+            s.uid_copy(&set, &to.path)?;
+            s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)")?;
+            s.expunge()?;
+        }
+        store.delete_uids(from.id, &uids)?;
+    }
+    let _ = sync_folder(store, &mut s, account, to);
+    let _ = s.logout();
+    Ok(())
+}
+
 /// Quote a mailbox / label name for an IMAP command.
 fn imap_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
@@ -590,6 +638,33 @@ mod tests {
         assert_eq!(safe_filename("../../etc/passwd"), "_.._etc_passwd");
         assert_eq!(safe_filename("Q3: plan?.pdf"), "Q3_ plan_.pdf");
         assert_eq!(safe_filename(""), "attachment");
+    }
+
+    #[test]
+    fn moves_can_be_undone() {
+        let p = crate::test_db_path("sp-undo");
+        let store = Store::open(&p).unwrap();
+        crate::demo::seed(&store).unwrap();
+        for gmail in [false, true] {
+            let account = store.accounts().unwrap().into_iter().find(|a| a.is_gmail() == gmail).unwrap();
+            let inbox = store.folder_by_role(account.id, FolderRole::Inbox).unwrap().unwrap();
+            let key = store.threads(&MailboxView::Folder(inbox.id), "", 10).unwrap().remove(0).thread_key;
+            for role in [FolderRole::Archive, FolderRole::Trash] {
+                let target = folder_for_role(&store, &account, role).unwrap();
+                let plan = move_plan(&store, &account, &key, target.id, None).unwrap();
+                assert_eq!(plan, [inbox.id], "{role:?} takes it out of the Inbox");
+                move_thread(&store, &account, &key, role).unwrap();
+                assert!(!store.thread_folder_ids(account.id, &key).unwrap().contains(&inbox.id));
+                for f in plan {
+                    restore_thread(&store, &account, &key, &store.folder(f).unwrap().unwrap(), &target).unwrap();
+                }
+                let now = store.thread_folder_ids(account.id, &key).unwrap();
+                assert!(now.contains(&inbox.id), "undo puts it back in the Inbox ({role:?}, gmail={gmail})");
+                if role == FolderRole::Trash {
+                    assert!(!now.contains(&target.id), "and out of the Trash");
+                }
+            }
+        }
     }
 
     #[test]

@@ -55,25 +55,29 @@ pub struct ListSettings {
     pub swipe_right: SwipeAction,
     /// Show action buttons when hovering a conversation in a wide list.
     pub quick_actions: bool,
+    /// The Pinned section is folded away ("Hide" in its header).
+    pub hide_pinned: bool,
 }
 
 impl Default for ListSettings {
     fn default() -> Self {
-        Self { swipe_left: SwipeAction::Trash, swipe_right: SwipeAction::Archive, quick_actions: true }
+        Self { swipe_left: SwipeAction::Trash, swipe_right: SwipeAction::Archive, quick_actions: true, hide_pinned: false }
     }
 }
 
 impl ListSettings {
     pub fn encode(&self) -> String {
-        format!("{},{},{}", self.swipe_left.key(), self.swipe_right.key(), self.quick_actions as u8)
+        format!("{},{},{},{}", self.swipe_left.key(), self.swipe_right.key(), self.quick_actions as u8, self.hide_pinned as u8)
     }
     pub fn decode(s: &str) -> Self {
         let mut d = Self::default();
         let parts: Vec<&str> = s.split(',').collect();
-        if let [l, r, q] = parts.as_slice() {
+        if let [l, r, q, rest @ ..] = parts.as_slice() {
             d.swipe_left = SwipeAction::parse(l).unwrap_or(d.swipe_left);
             d.swipe_right = SwipeAction::parse(r).unwrap_or(d.swipe_right);
             d.quick_actions = *q != "0";
+            // Added later: older settings have three fields.
+            d.hide_pinned = rest.first().is_some_and(|h| *h == "1");
         }
         d
     }
@@ -109,6 +113,8 @@ pub struct Prefs {
     google_id: String,
     google_secret: String,
     google_edit: bool,
+    /// Emails shown as designed (HTML in the web view); set by the app.
+    pub html_email: bool,
 }
 
 pub enum PrefsAction {
@@ -130,12 +136,14 @@ pub enum PrefsAction {
     /// Sign in with Google: a new account (None) or switch/renew one.
     GoogleSignIn(Option<AccountId>),
     CancelGoogle,
+    /// Show emails as designed (HTML) or as plain text.
+    SetHtmlEmail(bool),
     Close,
 }
 
 impl Prefs {
     pub fn new(tab: Tab) -> Self {
-        Self { tab, install_path: String::new(), editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false }
+        Self { tab, install_path: String::new(), editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false, html_email: true }
     }
 
     #[allow(clippy::too_many_arguments)] // one window, one call site
@@ -180,6 +188,17 @@ impl Prefs {
 
     fn appearance(&mut self, ui: &mut egui::Ui, col: &Colors, themes: &[Theme], current: &str) -> PrefsAction {
         let mut act = PrefsAction::None;
+        ui.label(RichText::new("Messages").strong().size(16.0));
+        let mut html = self.html_email;
+        let tip = if cfg!(target_os = "macos") {
+            "HTML emails are shown with their layout, colours and fonts (WebKit). Scripts never run, and remote images wait until you click Load images."
+        } else {
+            "Coming soon on this platform: messages are shown as text for now."
+        };
+        if ui.checkbox(&mut html, "Show emails as designed (HTML) — experimental").on_hover_text(tip).changed() {
+            act = PrefsAction::SetHtmlEmail(html);
+        }
+        ui.add_space(14.0);
         ui.label(RichText::new("Theme").strong().size(16.0));
         ui.label(
             RichText::new("OwlPost reads Mailspring theme packages: their ui-variables.less colours are applied to the native interface.")

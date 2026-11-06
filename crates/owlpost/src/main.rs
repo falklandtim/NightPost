@@ -4,6 +4,7 @@ mod app;
 mod attachments;
 mod composer;
 mod html_view;
+mod mail_view;
 mod icons;
 mod onboarding;
 mod prefs;

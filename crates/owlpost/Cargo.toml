@@ -11,6 +11,7 @@ anyhow.workspace = true
 chrono.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
+serde_json.workspace = true
 directories = "6"
 eframe = { version = "0.33", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence", "wayland", "x11"] }
 # "http" + "image": load signature images from the web.
@@ -18,6 +19,11 @@ egui_extras = { version = "0.33", features = ["http", "image"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 env_logger = "0.11"
 rfd = "0.15"
+
+# HTML email is shown in the system web view (WebKit). macOS first; Linux
+# (WebKitGTK) to follow.
+[target.'cfg(target_os = "macos")'.dependencies]
+wry = "0.57"
 
 [dev-dependencies]
 egui_kittest = { version = "0.33", features = ["wgpu", "snapshot"] }

@@ -5,6 +5,7 @@ use crossbeam_channel::{Receiver, Sender};
 use owlpost_core::engine::{self, SyncProgress};
 use owlpost_core::smtp::OutgoingMessage;
 use owlpost_core::{credentials, Account, AccountId, Auth, FolderId, FolderRole, Message, MessageId, Store};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -32,6 +33,59 @@ pub enum Cmd {
     /// account or switches an existing one to Google sign-in. Setting the
     /// flag cancels.
     GoogleSignIn(Option<AccountId>, Arc<AtomicBool>),
+    /// Undo a move: bring a thread back from the folder it was moved to
+    /// into the folders it came from.
+    Restore(AccountId, String, FolderId, Vec<FolderId>),
+    /// Is a Google OAuth client saved? (Read off the UI thread: the keychain
+    /// may wait on a permission prompt.)
+    CheckGoogle,
+}
+
+impl Cmd {
+    /// The conversation a command changes: commands on the same one run in
+    /// the order they were sent (so an undo never overtakes its action).
+    fn thread(&self) -> Option<(AccountId, String)> {
+        match self {
+            Cmd::SetUnread(a, k, _) | Cmd::SetStarred(a, k, _) | Cmd::Move(a, k, _) | Cmd::MoveTo(a, k, _, _) | Cmd::Label(a, k, _, _) | Cmd::Restore(a, k, _, _) => Some((*a, k.clone())),
+            Cmd::CreateFolder(a, _, Some((k, _))) => Some((*a, k.clone())),
+            _ => None,
+        }
+    }
+}
+
+/// Runs actions on the same conversation one after another, in order.
+#[derive(Default)]
+struct Turns {
+    /// Per conversation: (next turn to run, next ticket to hand out).
+    state: std::sync::Mutex<HashMap<(AccountId, String), (u64, u64)>>,
+    cv: std::sync::Condvar,
+}
+
+impl Turns {
+    fn ticket(&self, key: &(AccountId, String)) -> u64 {
+        let mut st = self.state.lock().unwrap();
+        let e = st.entry(key.clone()).or_insert((0, 0));
+        e.1 += 1;
+        e.1 - 1
+    }
+
+    fn wait(&self, key: &(AccountId, String), ticket: u64) {
+        let mut st = self.state.lock().unwrap();
+        while st.get(key).map(|e| e.0) != Some(ticket) {
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    fn done(&self, key: &(AccountId, String)) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(e) = st.get_mut(key) {
+            e.0 += 1;
+            if e.0 == e.1 {
+                st.remove(key);
+            }
+        }
+        self.cv.notify_all();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +123,7 @@ pub enum Event {
     GoogleWaiting(String),
     /// Google sign-in finished: Ok(message) or Err(reason).
     GoogleDone(Result<String, String>),
+    GoogleReady(bool),
 }
 
 /// A request for the sync thread.
@@ -235,6 +290,7 @@ impl Worker {
         std::thread::Builder::new()
             .name("actions".into())
             .spawn(move || {
+                let turns = Arc::new(Turns::default());
                 for cmd in cmd_rx {
                     match cmd {
                         Cmd::SyncAll => {
@@ -248,8 +304,20 @@ impl Worker {
                             let ev = ev_tx.clone();
                             let ctx = ctx.clone();
                             let sync_tx = sync_tx.clone();
+                            // Take a turn now, in send order.
+                            let turn = other.thread().map(|k| {
+                                let t = turns.ticket(&k);
+                                (k, t)
+                            });
+                            let turns = turns.clone();
                             std::thread::spawn(move || {
+                                if let Some((k, t)) = &turn {
+                                    turns.wait(k, *t);
+                                }
                                 run_action(&db, other, &ev, &sync_tx);
+                                if let Some((k, _)) = &turn {
+                                    turns.done(k);
+                                }
                                 ctx.request_repaint();
                             });
                         }
@@ -441,6 +509,16 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
                 engine::move_thread(&store, &account(a)?, &key, role)?;
                 let _ = ev.send(Event::Changed);
             }
+            Cmd::Restore(a, key, from, to) => {
+                let acc = account(a)?;
+                let from = store.folder(from)?.ok_or_else(|| anyhow::anyhow!("that folder no longer exists"))?;
+                for id in to {
+                    if let Some(f) = store.folder(id)? {
+                        engine::restore_thread(&store, &acc, &key, &f, &from)?;
+                    }
+                }
+                let _ = ev.send(Event::Changed);
+            }
             Cmd::MoveTo(a, key, folder, from) => {
                 let f = store.folder(folder)?.ok_or_else(|| anyhow::anyhow!("that folder no longer exists"))?;
                 engine::move_thread_to(&store, &account(a)?, &key, &f, from)?;
@@ -494,6 +572,11 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
                         let _ = ev.send(Event::AccountFailed(format!("{e:#}")));
                     }
                 }
+            }
+            Cmd::CheckGoogle => {
+                // Debug builds can skip it, so test runs never prompt for keychain access.
+                let skip = cfg!(debug_assertions) && std::env::var_os("OWLPOST_NO_KEYCHAIN").is_some();
+                let _ = ev.send(Event::GoogleReady(!skip && owlpost_core::oauth::GoogleClient::load().is_some()));
             }
             Cmd::GoogleSignIn(target, cancel) => {
                 let r = google_sign_in(&store, target, &cancel, ev, sync_tx);
@@ -679,6 +762,32 @@ mod push {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_conversation_runs_in_order() {
+        let turns = Arc::new(Turns::default());
+        let key = (1, "t".to_string());
+        let log = Arc::new(std::sync::Mutex::new(vec![]));
+        // Tickets in send order; threads start in reverse order.
+        let tickets: Vec<u64> = (0..5).map(|_| turns.ticket(&key)).collect();
+        let handles: Vec<_> = tickets
+            .into_iter()
+            .rev()
+            .map(|t| {
+                let (turns, key, log) = (turns.clone(), key.clone(), log.clone());
+                std::thread::spawn(move || {
+                    turns.wait(&key, t);
+                    log.lock().unwrap().push(t);
+                    turns.done(&key);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(*log.lock().unwrap(), [0, 1, 2, 3, 4]);
+        assert!(turns.state.lock().unwrap().is_empty(), "finished conversations are forgotten");
+    }
 
     #[test]
     fn sync_requests_merge() {
