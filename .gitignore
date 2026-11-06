@@ -1,0 +1,6 @@
+/target
+*.db
+.DS_Store
+
+# Reference screenshots dropped into the project folder (may show real mail)
+/Screenshot*.png

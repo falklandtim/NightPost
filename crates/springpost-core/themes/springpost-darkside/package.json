@@ -1,0 +1,8 @@
+{
+  "name": "springpost-darkside",
+  "displayName": "Darkside",
+  "theme": "ui",
+  "version": "1.0.0",
+  "description": "Light message list with a dark sidebar.",
+  "license": "GPL-3.0"
+}
