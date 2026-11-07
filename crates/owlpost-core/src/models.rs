@@ -205,18 +205,25 @@ impl FolderRole {
 
     /// Guess a role from IMAP SPECIAL-USE attributes and/or the folder name.
     pub fn detect(name: &str, attributes: &[String]) -> Self {
-        for a in attributes {
-            match a.to_ascii_lowercase().as_str() {
-                "\\sent" => return FolderRole::Sent,
-                "\\drafts" => return FolderRole::Drafts,
-                "\\trash" => return FolderRole::Trash,
-                "\\junk" => return FolderRole::Spam,
-                "\\archive" => return FolderRole::Archive,
-                "\\all" => return FolderRole::All,
-                "\\flagged" => return FolderRole::Starred,
-                _ => {}
-            }
-        }
+        Self::from_attributes(attributes).unwrap_or_else(|| Self::from_name(name))
+    }
+
+    /// The role a SPECIAL-USE attribute (`\Trash`, `\Sent`, …) gives.
+    pub fn from_attributes(attributes: &[String]) -> Option<Self> {
+        attributes.iter().find_map(|a| match a.to_ascii_lowercase().as_str() {
+            "\\sent" => Some(FolderRole::Sent),
+            "\\drafts" => Some(FolderRole::Drafts),
+            "\\trash" => Some(FolderRole::Trash),
+            "\\junk" => Some(FolderRole::Spam),
+            "\\archive" => Some(FolderRole::Archive),
+            "\\all" => Some(FolderRole::All),
+            "\\flagged" => Some(FolderRole::Starred),
+            _ => None,
+        })
+    }
+
+    /// A role guessed from the folder name alone.
+    pub fn from_name(name: &str) -> Self {
         let leaf = name.rsplit(['/', '.']).next().unwrap_or(name).to_ascii_lowercase();
         match leaf.as_str() {
             "inbox" => FolderRole::Inbox,
@@ -429,5 +436,6 @@ mod tests {
         assert_eq!(FolderRole::detect("INBOX", &[]), FolderRole::Inbox);
         assert_eq!(FolderRole::detect("Stuff", &["\\Trash".into()]), FolderRole::Trash);
         assert_eq!(FolderRole::detect("Projects", &[]), FolderRole::Other);
+        assert_eq!(FolderRole::from_attributes(&["\\HasNoChildren".into()]), None);
     }
 }

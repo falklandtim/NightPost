@@ -2,6 +2,7 @@
 
 mod app;
 mod attachments;
+mod avatars;
 mod composer;
 mod html_view;
 mod mail_view;

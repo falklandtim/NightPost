@@ -22,28 +22,182 @@ fn header_ids(v: &HeaderValue) -> Vec<String> {
     }
 }
 
+/// Bump when [`make_snippet`] changes, so stored previews are rebuilt.
+pub const SNIPPET_VERSION: i64 = 1;
+
 /// Collapse whitespace and trim to a list-view preview.
+///
+/// Newsletters' text parts are full of things nobody wants to read in a
+/// list: link targets (`<https://…>`, `[https://…]`, Markdown `[text](url)`),
+/// invisible padding characters that keep Gmail from showing the body as
+/// a preview (`&zwnj;`, U+034F, which draw as boxes), and rows of `****`.
 pub fn make_snippet(text: &str) -> String {
-    let mut out = String::with_capacity(200);
+    let mut kept = String::with_capacity(text.len().min(8192));
     for line in text.lines() {
         let l = line.trim();
         // Skip quoted text and "On ... wrote:" attributions.
         if l.starts_with('>') || (l.starts_with("On ") && l.ends_with("wrote:")) {
             continue;
         }
-        for w in l.split_whitespace() {
-            if !out.is_empty() {
-                out.push(' ');
+        kept.push_str(l);
+        kept.push('\n');
+        if kept.len() > 8000 {
+            break;
+        }
+    }
+    let clean = strip_links(&decode_entities(&kept));
+    let mut out = String::with_capacity(200);
+    let mut last = String::new();
+    for w in clean.split_whitespace() {
+        let w: String = w.chars().filter(|c| !invisible(*c)).collect();
+        let lower = w.to_ascii_lowercase();
+        if w.is_empty()
+            || w == last
+            || lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("www.")
+            || matches!(w.as_str(), "()" | "[]" | "<>" | "[[]]")
+            || (w.len() >= 3 && w.chars().all(|c| c.is_ascii_punctuation()))
+        {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&w);
+        if out.len() > 180 {
+            let mut cut = 180;
+            while !out.is_char_boundary(cut) {
+                cut -= 1;
             }
-            out.push_str(w);
-            if out.len() > 180 {
-                let mut cut = 180;
-                while !out.is_char_boundary(cut) {
-                    cut -= 1;
+            out.truncate(cut);
+            out.push('…');
+            return out;
+        }
+        last = w;
+    }
+    out
+}
+
+/// Zero-width and other characters that only pad or steer text.
+fn invisible(c: char) -> bool {
+    matches!(c, '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}'
+        | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FEFF}' | '\u{FFA0}')
+}
+
+/// HTML entities that leak into text parts (`&zwnj;`, `&nbsp;`, `&#847;`).
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let end = rest[1..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '#')).map(|e| e + 1);
+        let decoded = match end {
+            Some(e) if rest[e..].starts_with(';') && e > 1 => {
+                let name = &rest[1..e];
+                let c = match name {
+                    "nbsp" | "ensp" | "emsp" | "thinsp" => Some(' '),
+                    "zwnj" | "zwj" | "shy" | "lrm" | "rlm" => Some('\u{200B}'),
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "hellip" => Some('…'),
+                    "mdash" => Some('—'),
+                    "ndash" => Some('–'),
+                    "rsquo" => Some('’'),
+                    "lsquo" => Some('‘'),
+                    _ => name
+                        .strip_prefix("#x")
+                        .or_else(|| name.strip_prefix("#X"))
+                        .and_then(|h| u32::from_str_radix(h, 16).ok())
+                        .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
+                        .and_then(char::from_u32),
+                };
+                c.map(|c| (c, e + 1))
+            }
+            _ => None,
+        };
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_link(s: &str) -> bool {
+    let s = s.trim_start_matches(|c: char| c == '[' || c.is_whitespace()).to_ascii_lowercase();
+    s.starts_with("http://") || s.starts_with("https://") || s.starts_with("mailto:") || s.starts_with("www.")
+}
+
+/// Drop link targets, keeping link text: `[text](url)` → `text`, and
+/// `<url>`, `<[[url]]>`, `[url]`, `(url)` → nothing.
+fn strip_links(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let b = s.as_bytes();
+    // The closing byte for an opener, searched no further than `max` bytes.
+    let close = |from: usize, open: u8, shut: u8, max: usize| -> Option<usize> {
+        let stop = (from + max).min(b.len());
+        (from + 1..stop).find(|&j| b[j] == shut || (b[j] == open && open != shut)).filter(|&j| b[j] == shut)
+    };
+    while i < b.len() {
+        let c = b[i];
+        let skip = match c {
+            b'[' => {
+                // [[url]] or [url]
+                let inner_start = i;
+                let mut j = i;
+                while j < b.len() && b[j] == b'[' {
+                    j += 1;
                 }
-                out.truncate(cut);
-                out.push('…');
-                return out;
+                match (j..(j + 2000).min(b.len())).find(|&k| b[k] == b']') {
+                    Some(k) if is_link(&s[j..k]) => {
+                        let mut e = k;
+                        while e < b.len() && b[e] == b']' {
+                            e += 1;
+                        }
+                        Some(e)
+                    }
+                    Some(k) if j == inner_start + 1 && b.get(k + 1) == Some(&b'(') => {
+                        // [text](url)
+                        match close(k + 1, b'(', b')', 2000) {
+                            Some(p) if is_link(&s[k + 2..p]) || s[k + 2..p].starts_with('/') => {
+                                out.push_str(&s[j..k]);
+                                Some(p + 1)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            b'<' => close(i, b'<', b'>', 4000).filter(|&k| is_link(&s[i + 1..k])).map(|k| k + 1),
+            b'(' => close(i, b'(', b')', 2000).filter(|&k| is_link(&s[i + 1..k])).map(|k| k + 1),
+            _ => None,
+        };
+        match skip {
+            Some(e) => {
+                out.push(' ');
+                i = e;
+            }
+            None => {
+                let ch = s[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
             }
         }
     }
@@ -268,6 +422,26 @@ Date: Tue, 3 Nov 2026 10:00:00 +0000\r\nContent-Type: text/plain\r\n\r\nSounds g
         assert_eq!(m.in_reply_to, "root@example.com");
         assert_eq!(m.thread_key, "root@example.com");
         assert_eq!(m.snippet, "Sounds good!");
+    }
+
+    #[test]
+    fn newsletter_previews_read_cleanly() {
+        // Marketo: links in angle brackets, some wrapped over several lines.
+        assert_eq!(
+            make_snippet("View in your browser <[[https://go.example.nz/v/NzI3]]>\n\nYou last purchased from\n  \nLyall Bay\nFind your store here <[[\n\n   \n https://www.example.nz/store/x]]>\nFind Parts Fast <https://go.example.nz/dc/abc>"),
+            "View in your browser You last purchased from Lyall Bay Find your store here Find Parts Fast"
+        );
+        // Plain-text conversions with [url] after the link text.
+        assert_eq!(make_snippet("Hi there, Beam [https://ollama.com/library/beam] from Reflection AI"), "Hi there, Beam from Reflection AI");
+        // Markdown links keep their text; repeats collapse.
+        assert_eq!(make_snippet("[BLUNT](https://x.nz) [Shop All](https://x.nz/all) [GWP](https://x.nz) [GWP](https://x.nz)"), "BLUNT Shop All GWP");
+        // Preview padding: literal entities and invisible characters.
+        assert_eq!(make_snippet("&zwnj; &zwnj; &nbsp; &#847; Your gift of NZ$20 is waiting"), "Your gift of NZ$20 is waiting");
+        assert_eq!(make_snippet("Onions, radishes and more! \u{34F} \u{34F} \u{200C}\u{34F} \u{34F}"), "Onions, radishes and more!");
+        // Rows of asterisks, and "( url )".
+        assert_eq!(make_snippet("**********\nLittle Farms ( https://example.com?id=1 )\nView in the browser ( https://t.io/d/x )"), "Little Farms View in the browser");
+        // Ordinary text is untouched.
+        assert_eq!(make_snippet("Fish & chips (with peas) at 6 <maybe> [sic]"), "Fish & chips (with peas) at 6 <maybe> [sic]");
     }
 }
 

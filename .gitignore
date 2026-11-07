@@ -4,3 +4,7 @@
 
 # Reference screenshots dropped into the project folder (may show real mail)
 /Screenshot*.png
+# Screenshots and raw emails dropped in for debugging contain real mail.
+/*.png
+/*.rtf
+/*.eml

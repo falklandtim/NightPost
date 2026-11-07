@@ -80,7 +80,7 @@ pub fn sync_account(store: &Store, account: &Account, mut progress: impl FnMut(S
     }
     let mut session = connect(account)?;
     let names = session.list(Some(""), Some("*"))?;
-    let mut paths = Vec::new();
+    let mut found = Vec::new();
     for n in names.iter() {
         let attrs: Vec<String> = n
             .attributes()
@@ -94,15 +94,18 @@ pub fn sync_account(store: &Store, account: &Account, mut progress: impl FnMut(S
         if attrs.iter().any(|a| a.eq_ignore_ascii_case("\\Noselect") || a.eq_ignore_ascii_case("\\NonExistent")) {
             continue;
         }
-        let role = FolderRole::detect(n.name(), &attrs);
         // Gmail's [Gmail]/Important duplicates INBOX; skip it.
         if n.name().eq_ignore_ascii_case("[Gmail]/Important") {
             continue;
         }
-        store.upsert_folder(account.id, n.name(), role)?;
-        paths.push(n.name().to_string());
+        found.push((n.name().to_string(), attrs));
     }
     drop(names);
+    let mut paths = Vec::new();
+    for (path, role) in folder_roles(&found) {
+        store.upsert_folder(account.id, &path, role)?;
+        paths.push(path);
+    }
     store.delete_folders_not_in(account.id, &paths)?;
 
     let mut folders = store.folders(account.id)?;
@@ -124,6 +127,37 @@ pub fn sync_account(store: &Store, account: &Account, mut progress: impl FnMut(S
     }
     let _ = session.logout();
     Ok(new_total)
+}
+
+/// Each folder's role. The server's SPECIAL-USE flags win: once it marks
+/// `[Gmail]/Trash` as `\\Trash`, a plain label that happens to be called
+/// "Deleted Messages" or "Drafts" (old clients made these) is just a folder.
+fn folder_roles(found: &[(String, Vec<String>)]) -> Vec<(String, FolderRole)> {
+    let flagged: Vec<FolderRole> = found.iter().filter_map(|(_, a)| FolderRole::from_attributes(a)).collect();
+    found
+        .iter()
+        .map(|(path, attrs)| {
+            let role = FolderRole::from_attributes(attrs).unwrap_or_else(|| match FolderRole::from_name(path) {
+                r if r != FolderRole::Inbox && flagged.contains(&r) => FolderRole::Other,
+                r => r,
+            });
+            (path.clone(), role)
+        })
+        .collect()
+}
+
+/// Which messages to download, newest first. The first sync takes the
+/// newest [`INITIAL_WINDOW`]; after that only mail that arrived since
+/// (UIDs above the last one seen). Older mail outside the window stays on
+/// the server: without the `last_uid` floor, every sync of a big folder
+/// like All Mail re-downloaded hundreds of old messages.
+fn uids_to_fetch(server: &HashSet<u32>, known: &HashSet<u32>, last_uid: u32) -> Vec<u32> {
+    let mut new: Vec<u32> = server.difference(known).copied().filter(|u| last_uid == 0 || *u > last_uid).collect();
+    new.sort_unstable_by(|a, b| b.cmp(a));
+    if last_uid == 0 {
+        new.truncate(INITIAL_WINDOW);
+    }
+    new
 }
 
 fn sync_folder(store: &Store, session: &mut Session, account: &Account, folder: &Folder) -> Result<usize> {
@@ -152,12 +186,7 @@ fn sync_folder(store: &Store, session: &mut Session, account: &Account, folder: 
         }
     }
 
-    // New mail, newest first, capped at the window.
-    let mut new: Vec<u32> = server.difference(&known).copied().collect();
-    new.sort_unstable_by(|a, b| b.cmp(a));
-    let floor = if folder.last_uid == 0 { 0 } else { folder.last_uid };
-    let budget = if folder.last_uid == 0 { INITIAL_WINDOW } else { INITIAL_WINDOW.max(new.iter().filter(|u| **u > floor).count()) };
-    new.truncate(budget);
+    let new = uids_to_fetch(&server, &known, folder.last_uid);
     let mut inserted = 0;
     for chunk in new.chunks(FETCH_CHUNK) {
         let set = uid_set(chunk);
@@ -582,6 +611,39 @@ fn demo_attachment(filename: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_new_mail_is_fetched_after_the_first_sync() {
+        let server: HashSet<u32> = (1..=1000).collect();
+        // First sync: the newest window.
+        let first = uids_to_fetch(&server, &HashSet::new(), 0);
+        assert_eq!(first.len(), INITIAL_WINDOW);
+        assert_eq!((first[0], *first.last().unwrap()), (1000, 701));
+        // Next sync, nothing new: nothing to download (older mail stays put).
+        let known: HashSet<u32> = (701..=1000).collect();
+        assert!(uids_to_fetch(&server, &known, 1000).is_empty());
+        // Three new messages arrive (one moved in from elsewhere).
+        let mut server2 = server.clone();
+        server2.extend([1001, 1002, 1005]);
+        assert_eq!(uids_to_fetch(&server2, &known, 1000), vec![1005, 1002, 1001]);
+    }
+
+    #[test]
+    fn special_use_flags_beat_folder_names() {
+        let f = |p: &str, a: &[&str]| (p.to_string(), a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // Gmail, with labels left behind by Apple Mail.
+        let gmail = folder_roles(&[f("INBOX", &[]), f("Drafts", &[]), f("Deleted Messages", &[]), f("[Gmail]/Drafts", &["\\Drafts"]), f("[Gmail]/Trash", &["\\Trash"])]);
+        let role = |p: &str| gmail.iter().find(|(q, _)| q == p).unwrap().1;
+        assert_eq!(role("INBOX"), FolderRole::Inbox);
+        assert_eq!(role("Drafts"), FolderRole::Other);
+        assert_eq!(role("Deleted Messages"), FolderRole::Other);
+        assert_eq!(role("[Gmail]/Drafts"), FolderRole::Drafts);
+        assert_eq!(role("[Gmail]/Trash"), FolderRole::Trash);
+        // A server without SPECIAL-USE still gets roles from names.
+        let plain = folder_roles(&[f("INBOX", &[]), f("Trash", &[]), f("Sent", &[])]);
+        assert_eq!(plain[1].1, FolderRole::Trash);
+        assert_eq!(plain[2].1, FolderRole::Sent);
+    }
 
     #[test]
     fn attachments_download_once_and_cache() {

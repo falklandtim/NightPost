@@ -115,6 +115,10 @@ pub struct Prefs {
     google_edit: bool,
     /// Emails shown as designed (HTML in the web view); set by the app.
     pub html_email: bool,
+    /// Load remote images without asking (trackers are always blocked).
+    pub load_images: bool,
+    /// Show sender photos and logos.
+    pub faces: bool,
 }
 
 pub enum PrefsAction {
@@ -138,12 +142,14 @@ pub enum PrefsAction {
     CancelGoogle,
     /// Show emails as designed (HTML) or as plain text.
     SetHtmlEmail(bool),
+    SetLoadImages(bool),
+    SetFaces(bool),
     Close,
 }
 
 impl Prefs {
     pub fn new(tab: Tab) -> Self {
-        Self { tab, install_path: String::new(), editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false, html_email: true }
+        Self { tab, install_path: String::new(), editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false, html_email: true, load_images: true, faces: true }
     }
 
     #[allow(clippy::too_many_arguments)] // one window, one call site
@@ -191,12 +197,26 @@ impl Prefs {
         ui.label(RichText::new("Messages").strong().size(16.0));
         let mut html = self.html_email;
         let tip = if cfg!(target_os = "macos") {
-            "HTML emails are shown with their layout, colours and fonts (WebKit). Scripts never run, and remote images wait until you click Load images."
+            "HTML emails are shown with their layout, colours and fonts (WebKit). Scripts never run, and tracking pixels are always blocked."
         } else {
             "Coming soon on this platform: messages are shown as text for now."
         };
         if ui.checkbox(&mut html, "Show emails as designed (HTML) — experimental").on_hover_text(tip).changed() {
             act = PrefsAction::SetHtmlEmail(html);
+        }
+        ui.add_enabled_ui(self.html_email, |ui| {
+            let mut load = self.load_images;
+            let tip = "On: pictures in emails load straight away, like Canary and Apple Mail. Off: they wait until you click Load images. \
+                       Tracking pixels, which report when and where you open an email, are blocked either way.";
+            if ui.checkbox(&mut load, "Load remote images (trackers are always blocked)").on_hover_text(tip).changed() {
+                act = PrefsAction::SetLoadImages(load);
+            }
+        });
+        let mut faces = self.faces;
+        let tip = "A person's photo from your Contacts, or a company's logo: the verified brand logo it publishes (BIMI), \
+                   else its website's icon. Logos are fetched from the sender's own domain and cached for a month; no lookup service is used.";
+        if ui.checkbox(&mut faces, "Show sender photos and logos").on_hover_text(tip).changed() {
+            act = PrefsAction::SetFaces(faces);
         }
         ui.add_space(14.0);
         ui.label(RichText::new("Theme").strong().size(16.0));

@@ -137,7 +137,33 @@ impl Store {
             store.conn.execute_batch("ALTER TABLE accounts ADD COLUMN auth TEXT NOT NULL DEFAULT 'password'")?;
         }
         store.migrate_signatures()?;
+        store.rebuild_snippets()?;
         Ok(store)
+    }
+
+    /// Rebuild every stored preview once after [`crate::parse::make_snippet`]
+    /// improves (tracked in SQLite's `user_version`).
+    fn rebuild_snippets(&self) -> Result<()> {
+        let version: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version >= crate::parse::SNIPPET_VERSION {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut read = tx.prepare("SELECT id, body_text, snippet FROM messages")?;
+            let mut write = tx.prepare("UPDATE messages SET snippet=?2 WHERE id=?1")?;
+            let rows = read.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+            for row in rows {
+                let (id, body, old) = row?;
+                let new = crate::parse::make_snippet(&body);
+                if new != old {
+                    write.execute(params![id, new])?;
+                }
+            }
+        }
+        tx.execute_batch(&format!("PRAGMA user_version = {}", crate::parse::SNIPPET_VERSION))?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Older databases kept one signature string per account; turn those

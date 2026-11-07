@@ -208,6 +208,17 @@ pub fn long_date(d: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 /// A single-line, ellipsised text galley.
+/// Text without the invisible marks egui's fonts would draw as boxes: the
+/// emoji-style selector after ✉️ / 🏷️ (U+FE0F), its text twin, and the
+/// zero-width joiner. The emoji themselves are kept.
+pub fn drawable(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains(['\u{FE0E}', '\u{FE0F}', '\u{200D}', '\u{034F}']) {
+        text.chars().filter(|c| !matches!(c, '\u{FE0E}' | '\u{FE0F}' | '\u{200D}' | '\u{034F}')).collect::<String>().into()
+    } else {
+        text.into()
+    }
+}
+
 pub fn line(
     painter: &egui::Painter,
     pos: egui::Pos2,
@@ -216,7 +227,7 @@ pub fn line(
     color: Color32,
     max_width: f32,
 ) -> f32 {
-    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    let mut job = egui::text::LayoutJob::simple_singleline(drawable(text).into_owned(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(max_width.max(1.0));
     let galley = painter.layout_job(job);
     let w = galley.size().x;
@@ -232,7 +243,7 @@ pub fn bold_line(painter: &egui::Painter, pos: egui::Pos2, text: &str, font: egu
 
 /// Wrapped text, cut off with an ellipsis after `max_rows` lines.
 pub fn paragraph(painter: &egui::Painter, pos: egui::Pos2, text: &str, font: egui::FontId, color: Color32, max_width: f32, max_rows: usize) {
-    let mut job = egui::text::LayoutJob::single_section(text.split_whitespace().collect::<Vec<_>>().join(" "), egui::TextFormat::simple(font, color));
+    let mut job = egui::text::LayoutJob::single_section(drawable(text).split_whitespace().collect::<Vec<_>>().join(" "), egui::TextFormat::simple(font, color));
     job.wrap = egui::text::TextWrapping { max_width: max_width.max(1.0), max_rows, break_anywhere: false, overflow_character: Some('…') };
     let galley = painter.layout_job(job);
     painter.galley(pos, galley, color);
@@ -244,4 +255,13 @@ pub fn primary_button(ui: &mut egui::Ui, col: &Colors, label: &str) -> egui::Res
             .fill(col.button_emphasis)
             .stroke(Stroke::NONE),
     )
+}
+
+#[cfg(test)]
+mod drawable_tests {
+    #[test]
+    fn emoji_selectors_are_dropped_for_drawing() {
+        assert_eq!(super::drawable("\u{2709}\u{FE0F} \u{1F449} Emails"), "\u{2709} \u{1F449} Emails");
+        assert!(matches!(super::drawable("plain"), std::borrow::Cow::Borrowed("plain")));
+    }
 }

@@ -124,6 +124,8 @@ pub enum Event {
     /// Google sign-in finished: Ok(message) or Err(reason).
     GoogleDone(Result<String, String>),
     GoogleReady(bool),
+    /// A sender's picture (by lowercase address), or `None`: use the letter.
+    Avatar(String, Option<crate::avatars::Picture>),
 }
 
 /// A request for the sync thread.
@@ -190,6 +192,8 @@ const TICK: Duration = Duration::from_secs(20);
 pub struct Worker {
     pub tx: Sender<Cmd>,
     pub rx: Receiver<Event>,
+    /// Addresses to find a picture for (Contacts, BIMI, site icon).
+    pub avatars: Sender<String>,
 }
 
 impl Worker {
@@ -197,6 +201,24 @@ impl Worker {
         let (tx, cmd_rx) = crossbeam_channel::unbounded::<Cmd>();
         let (ev_tx, rx) = crossbeam_channel::unbounded::<Event>();
         let (sync_tx, sync_rx) = crossbeam_channel::unbounded::<SyncReq>();
+
+        // Sender pictures: a few lookups at a time, so a screenful of new
+        // senders fills in quickly without flooding the network.
+        let (avatars, avatar_rx) = crossbeam_channel::unbounded::<String>();
+        let cache = crate::avatars::cache_dir();
+        for i in 0..4 {
+            let (rx, ev, ctx, cache) = (avatar_rx.clone(), ev_tx.clone(), ctx.clone(), cache.clone());
+            std::thread::Builder::new()
+                .name(format!("avatars-{i}"))
+                .spawn(move || {
+                    for email in rx {
+                        let pic = crate::avatars::find(&email, &cache);
+                        let _ = ev.send(Event::Avatar(email, pic));
+                        ctx.request_repaint();
+                    }
+                })
+                .expect("spawn avatar thread");
+        }
 
         // Sync thread: one sync at a time, coalescing requests.
         {
@@ -326,7 +348,7 @@ impl Worker {
             })
             .expect("spawn action thread");
 
-        Self { tx, rx }
+        Self { tx, rx, avatars }
     }
 
     pub fn send(&self, cmd: Cmd) {

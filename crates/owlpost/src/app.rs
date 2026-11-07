@@ -233,6 +233,8 @@ const UNDO_DEPTH: usize = 30;
 pub struct OwlPostApp {
     store: Store,
     worker: Worker,
+    /// Sender photos and logos.
+    faces: crate::avatars::Faces,
     themes: Vec<Theme>,
     theme_id: String,
     colors: Colors,
@@ -277,6 +279,8 @@ pub struct OwlPostApp {
     mail_view_tried: bool,
     /// Show emails as designed (HTML) rather than as text.
     html_email: bool,
+    /// Load remote images straight away (trackers are stripped regardless).
+    load_images: bool,
     /// Where the web view goes this frame (the reading pane below the subject).
     web_rect: Option<egui::Rect>,
     /// Conversations whose remote images the user chose to load.
@@ -309,6 +313,8 @@ const LEGACY_LIST_KEY: &str = "springpost.list";
 const ROW_H: f32 = 94.0;
 const LIST_KEY: &str = "owlpost.list";
 const HTML_KEY: &str = "owlpost.html";
+const IMAGES_KEY: &str = "owlpost.images";
+const FACES_KEY: &str = "owlpost.faces";
 
 impl OwlPostApp {
     pub fn new(cc: &eframe::CreationContext<'_>, store: Store, demo: bool) -> Self {
@@ -318,6 +324,12 @@ impl OwlPostApp {
         let mut app = Self::with_context(&cc.egui_ctx, saved, store, demo);
         if let Some(h) = cc.storage.and_then(|s| s.get_string(HTML_KEY)) {
             app.html_email = h != "0";
+        }
+        if let Some(i) = cc.storage.and_then(|s| s.get_string(IMAGES_KEY)) {
+            app.load_images = i != "ask";
+        }
+        if let Some(f) = cc.storage.and_then(|s| s.get_string(FACES_KEY)) {
+            app.faces.enabled.set(f != "0");
         }
         if let Some(l) = get(LIST_KEY, LEGACY_LIST_KEY) {
             app.list_settings = ListSettings::decode(&l);
@@ -354,9 +366,11 @@ impl OwlPostApp {
         if !cfg!(test) {
             worker.send(Cmd::CheckGoogle);
         }
+        let faces = crate::avatars::Faces::new(ctx, worker.avatars.clone());
         let mut app = Self {
             store,
             worker,
+            faces,
             themes,
             theme_id,
             colors,
@@ -393,6 +407,7 @@ impl OwlPostApp {
             mail_view: None,
             mail_view_tried: false,
             html_email: true,
+            load_images: true,
             web_rect: None,
             remote_images: HashSet::new(),
             pending_input: vec![],
@@ -410,7 +425,6 @@ impl OwlPostApp {
         };
         app.reload();
         if app.accounts.iter().any(|a| !a.demo) {
-            app.syncing = true;
             app.worker.send(Cmd::SyncAll);
         }
         app
@@ -797,10 +811,9 @@ impl OwlPostApp {
         let mut changed = false;
         while let Ok(ev) = self.worker.rx.try_recv() {
             match ev {
-                Event::Status(s) => {
-                    self.status = s;
-                    self.syncing = true;
-                }
+                // Progress text only: the toolbar spinner is for syncs you
+                // asked for, not the quiet background ones.
+                Event::Status(s) => self.status = s,
                 Event::SyncFinished { new, errors } => {
                     self.syncing = false;
                     self.status = if new > 0 { format!("{new} new message{}", if new == 1 { "" } else { "s" }) } else { String::new() };
@@ -813,6 +826,7 @@ impl OwlPostApp {
                 Event::Error(e) => self.toast(e, true),
                 Event::Notice(s) => self.toast(s, false),
                 Event::GoogleReady(ready) => self.google_ready = ready,
+                Event::Avatar(email, pic) => self.faces.insert(email, pic),
                 Event::GoogleWaiting(url) => {
                     if let Some(g) = &mut self.google {
                         g.1 = Some(url);
@@ -1639,7 +1653,7 @@ impl OwlPostApp {
                         let rect = rect_c;
                         let top = rect.top();
                         let latest = t.participants.last().cloned().unwrap_or_default();
-                        style::paint_avatar(&p, egui::pos2(rect.left() + 36.0, top + 29.0), &latest.name, &latest.email, 34.0);
+                        self.faces.paint(&p, egui::pos2(rect.left() + 36.0, top + 29.0), &latest.name, &latest.email, 34.0);
                         let x = rect.left() + 62.0;
                         let mut right = rect.right() - 20.0;
 
@@ -1863,7 +1877,7 @@ impl OwlPostApp {
                     });
                     return;
                 };
-                let subject = open.messages.first().map(|m| m.subject.clone()).unwrap_or_default();
+                let subject = open.messages.first().map(|m| style::drawable(&m.subject).into_owned()).unwrap_or_default();
                 let snoozed = open.snoozed_until;
                 let pinned = self.store.is_pinned(open.account_id, &open.thread_key).unwrap_or(false);
                 let in_folders = self.store.thread_folder_ids(open.account_id, &open.thread_key).unwrap_or_default();
@@ -1917,7 +1931,7 @@ impl OwlPostApp {
                             if i > 0 {
                                 ui.add_space(6.0);
                             }
-                            let (r, clicked) = message_card(ui, &col, m, expanded, i + 1 == n, &downloading);
+                            let (r, clicked) = message_card(ui, &col, m, expanded, i + 1 == n, &downloading, &self.faces);
                             if let Some((idx, what)) = clicked {
                                 attachment_req = Some((m.clone(), idx, what));
                             }
@@ -2005,17 +2019,19 @@ impl OwlPostApp {
             return;
         }
         let key = (open.account_id, open.thread_key.clone());
-        let remote = self.remote_images.contains(&key);
+        let remote = self.load_images || self.remote_images.contains(&key);
         let page_key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            (&key, remote, &self.theme_id, open.messages.iter().map(|m| (m.id, m.starred, m.attachments.len())).collect::<Vec<_>>()).hash(&mut h);
+            let faces: Vec<bool> = open.messages.iter().map(|m| self.faces.texture(&m.from.email).is_some()).collect();
+            (&key, remote, &self.theme_id, open.messages.iter().map(|m| (m.id, m.starred, m.attachments.len())).collect::<Vec<_>>(), faces).hash(&mut h);
             h.finish()
         };
         let col = &self.colors;
+        let faces = &self.faces;
         view.show(rect, ctx.zoom_factor(), page_key, || {
             let nonce = format!("{:x}", page_key ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7));
-            crate::mail_view::document(&crate::mail_view::Page { messages: &open.messages, expanded: &open.expanded, remote_images: remote, nonce: &nonce }, col)
+            crate::mail_view::document(&crate::mail_view::Page { messages: &open.messages, expanded: &open.expanded, remote_images: remote, nonce: &nonce, avatar: &|e| faces.data_uri(e) }, col)
         });
     }
 
@@ -2178,6 +2194,8 @@ impl OwlPostApp {
             prefs.push = self.push.clone();
             prefs.google_ready = self.google_ready;
             prefs.html_email = self.html_email;
+            prefs.load_images = self.load_images;
+            prefs.faces = self.faces.enabled.get();
             prefs.google_waiting = self.google.as_ref().map(|g| g.1.clone());
             let act = prefs.ui(ctx, &col, &self.themes, &self.theme_id, &self.accounts, &mut self.list_settings, &self.sigs);
             match act {
@@ -2237,6 +2255,11 @@ impl OwlPostApp {
                 PrefsAction::GoogleSignIn(target) => self.google_sign_in(target),
                 PrefsAction::CancelGoogle => self.cancel_google(),
                 PrefsAction::SetHtmlEmail(on) => self.html_email = on,
+                PrefsAction::SetLoadImages(on) => self.load_images = on,
+                PrefsAction::SetFaces(on) => {
+                    self.faces.enabled.set(on);
+                    self.faces.clear();
+                }
                 PrefsAction::SaveAccount(a) => {
                     let _ = self.store.update_account(&a);
                     if let Some(p) = &mut self.prefs {
@@ -2510,6 +2533,7 @@ fn message_card(
     expanded: bool,
     is_last: bool,
     downloading: &HashSet<(MessageId, usize)>,
+    faces: &crate::avatars::Faces,
 ) -> (bool, Option<(usize, AttachmentClick)>) {
     let mut toggled = false;
     let mut clicked = None;
@@ -2522,7 +2546,7 @@ fn message_card(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let header = ui.horizontal(|ui| {
-                style::avatar(ui, &m.from.name, &m.from.email, 36.0);
+                faces.show(ui, &m.from.name, &m.from.email, 36.0);
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(m.from.display()).strong().color(col.text));
@@ -2717,6 +2741,8 @@ impl eframe::App for OwlPostApp {
         storage.set_string(THEME_KEY, self.theme_id.clone());
         storage.set_string(LIST_KEY, self.list_settings.encode());
         storage.set_string(HTML_KEY, if self.html_email { "1" } else { "0" }.into());
+        storage.set_string(IMAGES_KEY, if self.load_images { "load" } else { "ask" }.into());
+        storage.set_string(FACES_KEY, if self.faces.enabled.get() { "1" } else { "0" }.into());
     }
 }
 

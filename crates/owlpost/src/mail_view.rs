@@ -66,6 +66,115 @@ pub fn has_remote_content(html: &str) -> bool {
         })
 }
 
+/// Remove tracking pixels from an email: images whose only job is to tell
+/// the sender you opened it (and when, and roughly where). They're tiny
+/// (1×1) or come from known open-tracking paths. Returns the cleaned HTML
+/// and the hosts the trackers pointed at.
+pub fn strip_trackers(html: &str) -> (String, Vec<String>) {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut hosts: Vec<String> = Vec::new();
+    let mut at = 0;
+    while let Some(i) = lower[at..].find("<img").map(|i| at + i) {
+        let end = tag_end(html, i);
+        let tag = &html[i..end];
+        out.push_str(&html[at..i]);
+        match tracker_host(tag) {
+            Some(host) => {
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+            None => out.push_str(tag),
+        }
+        at = end;
+    }
+    out.push_str(&html[at..]);
+    (out, hosts)
+}
+
+/// Where a tag starting at `start` ends (after its `>`), skipping quoted `>`.
+fn tag_end(html: &str, start: usize) -> usize {
+    let mut quote = None;
+    for (j, c) in html[start..].char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, '>') => return start + j + 1,
+            _ => {}
+        }
+    }
+    html.len()
+}
+
+/// An attribute's value from a single tag (`name=` preceded by whitespace).
+pub(crate) fn tag_attr(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find(name).map(|i| from + i) {
+        from = i + name.len();
+        let before_ok = lower[..i].ends_with(|c: char| c.is_ascii_whitespace() || c == '/');
+        let rest = lower[from..].trim_start();
+        if !before_ok || !rest.starts_with('=') {
+            continue;
+        }
+        let vstart = tag.len() - rest.len() + 1;
+        let v = tag[vstart..].trim_start();
+        return Some(match v.chars().next() {
+            Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or("").to_string(),
+            _ => v.split(|c: char| c.is_ascii_whitespace() || c == '>').next().unwrap_or("").trim_end_matches('/').to_string(),
+        });
+    }
+    None
+}
+
+/// A pixel size from `1`, `1px` or a CSS declaration's value.
+fn px(v: &str) -> Option<f32> {
+    v.trim().trim_end_matches("!important").trim().trim_end_matches("px").trim().parse().ok()
+}
+
+fn css_prop(style: &str, prop: &str) -> Option<String> {
+    style.split(';').find_map(|d| {
+        let (k, v) = d.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(prop).then(|| v.trim().to_ascii_lowercase())
+    })
+}
+
+/// Open-tracking URLs of common email services.
+const TRACKER_PATHS: &[&str] = &[
+    "/trk?", "/track/open", "/open.php", "/open.aspx", "/open.gif", "/wf/open", "/e/o/", "/o.gif", "/pixel.gif", "/pixel.png", "/beacon",
+    "/e2t/to/", "/imp?", "/ci0/", "/oo/", "list-manage.com/track", "mandrillapp.com/track", "/mo/", "/t.gif",
+];
+
+/// The host an `<img>` tag reports opens to, if it's a tracker.
+fn tracker_host(tag: &str) -> Option<String> {
+    let src = tag_attr(tag, "src")?;
+    let lower = src.to_ascii_lowercase();
+    let rest = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")).or_else(|| lower.strip_prefix("//"))?;
+    let host = rest.split(['/', '?', ':', '#']).next().unwrap_or("").to_string();
+    let style = tag_attr(tag, "style").unwrap_or_default();
+    let w = tag_attr(tag, "width").as_deref().and_then(px).or_else(|| css_prop(&style, "width").as_deref().and_then(px));
+    let h = tag_attr(tag, "height").as_deref().and_then(px).or_else(|| css_prop(&style, "height").as_deref().and_then(px));
+    let tiny = match (w, h) {
+        (Some(w), Some(h)) => w <= 3.0 && h <= 3.0,
+        (Some(d), None) | (None, Some(d)) => d <= 1.0,
+        (None, None) => false,
+    };
+    let path = &rest[host.len()..];
+    let known = TRACKER_PATHS.iter().any(|t| if t.starts_with('/') { path.contains(t) } else { lower.contains(t) });
+    (tiny || known).then_some(host)
+}
+
+/// "go.example.com", "a.com and b.com", "a.com, b.com and 1 more".
+fn host_list(hosts: &[String]) -> String {
+    match hosts {
+        [] => String::new(),
+        [a] => a.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} more", rest.len()),
+    }
+}
+
 /// The Content Security Policy for the page and every email in it.
 pub fn csp(nonce: &str, remote: bool) -> String {
     let net = if remote { " https: http:" } else { "" };
@@ -123,18 +232,48 @@ pub struct Page<'a> {
     pub expanded: &'a [bool],
     pub remote_images: bool,
     pub nonce: &'a str,
+    /// A sender's picture as a data URI (and whether it fills the circle).
+    pub avatar: &'a dyn Fn(&str) -> Option<(String, bool)>,
 }
 
 /// The whole conversation as one HTML document.
 pub fn document(page: &Page, col: &Colors) -> String {
     let policy = csp(page.nonce, page.remote_images);
     let dark = col.p.dark;
-    let blocked = !page.remote_images && page.messages.iter().any(|m| m.body_html.as_deref().is_some_and(has_remote_content));
+    // Tracking pixels never load, whatever the image setting.
+    let mut trackers: Vec<String> = Vec::new();
+    let bodies: Vec<Option<String>> = page
+        .messages
+        .iter()
+        .map(|m| {
+            m.body_html.as_deref().filter(|h| !h.trim().is_empty()).map(|h| {
+                let (clean, hosts) = strip_trackers(h);
+                for host in hosts {
+                    if !trackers.contains(&host) {
+                        trackers.push(host);
+                    }
+                }
+                clean
+            })
+        })
+        .collect();
+    let blocked = !page.remote_images && bodies.iter().flatten().any(|h| has_remote_content(h));
     let mut body = String::new();
+    let tracked = if trackers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<span class=shield title=\"Tracking pixels report when and where you open an email. OwlPost never loads them.\">Blocked {} from {}.</span> ",
+            if trackers.len() == 1 { "a tracker" } else { "trackers" },
+            escape(&host_list(&trackers))
+        )
+    };
     if blocked {
-        body.push_str(
-            "<div class=banner>Remote images are hidden to protect your privacy. <a href=\"owlpost://load-images\">Load images</a></div>",
-        );
+        body.push_str(&format!(
+            "<div class=banner>{tracked}Remote images are hidden to protect your privacy. <a href=\"owlpost://load-images\">Load images</a></div>"
+        ));
+    } else if !tracked.is_empty() {
+        body.push_str(&format!("<div class=\"banner quiet\">{tracked}</div>"));
     }
     let n = page.messages.len();
     for (i, m) in page.messages.iter().enumerate() {
@@ -147,12 +286,19 @@ pub fn document(page: &Page, col: &Colors) -> String {
         }
         let email = if m.from.name.is_empty() { String::new() } else { format!("<span class=addr>&lt;{}&gt;</span>", escape(&m.from.email)) };
         body.push_str(&format!(
-            "<details class=card{open}><summary><div class=avatar style=\"background:{bg}\">{initial}</div>\
+            "<details class=card{open}><summary>{face}\
              <div class=who><div><b>{name}</b> {email}</div><div class=to>{to}</div><div class=snippet>{snippet}</div></div>\
              <div class=date>{date}{star}</div></summary><div class=content>",
             open = if open { " open" } else { "" },
-            bg = css(style::avatar_color(if m.from.email.is_empty() { &who } else { &m.from.email })),
-            initial = escape(&initial),
+            face = match (page.avatar)(&m.from.email) {
+                Some((uri, true)) => format!("<img class=\"avatar photo\" alt=\"\" src=\"{}\">", escape(&uri)),
+                Some((uri, false)) => format!("<div class=\"avatar icon\"><img alt=\"\" src=\"{}\"></div>", escape(&uri)),
+                None => format!(
+                    "<div class=avatar style=\"background:{}\">{}</div>",
+                    css(style::avatar_color(if m.from.email.is_empty() { &who } else { &m.from.email })),
+                    escape(&initial)
+                ),
+            },
             name = escape(&who),
             to = escape(&to),
             snippet = escape(&m.snippet),
@@ -172,7 +318,7 @@ pub fn document(page: &Page, col: &Colors) -> String {
             }
             body.push_str("</div><hr>");
         }
-        match m.body_html.as_deref().filter(|h| !h.trim().is_empty()) {
+        match bodies[i].as_deref() {
             Some(html) => {
                 // Each email in its own sandbox: no scripts, no forms, its
                 // CSS kept to itself. Links go to the top page (and so to
@@ -206,11 +352,17 @@ html, body {{ margin: 0; background: {bg2}; color: {text}; font: 14px/1.5 -apple
 body {{ padding: 6px 36px 36px; }}
 a {{ color: {link}; }}
 .banner {{ background: {bg}; border: 1px solid {border}; border-radius: 8px; padding: 9px 14px; margin-bottom: 14px; color: {subtle}; font-size: 13px; }}
+.banner.quiet {{ padding: 6px 14px; font-size: 12px; }}
+.shield::before {{ content: ""; display: inline-block; width: 11px; height: 13px; margin-right: 6px; vertical-align: -2px; background: currentColor; opacity: .7;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 11 13'%3E%3Cpath d='M5.5 0 11 2v4.2C11 9.5 8.7 12 5.5 13 2.3 12 0 9.5 0 6.2V2z'/%3E%3C/svg%3E") no-repeat center / contain; }}
 .card {{ background: {bg}; border: 1px solid {border}; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,.055); margin-bottom: 16px; }}
 .card > summary {{ list-style: none; display: flex; gap: 12px; align-items: flex-start; padding: 20px 26px 0; cursor: default; }}
 .card:not([open]) > summary {{ padding-bottom: 18px; }}
 .card > summary::-webkit-details-marker {{ display: none; }}
 .avatar {{ flex: none; width: 36px; height: 36px; border-radius: 50%; color: #fff; display: grid; place-items: center; font-weight: 600; font-size: 15px; }}
+.avatar.photo {{ object-fit: cover; background: #fff; }}
+.avatar.icon {{ background: #fff; box-shadow: inset 0 0 0 1px rgba(0,0,0,.07); }}
+.avatar.icon img {{ width: 22px; height: 22px; object-fit: contain; }}
 .who {{ flex: 1; min-width: 0; }}
 .who b {{ font-weight: 600; }}
 .addr, .date {{ color: {very_subtle}; font-size: 12px; }}
@@ -487,10 +639,10 @@ mod tests {
 
     #[test]
     fn html_bodies_are_sandboxed_and_locked_down() {
-        let evil = r#"<p style="color:red">Sale!</p><img src="https://track.example/pixel.gif"><script>alert(1)</script><form action="https://x"></form>"#;
+        let evil = r#"<p style="color:red">Sale!</p><img src="https://cdn.example/sale.jpg" width="600"><img src="https://track.example/pixel.gif"><script>alert(1)</script><form action="https://x"></form>"#;
         let mut m = msg(7, "Sale!", Some(evil));
         m.attachments = vec![Attachment { filename: "terms <1>.pdf".into(), mime_type: "application/pdf".into(), size: 2048 }];
-        let doc = document(&Page { messages: &[m.clone()], expanded: &[true], remote_images: false, nonce: "abc" }, &colors());
+        let doc = document(&Page { messages: &[m.clone()], expanded: &[true], remote_images: false, nonce: "abc", avatar: &|_| None }, &colors());
         // The email is inside a sandboxed frame without allow-scripts or allow-forms.
         assert!(doc.contains("<iframe sandbox=\"allow-same-origin allow-popups allow-top-navigation-by-user-activation\""));
         assert!(!doc.contains("allow-scripts") && !doc.contains("allow-forms"));
@@ -503,9 +655,33 @@ mod tests {
         // Attachments link back to the app, names escaped.
         assert!(doc.contains("href=\"owlpost://attachment/7/0\"") && doc.contains("terms &lt;1&gt;.pdf"));
         // Loading images opens up https only for media, still no scripts.
-        let open = document(&Page { messages: &[m], expanded: &[true], remote_images: true, nonce: "abc" }, &colors());
+        let open = document(&Page { messages: &[m], expanded: &[true], remote_images: true, nonce: "abc", avatar: &|_| None }, &colors());
         assert!(open.contains("img-src data: cid: https: http:") && !open.contains("owlpost://load-images"));
         assert!(open.contains("script-src 'nonce-abc'"));
+        // The tracking pixel is gone either way, and the banner says so.
+        for d in [&doc, &open] {
+            assert!(!d.contains("pixel.gif") && d.contains("Blocked a tracker from track.example."));
+        }
+    }
+
+    #[test]
+    fn tracking_pixels_are_removed() {
+        // Marketo (Repco), Loops (Ollama), Mailchimp, SendGrid; and images to keep.
+        let html = r#"<td><img src="https://info.example.com/images/logo.png" width="170" style="width:170px" alt="Logo" />
+<img width="660" style="display:inline-block; width:660px;" src="https://info.example.com/images/Header Mobile.jpg" alt="x">
+<img style="display:none; max-height:0" src="https://info.example.com/images/mobile-only.jpg" alt="mobile">
+<img src="https://go.repco.example/trk?t=1&mid=abc" width="1" height="1" style="display:none !important;" alt="" />
+<img alt="" src="https://c.vialoops.example/CI0/0100/xyz=452" style="display: none; width: 1px; height: 1px;">
+<IMG SRC='https://shop.us1.list-manage.com/track/open.php?u=1&id=2' height=1 width=1>
+<img src="https://u123.ct.sendgrid.net/wf/open?upn=abc" alt="" style="height:1px !important;width:1px !important;border-width:0 !important"></td>"#;
+        let (clean, hosts) = strip_trackers(html);
+        assert_eq!(hosts, ["go.repco.example", "c.vialoops.example", "shop.us1.list-manage.com", "u123.ct.sendgrid.net"]);
+        assert!(clean.contains("logo.png") && clean.contains("Header Mobile.jpg") && clean.contains("mobile-only.jpg"));
+        assert!(!clean.contains("trk?") && !clean.contains("CI0") && !clean.contains("track/open") && !clean.contains("wf/open"));
+        assert!(clean.starts_with("<td>") && clean.ends_with("</td>"));
+        assert_eq!(host_list(&hosts), "go.repco.example, c.vialoops.example and 2 more");
+        // Nothing to do: returned unchanged.
+        assert_eq!(strip_trackers("<p>Hi <b>there</b></p>"), ("<p>Hi <b>there</b></p>".to_string(), vec![]));
     }
 
     #[test]
@@ -519,7 +695,7 @@ mod tests {
     #[test]
     fn older_messages_start_folded() {
         let msgs = [msg(1, "first", None), msg(2, "second", None)];
-        let doc = document(&Page { messages: &msgs, expanded: &[false, true], remote_images: false, nonce: "n" }, &colors());
+        let doc = document(&Page { messages: &msgs, expanded: &[false, true], remote_images: false, nonce: "n", avatar: &|_| None }, &colors());
         assert_eq!(doc.matches("<details class=card open>").count(), 1);
         assert_eq!(doc.matches("<details class=card>").count(), 1);
         assert!(!doc.contains("owlpost://load-images"), "no banner without remote content");
@@ -541,7 +717,24 @@ mod tests {
         reply.from = owlpost_core::Contact::new("Alex Rivera", "alex@icloud.demo");
         msgs.insert(0, reply);
         for (name, remote) in [("mail-view", false), ("mail-view-images", true)] {
-            let doc = document(&Page { messages: &msgs, expanded: &[true, true], remote_images: remote, nonce: "n1" }, &colors());
+            let doc = document(&Page { messages: &msgs, expanded: &[true, true], remote_images: remote, nonce: "n1", avatar: &|_| None }, &colors());
+            std::fs::write(std::path::Path::new(&dir).join(format!("{name}.html")), doc).unwrap();
+        }
+    }
+
+    /// Renders saved raw emails to look at: `OWLPOST_EML=a.eml:b.eml` writes
+    /// `<name>.html` (images on) to $OWLPOST_SHOTS and prints the trackers.
+    /// Real mail stays out of the repo this way.
+    #[test]
+    fn renders_saved_emails() {
+        let (Ok(files), Ok(dir)) = (std::env::var("OWLPOST_EML"), std::env::var("OWLPOST_SHOTS")) else { return };
+        for f in files.split(':') {
+            let raw = std::fs::read(f).unwrap();
+            let m = owlpost_core::parse::parse_message(&raw, 1, 1, 1).unwrap();
+            let (_, hosts) = strip_trackers(m.body_html.as_deref().unwrap_or(""));
+            println!("{f}: snippet {:?}\n  trackers {hosts:?}", m.snippet);
+            let name = std::path::Path::new(f).file_stem().unwrap().to_string_lossy().to_string();
+            let doc = document(&Page { messages: &[m], expanded: &[true], remote_images: true, nonce: "n1", avatar: &|_| None }, &colors());
             std::fs::write(std::path::Path::new(&dir).join(format!("{name}.html")), doc).unwrap();
         }
     }

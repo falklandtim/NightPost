@@ -47,6 +47,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSContactsUsageDescription</key><string>OwlPost shows the photos of people in your Contacts next to their emails.</string>
 </dict>
 </plist>
 PLIST
