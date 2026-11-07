@@ -167,7 +167,7 @@ impl Server {
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                let _ = self.store.wake_due_snoozes();
+                let _ = crate::snooze_sync::wake_due(&self.store);
                 Ok(match self.call(name, &args) {
                     Ok(v) => json!({"content":[{"type":"text","text": serde_json::to_string_pretty(&v).unwrap_or_default()}],
                                     "structuredContent": v, "isError": false}),
@@ -275,7 +275,7 @@ impl Server {
                 };
                 let mut out = vec![];
                 for a in accounts {
-                    for f in self.store.folders(a.id)? {
+                    for f in self.store.folders(a.id)?.into_iter().filter(|f| !crate::snooze_sync::is_internal_folder(&f.path)) {
                         out.push(json!({"id":f.id,"account":a.email,"path":f.path,"role":f.role.as_str(),"unread":f.unread}));
                     }
                 }
@@ -328,12 +328,14 @@ impl Server {
                 if until <= chrono::Utc::now() {
                     return Err(anyhow!("snooze time must be in the future"));
                 }
-                self.store.snooze(acc, &key, until)?;
+                let account = self.store.account(acc)?.ok_or_else(|| anyhow!("account not found"))?;
+                crate::snooze_sync::snooze_thread(&self.store, &account, &key, until)?;
                 Ok(json!({"thread_id": thread_id(acc, &key), "snoozed_until": until.to_rfc3339(), "label": snooze::describe(until)}))
             }
             "unsnooze_thread" => {
                 let (acc, key) = split_thread_id(&s("thread_id"))?;
-                self.store.unsnooze(acc, &key)?;
+                let account = self.store.account(acc)?.ok_or_else(|| anyhow!("account not found"))?;
+                crate::snooze_sync::unsnooze_thread(&self.store, &account, &key)?;
                 Ok(json!({"thread_id": thread_id(acc, &key), "snoozed": false}))
             }
             "list_snoozed" => {

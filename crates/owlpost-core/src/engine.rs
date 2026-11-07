@@ -94,8 +94,9 @@ pub fn sync_account(store: &Store, account: &Account, mut progress: impl FnMut(S
         if attrs.iter().any(|a| a.eq_ignore_ascii_case("\\Noselect") || a.eq_ignore_ascii_case("\\NonExistent")) {
             continue;
         }
-        // Gmail's [Gmail]/Important duplicates INBOX; skip it.
-        if n.name().eq_ignore_ascii_case("[Gmail]/Important") {
+        // Gmail's [Gmail]/Important duplicates INBOX; skip it. The snooze
+        // state folder isn't mail.
+        if n.name().eq_ignore_ascii_case("[Gmail]/Important") || n.name() == crate::snooze_sync::STATE_FOLDER {
             continue;
         }
         found.push((n.name().to_string(), attrs));
@@ -126,6 +127,10 @@ pub fn sync_account(store: &Store, account: &Account, mut progress: impl FnMut(S
         }
     }
     let _ = session.logout();
+    // Snoozes made, cancelled or due on other machines.
+    if let Err(e) = crate::snooze_sync::sync_snoozes(store, account) {
+        log::warn!("snooze sync for {} failed: {e:#}", account.email);
+    }
     Ok(new_total)
 }
 
@@ -194,6 +199,10 @@ fn sync_folder(store: &Store, session: &mut Session, account: &Account, folder: 
         for fetch in fetches.iter() {
             let (Some(uid), Some(body)) = (fetch.uid, fetch.body()) else { continue };
             let Some(mut m) = parse::parse_message(body, account.id, folder.id, uid) else { continue };
+            // OwlPost's snooze list (Gmail also shows it in All Mail and Trash).
+            if m.from.email == crate::snooze_sync::STATE_FROM {
+                continue;
+            }
             let (unread, starred) = flags(fetch.flags());
             m.unread = unread && !matches!(folder.role, FolderRole::Sent | FolderRole::Drafts);
             m.starred = starred;

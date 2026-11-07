@@ -335,15 +335,12 @@ impl Composer {
             ui.label(RichText::new("To").color(col.subtle));
             ui.horizontal(|ui| {
                 let w = ui.available_width() - if self.show_cc { 0.0 } else { 70.0 };
-                let r = ui.add(egui::TextEdit::singleline(&mut self.to).desired_width(w).hint_text("Recipients"));
+                let r = recipients(ui, "to", &mut self.to, w, "Recipients", store, col);
                 if self.focus_first {
                     r.request_focus();
                     self.focus_first = false;
                 }
                 any_focus |= r.has_focus();
-                if r.has_focus() {
-                    suggest(ui, &mut self.to, store, col);
-                }
                 if !self.show_cc && ui.small_button("Cc Bcc").clicked() {
                     self.show_cc = true;
                 }
@@ -351,11 +348,11 @@ impl Composer {
             ui.end_row();
             if self.show_cc {
                 ui.label(RichText::new("Cc").color(col.subtle));
-                let r = ui.add(egui::TextEdit::singleline(&mut self.cc).desired_width(f32::INFINITY));
+                let r = recipients(ui, "cc", &mut self.cc, f32::INFINITY, "", store, col);
                 any_focus |= r.has_focus();
                 ui.end_row();
                 ui.label(RichText::new("Bcc").color(col.subtle));
-                let r = ui.add(egui::TextEdit::singleline(&mut self.bcc).desired_width(f32::INFINITY));
+                let r = recipients(ui, "bcc", &mut self.bcc, f32::INFINITY, "", store, col);
                 any_focus |= r.has_focus();
                 ui.end_row();
             }
@@ -569,40 +566,132 @@ fn chip(ui: &mut egui::Ui, col: &Colors, a: &Attached, size: ImageSize, salt: (u
     remove
 }
 
-/// Address autocomplete for the token currently being typed.
-fn suggest(ui: &mut egui::Ui, field: &mut String, store: &Store, col: &Colors) {
-    let (head, tail) = match field.rfind(',') {
-        Some(i) => (field[..=i].to_string(), field[i + 1..].trim().to_string()),
-        None => (String::new(), field.trim().to_string()),
-    };
-    if tail.len() < 2 || tail.contains('<') {
-        return;
+/// The address being typed: everything before it (up to and including the
+/// last comma) and the partial address itself.
+fn split_tail(field: &str) -> (&str, &str) {
+    match field.rfind([',', ';']) {
+        Some(i) => (&field[..=i], field[i + 1..].trim()),
+        None => ("", field.trim()),
     }
-    let Ok(list) = store.suggest_contacts(&tail, 6) else { return };
-    let list: Vec<Contact> = list.into_iter().filter(|c| !c.email.eq_ignore_ascii_case(&tail)).collect();
-    if list.is_empty() {
-        return;
+}
+
+/// Replace the partial address with `c`, ready for the next one.
+fn accept(field: &str, c: &Contact) -> String {
+    let (head, _) = split_tail(field);
+    let sep = if head.is_empty() { "" } else { " " };
+    format!("{head}{sep}{}, ", c.to_header())
+}
+
+/// Suggestions for the partial address: people from your mail (those you
+/// write to first), then the system address book. Skips anyone already in
+/// the field.
+fn suggestions(field: &str, store: &Store) -> Vec<Contact> {
+    let (head, tail) = split_tail(field);
+    if tail.chars().count() < 2 || tail.contains('<') {
+        return Vec::new();
     }
-    let pos = ui.min_rect().left_bottom() + egui::vec2(40.0, 4.0);
-    egui::Area::new(ui.id().with("suggest"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(pos)
-        .show(ui.ctx(), |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                for c in list {
-                    let text = RichText::new(format!("{}  ", c.display())).color(col.text);
-                    let r = ui.horizontal(|ui| {
-                        let r = ui.selectable_label(false, text);
-                        ui.label(RichText::new(&c.email).color(col.subtle).small());
-                        r
-                    });
-                    if r.inner.clicked() {
-                        let sep = if head.is_empty() { "" } else { " " };
-                        *field = format!("{head}{sep}{}, ", c.to_header());
-                    }
-                }
-            });
+    let taken: Vec<String> = Contact::parse_list(head).into_iter().map(|c| c.email.to_lowercase()).collect();
+    let mut out: Vec<Contact> = Vec::new();
+    let found = store.suggest_contacts(tail, 6).unwrap_or_default().into_iter().chain(crate::contacts::search(tail, 6));
+    for c in found {
+        let e = c.email.to_lowercase();
+        if e == tail.to_lowercase() || taken.contains(&e) || out.iter().any(|o| o.email.eq_ignore_ascii_case(&e)) {
+            continue;
+        }
+        out.push(c);
+        if out.len() == 8 {
+            break;
+        }
+    }
+    out
+}
+
+/// A To/Cc/Bcc field with address autocomplete. Up/Down pick a
+/// suggestion, Enter or Tab takes it, Esc hides the list.
+fn recipients(ui: &mut egui::Ui, key: &str, field: &mut String, width: f32, hint: &str, store: &Store, col: &Colors) -> egui::Response {
+    let id = ui.make_persistent_id(("recipients", key));
+    let sel_id = id.with("sel");
+    let hover_id = id.with("hover");
+    let hidden_id = id.with("hidden");
+    let ctx = ui.ctx().clone();
+    let focused = ctx.memory(|m| m.has_focus(id));
+    let popup_hovered = ctx.data(|d| d.get_temp::<bool>(hover_id)).unwrap_or(false);
+    let hidden_for = ctx.data(|d| d.get_temp::<String>(hidden_id));
+
+    let list = if (focused || popup_hovered) && hidden_for.as_deref() != Some(field.as_str()) { suggestions(field, store) } else { Vec::new() };
+    let mut sel = ctx.data(|d| d.get_temp::<usize>(sel_id)).unwrap_or(0).min(list.len().saturating_sub(1));
+    let mut chosen: Option<Contact> = None;
+
+    // Keys go to the list before the text field sees them.
+    if focused && !list.is_empty() {
+        ui.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, Key::ArrowDown) {
+                sel = (sel + 1) % list.len();
+            }
+            if i.consume_key(egui::Modifiers::NONE, Key::ArrowUp) {
+                sel = (sel + list.len() - 1) % list.len();
+            }
+            if i.consume_key(egui::Modifiers::NONE, Key::Enter) || i.consume_key(egui::Modifiers::NONE, Key::Tab) {
+                chosen = Some(list[sel].clone());
+            }
+            if i.consume_key(egui::Modifiers::NONE, Key::Escape) {
+                ctx.data_mut(|d| d.insert_temp(hidden_id, field.clone()));
+            }
         });
+    }
+
+    let r = ui.add(egui::TextEdit::singleline(field).id(id).desired_width(width).hint_text(hint));
+
+    let mut hovered = false;
+    let hidden_now = ctx.data(|d| d.get_temp::<String>(hidden_id));
+    if chosen.is_none() && !list.is_empty() && hidden_now.as_deref() != Some(field.as_str()) && (r.has_focus() || popup_hovered) {
+        let area = egui::Area::new(id.with("popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(r.rect.left_bottom() + egui::vec2(0.0, 4.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(r.rect.width().min(420.0));
+                    for (i, c) in list.iter().enumerate() {
+                        let item = ui.horizontal(|ui| {
+                            let row = ui.selectable_label(i == sel, RichText::new(format!("{}  ", c.display())).color(col.text));
+                            if !c.name.trim().is_empty() {
+                                ui.label(RichText::new(&c.email).color(col.subtle).small());
+                            }
+                            row
+                        });
+                        let row = item.inner.union(item.response.interact(egui::Sense::click()));
+                        if row.hovered() {
+                            sel = i;
+                        }
+                        if row.clicked() {
+                            chosen = Some(c.clone());
+                        }
+                    }
+                });
+            });
+        hovered = area.response.contains_pointer();
+    }
+    ctx.data_mut(|d| {
+        d.insert_temp(hover_id, hovered);
+        d.insert_temp(sel_id, sel);
+    });
+
+    if let Some(c) = chosen {
+        *field = accept(field, &c);
+        ctx.data_mut(|d| {
+            d.insert_temp(hover_id, false);
+            d.insert_temp(sel_id, 0usize);
+        });
+        // Back to the field with the cursor after the new address.
+        ctx.memory_mut(|m| m.request_focus(id));
+        if let Some(mut state) = egui::TextEdit::load_state(&ctx, id) {
+            let end = egui::text::CCursor::new(field.chars().count());
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+            state.store(&ctx, id);
+        }
+        ctx.request_repaint();
+    }
+    r
 }
 
 #[cfg(test)]
@@ -628,6 +717,64 @@ mod tests {
 
     fn plain(body: &str) -> Signature {
         Signature { id: 2, title: "Work".into(), body: body.into(), html: false }
+    }
+
+    #[test]
+    fn picking_a_suggestion_inserts_the_full_address() {
+        let maya = Contact::new("Maya Chen", "maya@chen.family");
+        assert_eq!(accept("May", &maya), "\"Maya Chen\" <maya@chen.family>, ");
+        let both = accept("\"Sam\" <sam@x.com>, ma", &maya);
+        assert_eq!(both, "\"Sam\" <sam@x.com>, \"Maya Chen\" <maya@chen.family>, ");
+        let parsed = Contact::parse_list(&both);
+        assert_eq!(parsed.iter().map(|c| c.email.as_str()).collect::<Vec<_>>(), ["sam@x.com", "maya@chen.family"]);
+        assert_eq!(split_tail("a@b.com; jo"), ("a@b.com;", "jo"));
+    }
+
+    #[test]
+    fn suggestions_skip_people_already_added() {
+        let p = std::env::temp_dir().join(format!("sp-suggest-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let store = Store::open(&p).unwrap();
+        owlpost_core::demo::seed(&store).unwrap();
+        assert!(suggestions("ma", &store).iter().any(|c| c.email == "maya@chen.family"));
+        assert!(!suggestions("maya@chen.family, ma", &store).iter().any(|c| c.email == "maya@chen.family"));
+        assert!(suggestions("m", &store).is_empty());
+    }
+
+    /// A real click: hover, press, release, each on its own frame.
+    #[test]
+    fn clicking_a_suggestion_with_the_mouse() {
+        use egui_kittest::kittest::Queryable;
+        let p = std::env::temp_dir().join(format!("sp-suggest-click-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let store = Store::open(&p).unwrap();
+        owlpost_core::demo::seed(&store).unwrap();
+        let col = Colors::new(owlpost_core::theme::Palette::from_vars(&Default::default()));
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(600.0, 300.0)).build_ui_state(
+            move |ui, field: &mut String| {
+                recipients(ui, "to", field, 400.0, "Recipients", &store, &col);
+            },
+            String::new(),
+        );
+        h.get_by_role(egui::accesskit::Role::TextInput).focus();
+        h.run();
+        h.get_by_role(egui::accesskit::Role::TextInput).type_text("May");
+        h.run();
+        let pos = h.get_by_label_contains("Maya Chen").rect().center();
+        h.hover_at(pos);
+        h.run();
+        h.drag_at(pos);
+        h.run();
+        h.drop_at(pos);
+        h.run();
+        assert_eq!(h.state(), "\"Maya Chen\" <maya@chen.family>, ");
+
+        // Keyboard: Down then Enter takes the second suggestion.
+        h.get_by_role(egui::accesskit::Role::TextInput).type_text("sa");
+        h.run();
+        h.key_press(Key::Enter);
+        h.run();
+        assert!(h.state().ends_with(">, ") && h.state().matches('@').count() == 2, "{}", h.state());
     }
 
     #[test]

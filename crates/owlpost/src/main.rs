@@ -4,6 +4,7 @@ mod app;
 mod attachments;
 mod avatars;
 mod composer;
+mod contacts;
 mod html_view;
 mod mail_view;
 mod icons;

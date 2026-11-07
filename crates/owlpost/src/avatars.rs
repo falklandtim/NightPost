@@ -78,7 +78,7 @@ pub fn find(email: &str, cache: &Path) -> Option<Picture> {
     if is_reserved(&domain) {
         return None;
     }
-    if let Some(png) = contacts::photo(email).and_then(|b| normalize(&b, true)) {
+    if let Some(png) = crate::contacts::photo(email).and_then(|b| normalize(&b, true)) {
         return Some(Picture { png, fill: true });
     }
     if is_personal(&domain) {
@@ -504,57 +504,6 @@ pub mod dns {
             }
         }
         Some(out)
-    }
-}
-
-/// Photos from the Mac's Contacts. Only inside OwlPost.app, whose
-/// Info.plist explains why it asks (macOS ends any app that asks without).
-#[cfg(all(target_os = "macos", not(test)))]
-mod contacts {
-    use objc2::runtime::{Bool, ProtocolObject};
-    use objc2_contacts::{CNAuthorizationStatus, CNContact, CNContactStore, CNContactThumbnailImageDataKey, CNEntityType, CNKeyDescriptor};
-    use objc2_foundation::{ns_string, NSArray, NSBundle, NSError, NSString};
-    use std::sync::OnceLock;
-
-    fn allowed() -> bool {
-        static ALLOWED: OnceLock<bool> = OnceLock::new();
-        *ALLOWED.get_or_init(|| unsafe {
-            if NSBundle::mainBundle().objectForInfoDictionaryKey(ns_string!("NSContactsUsageDescription")).is_none() {
-                return false;
-            }
-            let status = CNContactStore::authorizationStatusForEntityType(CNEntityType::Contacts);
-            if status == CNAuthorizationStatus::NotDetermined {
-                // Ask once; this thread waits for the answer.
-                let (tx, rx) = std::sync::mpsc::channel();
-                let block = block2::RcBlock::new(move |granted: Bool, _e: *mut NSError| {
-                    let _ = tx.send(granted.as_bool());
-                });
-                CNContactStore::new().requestAccessForEntityType_completionHandler(CNEntityType::Contacts, &block);
-                return rx.recv_timeout(std::time::Duration::from_secs(120)).unwrap_or(false);
-            }
-            status == CNAuthorizationStatus::Authorized || status == CNAuthorizationStatus::Limited
-        })
-    }
-
-    pub fn photo(email: &str) -> Option<Vec<u8>> {
-        if !allowed() {
-            return None;
-        }
-        unsafe {
-            let store = CNContactStore::new();
-            let predicate = CNContact::predicateForContactsMatchingEmailAddress(&NSString::from_str(email));
-            let key: &ProtocolObject<dyn CNKeyDescriptor> = ProtocolObject::from_ref(CNContactThumbnailImageDataKey);
-            let keys = NSArray::from_slice(&[key]);
-            let found = store.unifiedContactsMatchingPredicate_keysToFetch_error(&predicate, &keys).ok()?;
-            found.iter().find_map(|c| c.thumbnailImageData()).map(|d| d.to_vec())
-        }
-    }
-}
-
-#[cfg(not(all(target_os = "macos", not(test))))]
-mod contacts {
-    pub fn photo(_email: &str) -> Option<Vec<u8>> {
-        None
     }
 }
 

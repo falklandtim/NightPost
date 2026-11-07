@@ -36,6 +36,11 @@ pub enum Cmd {
     /// Undo a move: bring a thread back from the folder it was moved to
     /// into the folders it came from.
     Restore(AccountId, String, FolderId, Vec<FolderId>),
+    /// Snooze a conversation on the server too (moves it into the Snoozed
+    /// folder and records the wake time for other machines).
+    Snooze(AccountId, String, chrono::DateTime<chrono::Utc>),
+    /// Cancel a snooze everywhere and return the conversation to the Inbox.
+    Unsnooze(AccountId, String),
     /// Is a Google OAuth client saved? (Read off the UI thread: the keychain
     /// may wait on a permission prompt.)
     CheckGoogle,
@@ -46,7 +51,7 @@ impl Cmd {
     /// the order they were sent (so an undo never overtakes its action).
     fn thread(&self) -> Option<(AccountId, String)> {
         match self {
-            Cmd::SetUnread(a, k, _) | Cmd::SetStarred(a, k, _) | Cmd::Move(a, k, _) | Cmd::MoveTo(a, k, _, _) | Cmd::Label(a, k, _, _) | Cmd::Restore(a, k, _, _) => Some((*a, k.clone())),
+            Cmd::SetUnread(a, k, _) | Cmd::SetStarred(a, k, _) | Cmd::Move(a, k, _) | Cmd::MoveTo(a, k, _, _) | Cmd::Label(a, k, _, _) | Cmd::Restore(a, k, _, _) | Cmd::Snooze(a, k, _) | Cmd::Unsnooze(a, k) => Some((*a, k.clone())),
             Cmd::CreateFolder(a, _, Some((k, _))) => Some((*a, k.clone())),
             _ => None,
         }
@@ -242,10 +247,12 @@ impl Worker {
                             Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
                             Err(_) => return,
                         };
-                        if let Ok(woke) = store.wake_due_snoozes() {
-                            if !woke.is_empty() {
-                                let _ = ev.send(Event::SnoozesWoke(woke.len()));
-                                ctx.request_repaint();
+                        if store.due_snoozes().is_ok_and(|d| !d.is_empty()) {
+                            if let Ok(woke) = owlpost_core::snooze_sync::wake_due(&store) {
+                                if woke > 0 {
+                                    let _ = ev.send(Event::SnoozesWoke(woke));
+                                    ctx.request_repaint();
+                                }
                             }
                         }
                         let mut plan = match req {
@@ -527,6 +534,17 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
             }
             Cmd::SetUnread(a, key, unread) => engine::set_thread_unread(&store, &account(a)?, &key, unread)?,
             Cmd::SetStarred(a, key, starred) => engine::set_thread_starred(&store, &account(a)?, &key, starred)?,
+            Cmd::Snooze(a, key, until) => {
+                // On failure the snooze is undone, so the conversation reappears.
+                let r = owlpost_core::snooze_sync::snooze_thread(&store, &account(a)?, &key, until);
+                let _ = ev.send(Event::Changed);
+                r.map_err(|e| e.context("Couldn't snooze on the server"))?;
+            }
+            Cmd::Unsnooze(a, key) => {
+                let r = owlpost_core::snooze_sync::unsnooze_thread(&store, &account(a)?, &key);
+                let _ = ev.send(Event::Changed);
+                r?;
+            }
             Cmd::Move(a, key, role) => {
                 engine::move_thread(&store, &account(a)?, &key, role)?;
                 let _ = ev.send(Event::Changed);

@@ -9,6 +9,7 @@ use crate::worker::{AttachmentDo, Cmd, Event, FolderUse, PushState, Worker};
 use chrono::{DateTime, Utc};
 use eframe::egui::{self, Key, RichText, Sense};
 use owlpost_core::snooze::{self, SnoozePreset};
+use owlpost_core::snooze_sync;
 use owlpost_core::theme::{self, Theme};
 use owlpost_core::*;
 use std::collections::{HashMap, HashSet};
@@ -467,6 +468,7 @@ impl OwlPostApp {
             }
             Undo::Snoozed { a, k } => {
                 let _ = self.store.unsnooze(*a, k);
+                self.worker.send(Cmd::Unsnooze(*a, k.clone()));
                 self.snoozed_count = self.store.snoozed_count().unwrap_or(0);
             }
             Undo::Pin { a, k } => {
@@ -692,10 +694,12 @@ impl OwlPostApp {
 
     fn act_snooze(&mut self, until: DateTime<Utc>) {
         let Some((a, k)) = self.current() else { return };
+        // Hidden here at once; the worker files it on the server.
         if let Err(e) = self.store.snooze(a, &k, until) {
             self.toast(format!("Couldn't snooze: {e:#}"), true);
             return;
         }
+        self.worker.send(Cmd::Snooze(a, k.clone(), until));
         if self.selection == Selection::Snoozed {
             self.reload();
         } else {
@@ -708,6 +712,7 @@ impl OwlPostApp {
     fn act_unsnooze(&mut self) {
         let Some((a, k)) = self.current() else { return };
         let _ = self.store.unsnooze(a, &k);
+        self.worker.send(Cmd::Unsnooze(a, k.clone()));
         self.toast("Returned to Inbox", false);
         self.reload();
     }
@@ -1145,6 +1150,7 @@ impl OwlPostApp {
         let has_archive = all.iter().any(|f| f.role == FolderRole::Archive);
         let from = self.viewed_folder(account);
         all.into_iter()
+            .filter(|f| !snooze_sync::is_internal_folder(&f.path))
             .filter(|f| match kind {
                 FolderUse::Label => f.role == FolderRole::Other,
                 FolderUse::Move => {
@@ -1397,7 +1403,7 @@ impl OwlPostApp {
                                 self.set_selection(Selection::Folder(f.id));
                             }
                         }
-                        for f in folders.iter().filter(|f| f.role == FolderRole::Other) {
+                        for f in folders.iter().filter(|f| f.role == FolderRole::Other && !snooze_sync::is_internal_folder(&f.path)) {
                             let depth = f.path.matches(['/', '.']).count();
                             let sel = self.selection == Selection::Folder(f.id) && self.search.is_empty();
                             ui.horizontal(|ui| {
@@ -1951,7 +1957,7 @@ impl OwlPostApp {
                 let labels: Vec<Folder> = self
                     .folders
                     .get(&open.account_id)
-                    .map(|fs| fs.iter().filter(|f| f.role == FolderRole::Other && in_folders.contains(&f.id)).cloned().collect())
+                    .map(|fs| fs.iter().filter(|f| f.role == FolderRole::Other && in_folders.contains(&f.id) && !snooze_sync::is_internal_folder(&f.path)).cloned().collect())
                     .unwrap_or_default();
                 let thread_ref = (open.account_id, open.thread_key.clone());
                 let mut remove_label: Option<Folder> = None;

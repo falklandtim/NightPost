@@ -1,0 +1,622 @@
+//! Snoozes kept on the mail server, so every OwlPost agrees (and the phone's
+//! mail app stops showing snoozed mail in the inbox).
+//!
+//! Two folders per account (labels on Gmail):
+//!
+//! * [`SNOOZED_FOLDER`] holds the snoozed conversations themselves.
+//! * [`STATE_FOLDER`] holds one small message, [`State`], listing each snooze:
+//!   the conversation's Message-IDs (local thread keys differ between
+//!   machines), when it wakes, and when that was last changed.
+//!
+//! Every change reads the state, merges it (the newer change to a
+//! conversation wins), appends the new state and deletes the old copies.
+//! Two machines writing at once just leave two copies, merged next time.
+//! Cancelled snoozes stay as tombstones for [`TOMBSTONE_DAYS`] so a machine
+//! that was offline doesn't bring them back.
+//!
+//! Whichever OwlPost is running when a snooze is due moves the conversation
+//! back to the Inbox and marks it unread. If another got there first, the
+//! conversation is no longer in the Snoozed folder and nothing happens twice.
+
+use crate::engine;
+use crate::models::*;
+use crate::store::Store;
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+/// Where snoozed conversations wait. Not plain "Snoozed": Mailspring used
+/// that name, and its leftovers mustn't be mistaken for ours.
+pub const SNOOZED_FOLDER: &str = "OwlPost Snoozed";
+/// Where the snooze list lives.
+pub const STATE_FOLDER: &str = "OwlPost Sync";
+/// The state message's sender; sync skips these wherever Gmail shows them.
+pub const STATE_FROM: &str = "snoozes@owlpost.invalid";
+const STATE_HEADER: &str = "X-OwlPost-State";
+const TOMBSTONE_DAYS: i64 = 30;
+/// A snooze whose conversation isn't in the Snoozed folder this long after
+/// it was set was taken out elsewhere (or its move failed): drop it.
+const GRACE_SECS: i64 = 10 * 60;
+
+/// Folders OwlPost keeps for itself, hidden from the sidebar and pickers.
+pub fn is_internal_folder(path: &str) -> bool {
+    path == SNOOZED_FOLDER || path == STATE_FOLDER
+}
+
+/// One snoozed (or un-snoozed) conversation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Entry {
+    /// Message-IDs in the conversation; any one identifies it.
+    pub ids: Vec<String>,
+    /// When it wakes (Unix seconds).
+    pub until: i64,
+    /// When this entry last changed (Unix seconds); the newer change wins.
+    pub updated: i64,
+    /// Cancelled or woken: a tombstone.
+    #[serde(default)]
+    pub removed: bool,
+}
+
+impl Entry {
+    fn same_conversation(&self, ids: &[String]) -> bool {
+        self.ids.iter().any(|i| ids.contains(i))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct State {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub entries: Vec<Entry>,
+}
+
+impl State {
+    /// Merge copies of the state: per conversation the newest change wins
+    /// (and their Message-IDs are pooled). Old tombstones are dropped.
+    pub fn merge(docs: impl IntoIterator<Item = State>, now: i64) -> State {
+        let mut out: Vec<Entry> = Vec::new();
+        for e in docs.into_iter().flat_map(|d| d.entries) {
+            match out.iter_mut().find(|o| o.same_conversation(&e.ids)) {
+                Some(o) => {
+                    for id in &e.ids {
+                        if !o.ids.contains(id) {
+                            o.ids.push(id.clone());
+                        }
+                    }
+                    if e.updated > o.updated {
+                        (o.until, o.updated, o.removed) = (e.until, e.updated, e.removed);
+                    }
+                }
+                None => out.push(e),
+            }
+        }
+        out.retain(|e| !(e.removed && e.updated < now - TOMBSTONE_DAYS * 86_400));
+        out.sort_by_key(|e| (e.removed, e.until));
+        State { version: 1, entries: out }
+    }
+
+    /// Snooze (`Some(until)`) or cancel (`None`) a conversation.
+    pub fn set(&mut self, ids: &[String], until: Option<i64>, now: i64) {
+        let entry = Entry { ids: ids.to_vec(), until: until.unwrap_or(0), updated: now, removed: until.is_none() };
+        match self.entries.iter_mut().find(|e| e.same_conversation(ids)) {
+            Some(e) => {
+                for id in ids {
+                    if !e.ids.contains(id) {
+                        e.ids.push(id.clone());
+                    }
+                }
+                e.until = if until.is_some() { entry.until } else { e.until };
+                (e.updated, e.removed) = (now, entry.removed);
+            }
+            None => self.entries.push(entry),
+        }
+    }
+
+    /// The state as an email to append to [`STATE_FOLDER`].
+    pub fn to_message(&self, now: DateTime<Utc>) -> Vec<u8> {
+        use base64::Engine;
+        let json = serde_json::to_string_pretty(self).unwrap_or_default();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json);
+        let body: Vec<&str> = b64.as_bytes().chunks(76).map(|c| std::str::from_utf8(c).unwrap_or_default()).collect();
+        format!(
+            "From: OwlPost <{STATE_FROM}>\r\nTo: OwlPost <{STATE_FROM}>\r\n\
+             Subject: OwlPost snoozes (used by OwlPost to sync snoozes; please leave it here)\r\n\
+             Date: {}\r\nMessage-ID: <owlpost-state-{}-{:08x}@owlpost.invalid>\r\n\
+             MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\
+             {STATE_HEADER}: 1\r\n\r\n{}\r\n",
+            now.to_rfc2822(),
+            now.timestamp(),
+            rand_u32(),
+            body.join("\r\n")
+        )
+        .into_bytes()
+    }
+
+    /// Read a state message (None if it isn't one).
+    pub fn from_message(raw: &[u8]) -> Option<State> {
+        let msg = mail_parser::MessageParser::default().parse(raw)?;
+        msg.header(STATE_HEADER)?;
+        serde_json::from_str(msg.body_text(0)?.trim()).ok()
+    }
+}
+
+fn rand_u32() -> u32 {
+    let mut b = [0u8; 4];
+    let _ = getrandom::getrandom(&mut b);
+    u32::from_le_bytes(b)
+}
+
+/// What one account looks like locally, for [`plan`].
+#[derive(Debug, Default)]
+pub struct Local {
+    /// Snoozes in the local table: thread key → wake time.
+    pub snoozes: HashMap<String, i64>,
+    /// Message-IDs of each thread mentioned (snoozed or in the folder).
+    pub ids: HashMap<String, Vec<String>>,
+    /// Threads with a copy in the Snoozed folder.
+    pub parked: HashSet<String>,
+}
+
+impl Local {
+    fn find(&self, ids: &[String]) -> Option<&String> {
+        let mut keys: Vec<&String> = self.ids.iter().filter(|(_, v)| v.iter().any(|i| ids.contains(i))).map(|(k, _)| k).collect();
+        keys.sort();
+        keys.into_iter().next()
+    }
+}
+
+/// What to do to bring the server, this machine and the clock into line.
+#[derive(Debug, Default, PartialEq)]
+pub struct Plan {
+    /// Snooze locally until…
+    pub snooze: Vec<(String, i64)>,
+    /// Forget the local snooze.
+    pub unsnooze: Vec<String>,
+    /// Due: back to the Inbox, unread.
+    pub wake: Vec<String>,
+    /// Move into the Snoozed folder.
+    pub park: Vec<String>,
+    /// In the Snoozed folder but not snoozed: back to the Inbox.
+    pub release: Vec<String>,
+    /// The state to write back, if it changed.
+    pub write: Option<State>,
+}
+
+/// Work out the changes, given the merged server state and what's local.
+pub fn plan(mut state: State, local: &Local, now: i64) -> Plan {
+    let before = state.clone();
+    let mut p = Plan::default();
+    let mut matched: HashSet<String> = HashSet::new();
+    let mut live: HashSet<String> = HashSet::new();
+    for e in state.entries.iter_mut() {
+        let key = local.find(&e.ids).cloned();
+        if let Some(k) = &key {
+            matched.insert(k.clone());
+        }
+        if e.removed {
+            if let Some(k) = key {
+                if local.snoozes.contains_key(&k) {
+                    p.unsnooze.push(k.clone());
+                }
+                if local.parked.contains(&k) {
+                    p.release.push(k);
+                }
+            }
+            continue;
+        }
+        match key {
+            Some(k) if e.until <= now => {
+                p.wake.push(k);
+                (e.removed, e.updated) = (true, now);
+            }
+            // Taken out of the Snoozed folder elsewhere (e.g. on the phone).
+            Some(k) if !local.parked.contains(&k) && e.updated < now - GRACE_SECS => {
+                if local.snoozes.contains_key(&k) {
+                    p.unsnooze.push(k);
+                }
+                (e.removed, e.updated) = (true, now);
+            }
+            Some(k) => {
+                if local.snoozes.get(&k) != Some(&e.until) {
+                    p.snooze.push((k.clone(), e.until));
+                }
+                live.insert(k);
+            }
+            // Mail this machine hasn't got; long overdue means nobody has.
+            None if e.until < now - 86_400 => (e.removed, e.updated) = (true, now),
+            None => {}
+        }
+    }
+    // Snoozed here but unknown to the server: snoozes from before syncing,
+    // or made while offline.
+    let mut local_only: Vec<(&String, &i64)> = local.snoozes.iter().filter(|(k, _)| !matched.contains(*k)).collect();
+    local_only.sort();
+    for (k, until) in local_only {
+        let ids = local.ids.get(k).cloned().unwrap_or_default();
+        // Its messages are gone (deleted elsewhere): nothing left to snooze.
+        if ids.is_empty() {
+            p.unsnooze.push(k.clone());
+            continue;
+        }
+        if *until <= now {
+            p.wake.push(k.clone());
+            continue;
+        }
+        state.set(&ids, Some(*until), now);
+        live.insert(k.clone());
+        if !local.parked.contains(k) {
+            p.park.push(k.clone());
+        }
+    }
+    let mut stray: Vec<&String> = local.parked.iter().filter(|k| !live.contains(*k) && !p.wake.contains(k) && !p.release.contains(k)).collect();
+    stray.sort();
+    p.release.extend(stray.into_iter().cloned());
+    if state != before {
+        p.write = Some(State::merge([state], now));
+    }
+    p
+}
+
+// ---------------------------------------------------------------------------
+// On the server
+// ---------------------------------------------------------------------------
+
+/// The Message-IDs of a thread.
+fn thread_ids(store: &Store, account: &Account, key: &str) -> Result<Vec<String>> {
+    Ok(store.thread_messages(account.id, key)?.into_iter().map(|m| m.message_id).filter(|i| !i.is_empty()).collect())
+}
+
+/// Every copy of the state on the server: (UIDs, merged state). An account
+/// that has never snoozed has no state folder: empty.
+fn read_state(account: &Account) -> Result<(Vec<u32>, State)> {
+    let mut s = engine::connect(account)?;
+    if s.select(STATE_FOLDER).is_err() {
+        let _ = s.logout();
+        return Ok((vec![], State::default()));
+    }
+    let uids: Vec<u32> = s.uid_search("ALL")?.into_iter().collect();
+    let mut docs = Vec::new();
+    if !uids.is_empty() {
+        for f in s.uid_fetch(engine::uid_set(&uids), "(UID BODY.PEEK[])")?.iter() {
+            if let Some(st) = f.body().and_then(State::from_message) {
+                docs.push(st);
+            }
+        }
+    }
+    let _ = s.logout();
+    Ok((uids, State::merge(docs, Utc::now().timestamp())))
+}
+
+/// Replace the copies `old` with `state`. Appends first, so a failure part
+/// way leaves an extra copy (merged later), never none.
+fn write_state(store: &Store, account: &Account, old: &[u32], state: &State) -> Result<()> {
+    let mut s = engine::connect(account)?;
+    ensure_folders(store, account, &mut s)?;
+    s.append_with_flags(STATE_FOLDER, state.to_message(Utc::now()), &[imap::types::Flag::Seen])?;
+    if !old.is_empty() {
+        s.select(STATE_FOLDER)?;
+        let set = engine::uid_set(old);
+        if account.is_gmail() {
+            // Deleting from a label only removes the label; the copy would
+            // stay in All Mail. Move it to Trash and delete it there.
+            if let Ok(trash) = engine::folder_for_role(store, account, FolderRole::Trash) {
+                s.uid_mv(&set, &trash.path)?;
+                s.select(&trash.path)?;
+                let gone: Vec<u32> = s.uid_search(format!("FROM \"{STATE_FROM}\""))?.into_iter().collect();
+                if !gone.is_empty() {
+                    s.uid_store(engine::uid_set(&gone), "+FLAGS.SILENT (\\Deleted)")?;
+                    s.expunge()?;
+                }
+            }
+        } else {
+            s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)")?;
+            s.expunge()?;
+        }
+    }
+    let _ = s.logout();
+    Ok(())
+}
+
+/// Create the two folders if they're missing; returns the Snoozed folder.
+fn ensure_folders(store: &Store, account: &Account, s: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>) -> Result<Folder> {
+    // The imap crate sends LIST's pattern as is, so quote it (the names have spaces).
+    let exists = |s: &mut imap::Session<_>, name: &str| s.list(Some(""), Some(&format!("\"{name}\""))).map(|l| !l.is_empty()).unwrap_or(false);
+    for name in [SNOOZED_FOLDER, STATE_FOLDER] {
+        if !exists(s, name) {
+            s.create(name)?;
+            let _ = s.subscribe(name);
+        }
+    }
+    snoozed_folder(store, account)
+}
+
+fn snoozed_folder(store: &Store, account: &Account) -> Result<Folder> {
+    let id = store.upsert_folder(account.id, SNOOZED_FOLDER, FolderRole::Other)?;
+    store.folder(id)?.ok_or_else(|| anyhow!("{SNOOZED_FOLDER} vanished"))
+}
+
+/// Read, change and write the state.
+fn update_state(store: &Store, account: &Account, f: impl FnOnce(&mut State)) -> Result<()> {
+    let (old, mut state) = read_state(account)?;
+    f(&mut state);
+    write_state(store, account, &old, &State::merge([state], Utc::now().timestamp()))
+}
+
+/// Move a thread into the Snoozed folder (out of the Inbox when it's there).
+/// A thread with nothing to move (archived on Gmail) gets a copy instead,
+/// so it's still in the folder and comes back to the Inbox when it wakes.
+fn park(store: &Store, account: &Account, key: &str, snoozed: &Folder) -> Result<()> {
+    let inbox = store.folder_by_role(account.id, FolderRole::Inbox)?.map(|f| f.id);
+    if engine::move_plan(store, account, key, snoozed.id, inbox)?.is_empty() {
+        return engine::set_label(store, account, key, snoozed, true);
+    }
+    engine::move_thread_to(store, account, key, snoozed, inbox)
+}
+
+/// Move a thread from the Snoozed folder back to the Inbox, if it's there.
+fn unpark(store: &Store, account: &Account, key: &str, snoozed: &Folder) -> Result<()> {
+    if !store.thread_folder_ids(account.id, key)?.contains(&snoozed.id) {
+        return Ok(());
+    }
+    let inbox = engine::folder_for_role(store, account, FolderRole::Inbox)?;
+    engine::restore_thread(store, account, key, &inbox, snoozed)
+}
+
+/// Snooze a conversation everywhere. On failure nothing stays snoozed.
+pub fn snooze_thread(store: &Store, account: &Account, key: &str, until: DateTime<Utc>) -> Result<()> {
+    store.snooze(account.id, key, until)?;
+    if account.demo {
+        return Ok(());
+    }
+    let ids = thread_ids(store, account, key)?;
+    let now = Utc::now().timestamp();
+    let r = update_state(store, account, |st| st.set(&ids, Some(until.timestamp()), now)).and_then(|_| {
+        let snoozed = snoozed_folder(store, account)?;
+        park(store, account, key, &snoozed)
+    });
+    if let Err(e) = r {
+        store.unsnooze(account.id, key)?;
+        let _ = update_state(store, account, |st| st.set(&ids, None, Utc::now().timestamp()));
+        return Err(e);
+    }
+    // The move may have filed the thread under a new key.
+    rekey(store, account, key, &ids, until)?;
+    Ok(())
+}
+
+/// After a move, keep the local snooze on whatever key the thread has now.
+fn rekey(store: &Store, account: &Account, key: &str, ids: &[String], until: DateTime<Utc>) -> Result<()> {
+    if let Some(now_key) = store.thread_key_for_ids(account.id, ids)? {
+        if now_key != key {
+            store.unsnooze(account.id, key)?;
+            store.snooze(account.id, &now_key, until)?;
+        }
+    }
+    Ok(())
+}
+
+/// Cancel a snooze everywhere and put the conversation back in the Inbox.
+pub fn unsnooze_thread(store: &Store, account: &Account, key: &str) -> Result<()> {
+    store.unsnooze(account.id, key)?;
+    if account.demo {
+        return Ok(());
+    }
+    let ids = thread_ids(store, account, key)?;
+    update_state(store, account, |st| st.set(&ids, None, Utc::now().timestamp()))?;
+    if let Some(f) = store.folders(account.id)?.into_iter().find(|f| f.path == SNOOZED_FOLDER) {
+        unpark(store, account, key, &f)?;
+    }
+    Ok(())
+}
+
+/// Bring one account into line with the server: pick up snoozes made on
+/// other machines, drop ones cancelled there, wake what's due, and upload
+/// snoozes only this machine knows. Returns how many woke.
+pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
+    if account.demo {
+        return Ok(store.wake_due_snoozes()?.iter().filter(|(a, _)| *a == account.id).count());
+    }
+    let snoozed = store.folders(account.id)?.into_iter().find(|f| f.path == SNOOZED_FOLDER);
+    let mut local = Local::default();
+    for (k, until) in store.account_snoozes(account.id)? {
+        local.snoozes.insert(k, until.timestamp());
+    }
+    if let Some(f) = &snoozed {
+        local.parked = store.thread_keys_in_folder(f.id)?.into_iter().collect();
+    }
+    let (old, state) = read_state(account)?;
+    // Never snoozed anywhere: nothing to do.
+    if local.snoozes.is_empty() && local.parked.is_empty() && state.entries.iter().all(|e| e.removed) {
+        return Ok(0);
+    }
+    let keys: Vec<String> = local.snoozes.keys().chain(local.parked.iter()).cloned().collect();
+    for k in keys {
+        let ids = thread_ids(store, account, &k)?;
+        local.ids.insert(k, ids);
+    }
+    // Threads the server knows about that aren't snoozed or parked here.
+    for e in state.entries.iter().filter(|e| !e.removed) {
+        if local.find(&e.ids).is_none() {
+            if let Some(k) = store.thread_key_for_ids(account.id, &e.ids)? {
+                let ids = thread_ids(store, account, &k)?;
+                local.ids.insert(k, ids);
+            }
+        }
+    }
+    let now = Utc::now().timestamp();
+    let p = plan(state, &local, now);
+    if let Some(st) = &p.write {
+        write_state(store, account, &old, st)?;
+    }
+    for (k, until) in &p.snooze {
+        store.snooze(account.id, k, DateTime::from_timestamp(*until, 0).unwrap_or_default())?;
+    }
+    for k in &p.unsnooze {
+        store.unsnooze(account.id, k)?;
+    }
+    let snoozed = match (&snoozed, p.park.is_empty()) {
+        (Some(f), _) => Some(f.clone()),
+        (None, false) => Some(snoozed_folder(store, account)?),
+        (None, true) => None,
+    };
+    if let Some(f) = &snoozed {
+        for k in &p.park {
+            if let Err(e) = park(store, account, k, f) {
+                log::warn!("couldn't move a snoozed conversation into {SNOOZED_FOLDER}: {e:#}");
+            }
+        }
+        for k in &p.release {
+            if let Err(e) = unpark(store, account, k, f) {
+                log::warn!("couldn't return a conversation from {SNOOZED_FOLDER}: {e:#}");
+            }
+        }
+    }
+    for k in &p.wake {
+        store.unsnooze(account.id, k)?;
+        if let Some(f) = &snoozed {
+            unpark(store, account, k, f)?;
+        }
+        // The move may have changed its key; mark whatever it is now.
+        let ids = local.ids.get(k).cloned().unwrap_or_default();
+        let key = store.thread_key_for_ids(account.id, &ids)?.unwrap_or_else(|| k.clone());
+        engine::set_thread_unread(store, account, &key, true)?;
+    }
+    Ok(p.wake.len())
+}
+
+/// Wake every snooze that's due, on every account. Returns how many woke.
+pub fn wake_due(store: &Store) -> Result<usize> {
+    let due: HashSet<AccountId> = store.due_snoozes()?.into_iter().map(|(a, _)| a).collect();
+    let mut woke = 0;
+    for a in store.accounts()?.into_iter().filter(|a| due.contains(&a.id)) {
+        match sync_snoozes(store, &a) {
+            Ok(n) => woke += n,
+            Err(e) => log::warn!("waking snoozes for {} failed: {e:#}", a.email),
+        }
+    }
+    Ok(woke)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+    fn entry(i: &[&str], until: i64, updated: i64, removed: bool) -> Entry {
+        Entry { ids: ids(i), until, updated, removed }
+    }
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn newer_change_wins_and_ids_pool() {
+        let a = State { version: 1, entries: vec![entry(&["a"], NOW + 100, NOW - 50, false)] };
+        let b = State { version: 1, entries: vec![entry(&["a", "b"], 0, NOW - 10, true), entry(&["c"], NOW + 5, NOW - 5, false)] };
+        let m = State::merge([a.clone(), b.clone()], NOW);
+        assert_eq!(m.entries.len(), 2);
+        let first = m.entries.iter().find(|e| e.ids.contains(&"a".into())).unwrap();
+        assert!(first.removed, "the later unsnooze wins");
+        assert_eq!(first.ids, ids(&["a", "b"]));
+        // Order of copies doesn't matter.
+        assert_eq!(State::merge([b, a], NOW).entries.len(), 2);
+    }
+
+    #[test]
+    fn old_tombstones_are_dropped() {
+        let s = State { version: 1, entries: vec![entry(&["a"], 0, NOW - 31 * 86_400, true), entry(&["b"], 0, NOW - 86_400, true)] };
+        assert_eq!(State::merge([s], NOW).entries, vec![entry(&["b"], 0, NOW - 86_400, true)]);
+    }
+
+    #[test]
+    fn state_round_trips_through_an_email() {
+        let s = State { version: 1, entries: vec![entry(&["abc@example.com", "dé@x"], NOW, NOW, false)] };
+        let raw = s.to_message(DateTime::from_timestamp(NOW, 0).unwrap());
+        assert_eq!(State::from_message(&raw), Some(s));
+        assert!(String::from_utf8(raw).unwrap().contains(STATE_FROM));
+        assert_eq!(State::from_message(b"From: a@b\r\nSubject: hi\r\n\r\nhello\r\n"), None, "ordinary mail isn't state");
+    }
+
+    fn local(snoozes: &[(&str, i64)], parked: &[&str], threads: &[(&str, &[&str])]) -> Local {
+        Local {
+            snoozes: snoozes.iter().map(|(k, u)| (k.to_string(), *u)).collect(),
+            parked: parked.iter().map(|k| k.to_string()).collect(),
+            ids: threads.iter().map(|(k, i)| (k.to_string(), ids(i))).collect(),
+        }
+    }
+
+    #[test]
+    fn picks_up_a_snooze_from_another_machine() {
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 60, false)] };
+        let p = plan(st, &local(&[], &["t1"], &[("t1", &["m1"])]), NOW);
+        assert_eq!(p.snooze, vec![("t1".into(), NOW + 3600)]);
+        assert!(p.write.is_none() && p.wake.is_empty() && p.release.is_empty());
+    }
+
+    #[test]
+    fn wakes_due_snoozes_once() {
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW - 1, NOW - 600, false)] };
+        let p = plan(st, &local(&[("t1", NOW - 1)], &["t1"], &[("t1", &["m1"])]), NOW);
+        assert_eq!(p.wake, vec!["t1".to_string()]);
+        let w = p.write.expect("tombstone written");
+        assert!(w.entries[0].removed);
+        // The next machine sees the tombstone and does nothing more.
+        let again = plan(w, &local(&[("t1", NOW - 1)], &[], &[("t1", &["m1"])]), NOW + 5);
+        assert!(again.wake.is_empty());
+        assert_eq!(again.unsnooze, vec!["t1".to_string()]);
+    }
+
+    #[test]
+    fn cancelled_elsewhere_is_dropped_here() {
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 5, true)] };
+        let p = plan(st, &local(&[("t1", NOW + 3600)], &["t1"], &[("t1", &["m1"])]), NOW);
+        assert_eq!(p.unsnooze, vec!["t1".to_string()]);
+        assert_eq!(p.release, vec!["t1".to_string()]);
+        assert!(p.write.is_none());
+    }
+
+    #[test]
+    fn local_snoozes_are_uploaded_and_parked() {
+        let p = plan(State::default(), &local(&[("t1", NOW + 3600)], &[], &[("t1", &["m1", "m2"])]), NOW);
+        assert_eq!(p.park, vec!["t1".to_string()]);
+        let w = p.write.unwrap();
+        assert_eq!(w.entries, vec![entry(&["m1", "m2"], NOW + 3600, NOW, false)]);
+    }
+
+    #[test]
+    fn taken_out_of_the_folder_elsewhere_means_unsnoozed() {
+        // Snoozed an hour ago, but no longer in the Snoozed folder.
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 3600, false)] };
+        let p = plan(st.clone(), &local(&[("t1", NOW + 3600)], &[], &[("t1", &["m1"])]), NOW);
+        assert_eq!(p.unsnooze, vec!["t1".to_string()]);
+        assert!(p.write.unwrap().entries[0].removed);
+        // Just snoozed (the move may still be on its way): leave it.
+        let fresh = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 30, false)] };
+        let p = plan(fresh, &local(&[("t1", NOW + 3600)], &[], &[("t1", &["m1"])]), NOW);
+        assert!(p.unsnooze.is_empty() && p.write.is_none());
+    }
+
+    #[test]
+    fn snoozes_of_deleted_mail_are_forgotten() {
+        let p = plan(State::default(), &local(&[("gone", NOW - 5)], &[], &[]), NOW);
+        assert_eq!(p.unsnooze, vec!["gone".to_string()]);
+        assert!(p.wake.is_empty() && p.write.is_none());
+    }
+
+    #[test]
+    fn strays_in_the_folder_go_back_to_the_inbox() {
+        let p = plan(State::default(), &local(&[], &["t9"], &[("t9", &["m9"])]), NOW);
+        assert_eq!(p.release, vec!["t9".to_string()]);
+    }
+
+    #[test]
+    fn unknown_mail_is_kept_until_long_overdue() {
+        let st = State { version: 1, entries: vec![entry(&["x"], NOW + 60, NOW - 9000, false), entry(&["y"], NOW - 2 * 86_400, NOW - 9000, false)] };
+        let p = plan(st, &Local::default(), NOW);
+        let w = p.write.unwrap();
+        assert!(!w.entries.iter().find(|e| e.ids == ids(&["x"])).unwrap().removed);
+        assert!(w.entries.iter().find(|e| e.ids == ids(&["y"])).unwrap().removed);
+    }
+}

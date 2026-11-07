@@ -7,7 +7,7 @@ It has one binary with no Electron, a local SQLite cache, a built-in MCP server,
 
 - **Gmail, iCloud and any IMAP/SMTP account.** Presets for Gmail, iCloud, Outlook, Yahoo and Fastmail; passwords are kept in the macOS Keychain (or the Windows/Linux equivalent).
 - **Unified Inbox** plus per-account folders, conversation threading (References/In-Reply-To), and Gmail-style search (`from:`, `to:`, `subject:`, `is:unread`, `is:starred`, `is:pinned`, `has:attachment`).
-- **Snooze**: *Later today, Tonight, Tomorrow, This weekend, Next week, Next month*, or type a time like `3h`, `friday` or `2026-12-01 09:00`. Snoozed threads leave every mailbox and come back to the inbox unread when they wake.
+- **Snooze**: *Later today, Tonight, Tomorrow, This weekend, Next week, Next month*, or type a time like `3h`, `friday` or `2026-12-01 09:00`. Snoozed threads leave every mailbox and come back to the inbox unread when they wake. Snoozes are kept on the mail server, so every Mac running OwlPost agrees and your phone's mail app doesn't show snoozed mail in the inbox (see [Snooze sync](#snooze-sync)).
 - **Pin to top** (like Canary): press `p`, click the pin in the toolbar, or right-click a conversation. Pinned conversations stay above everything else in every list they appear in. Pins are stored locally.
 - **Swipe actions**: swipe a conversation sideways with two fingers on a trackpad, or drag it with the mouse. By default swiping right archives and swiping left trashes. Each direction can be set to archive, trash, snooze, pin or mark read/unread in Preferences → Message list.
 - **Quick actions on hover**: widen the message list (at least 420 points) and hovering over a conversation shows mark read/unread, archive, trash, snooze and pin buttons, as in Mailspring.
@@ -21,7 +21,7 @@ It has one binary with no Electron, a local SQLite cache, a built-in MCP server,
 - **Received attachments**: click an attachment in a message to open it in its usual app (Preview, Pages…). Right-click it for **Save to Downloads**, which never overwrites an existing file and shows the saved file in Finder, or **Save As…**. Sync keeps only each attachment's name and size; the file itself is fetched from the server the first time you open it. It's then cached in `~/Library/Caches/co.timson.OwlPost/attachments`, which macOS may clear at any time. The server keeps the real copy.
 - **Move & label**: move a conversation to any folder (`v`, the folder button, or right-click → Move to), and add or remove Gmail labels (`l`, the tag button, or right-click → Label). Both pickers are searchable and can create a new folder or label. Labels show as removable chips on the open conversation. On Gmail, Archive and Move only take a conversation out of the Inbox, so its other labels stay.
 - **Signatures**: Preferences → Signatures lets you create named signatures and choose a default for each account. Each signature has a **Plain text / HTML** toggle. HTML signatures appear as readable text while you write, and the message is sent with both a text and an HTML version, with your real HTML in the HTML version (the MCP `send_email` and `reply` tools do the same). HTML signatures are drawn in the composer and in Preferences, with bold and italic text, links, and images loaded from the web. Pasting a whole page copied from another app (such as Canary) is fine: on Save, OwlPost keeps only the signature and removes page styles, such as Canary's dark-mode colour inversion, which would otherwise restyle the whole email. Images load even when the host labels them with the wrong file type, as Dropbox share links do. The composer has a signature picker that swaps the signature in place, and changing the From account switches to that account's default.
-- Archive, trash, spam, star, mark unread, reply, reply all and forward, with address autocomplete.
+- Archive, trash, spam, star, mark unread, reply, reply all and forward. To, Cc and Bcc suggest addresses as you type: people you've written to come first, then people who've written to you, then your Mac's Contacts. Use ↑ ↓ and Enter or Tab to pick one, or click it.
 - A unified toolbar with capsule button groups (it sits in the title bar on macOS). There's also a filter menu with All, Unread, Starred, Pinned and With attachments, and Mark all as read.
 - Keyboard shortcuts: `⌘W` closes a composer or Preferences, plus `c` `r` `a` `f` `e` `#` `!` `b` `p` `s` `u` `j/k` `/` `g i` (full list in Preferences → Shortcuts).
 - **Mailspring themes** (see below).
@@ -105,7 +105,16 @@ Data lives in `~/Library/Application Support/co.timson.OwlPost/` (override with 
 
 ## Not yet implemented
 
-HTML message rendering on Linux (shown as text there), inline (cid:) images in HTML email, server-side snooze that syncs across devices, drafts sync, and send-later or read receipts.
+HTML message rendering on Linux (shown as text there), inline (cid:) images in HTML email, drafts sync, and send-later or read receipts.
+
+## Snooze sync
+
+Each account gets two extra folders (labels on Gmail):
+
+- **OwlPost Snoozed** holds snoozed conversations until they wake. Other mail apps show the folder, so you can find snoozed mail there. Moving a conversation out of it elsewhere (on your phone, say) cancels the snooze.
+- **OwlPost Sync** holds one small message, "OwlPost snoozes", listing each snooze by Message-ID with its wake time. Leave it alone. OwlPost hides both folders and never shows the message as mail.
+
+Each change merges with what's on the server, and for any one conversation the newer change wins. Cancelled snoozes are remembered for 30 days so a Mac that was offline doesn't bring them back. Whichever OwlPost is running when a snooze is due moves it back to the Inbox and marks it unread. When none is running, it comes back the next time one starts. Snoozes made before syncing existed are uploaded on the first sync. Code: `crates/owlpost-core/src/snooze_sync.rs`.
 
 ## Plans
 

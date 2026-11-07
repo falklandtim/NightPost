@@ -871,10 +871,10 @@ impl Store {
     /// Snoozed threads that are still asleep, soonest wake-up first.
     pub fn snoozed_threads(&self) -> Result<Vec<(ThreadSummary, DateTime<Utc>)>> {
         let mut st = self.conn.prepare(
-            "SELECT account_id, thread_key, until FROM snoozes WHERE until > ?1 ORDER BY until ASC",
+            "SELECT account_id, thread_key, until FROM snoozes ORDER BY until ASC",
         )?;
         let rows: Vec<(AccountId, String, i64)> = st
-            .query_map([Utc::now().timestamp()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut out = Vec::new();
         for (acc, key, until) in rows {
@@ -910,9 +910,13 @@ impl Store {
 
     /// Remove expired snoozes, marking their threads unread so they pop back
     /// to the top of the inbox. Returns the woken threads.
+    /// Wake the demo accounts' due snoozes (real accounts wake through
+    /// `snooze_sync`, which also moves the mail on the server).
     pub fn wake_due_snoozes(&self) -> Result<Vec<(AccountId, String)>> {
         let now = Utc::now().timestamp();
-        let mut st = self.conn.prepare("SELECT account_id, thread_key FROM snoozes WHERE until <= ?1")?;
+        let mut st = self.conn.prepare(
+            "SELECT s.account_id, s.thread_key FROM snoozes s JOIN accounts a ON a.id=s.account_id WHERE s.until <= ?1 AND a.demo=1",
+        )?;
         let due: Vec<(AccountId, String)> = st
             .query_map([now], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -923,12 +927,47 @@ impl Store {
         Ok(due)
     }
 
+    /// Snoozes in the Snoozed view, including any that are due but not yet
+    /// back in the Inbox (waiting for the server).
     pub fn snoozed_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM snoozes WHERE until > ?1",
-            [Utc::now().timestamp()],
-            |r| r.get(0),
-        )?)
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM snoozes", [], |r| r.get(0))?)
+    }
+
+    /// Snoozes that are due, on any account.
+    pub fn due_snoozes(&self) -> Result<Vec<(AccountId, String)>> {
+        let mut st = self.conn.prepare("SELECT account_id, thread_key FROM snoozes WHERE until <= ?1")?;
+        let v = st.query_map([Utc::now().timestamp()], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    /// One account's snoozes: thread key and wake time.
+    pub fn account_snoozes(&self, account_id: AccountId) -> Result<Vec<(String, DateTime<Utc>)>> {
+        let mut st = self.conn.prepare("SELECT thread_key, until FROM snoozes WHERE account_id=?1")?;
+        let v = st
+            .query_map([account_id], |r| Ok((r.get::<_, String>(0)?, from_ts(r.get(1)?))))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    /// The threads with a copy in a folder.
+    pub fn thread_keys_in_folder(&self, folder_id: FolderId) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT DISTINCT thread_key FROM messages WHERE folder_id=?1")?;
+        let v = st.query_map([folder_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    /// The thread holding any of these Message-IDs.
+    pub fn thread_key_for_ids(&self, account_id: AccountId, ids: &[String]) -> Result<Option<String>> {
+        for id in ids {
+            let k: Option<String> = self
+                .conn
+                .query_row("SELECT thread_key FROM messages WHERE account_id=?1 AND message_id=?2 LIMIT 1", params![account_id, id], |r| r.get(0))
+                .optional()?;
+            if k.is_some() {
+                return Ok(k);
+            }
+        }
+        Ok(None)
     }
 
     // ----- pins -------------------------------------------------------------
@@ -966,10 +1005,21 @@ impl Store {
     /// Address-book style autocomplete built from everyone you've exchanged mail with.
     pub fn suggest_contacts(&self, prefix: &str, limit: usize) -> Result<Vec<Contact>> {
         let like = format!("%{}%", prefix.trim());
+        // People who wrote to you, plus people you wrote to (weighted higher).
         let mut st = self.conn.prepare(
-            "SELECT from_name, from_email, COUNT(*) c FROM messages
-             WHERE from_email LIKE ?1 OR from_name LIKE ?1
-             GROUP BY lower(from_email) ORDER BY c DESC LIMIT ?2",
+            "WITH mine AS (SELECT lower(email) e FROM accounts),
+             people(name, email, w) AS (
+                SELECT from_name, from_email, 1 FROM messages WHERE lower(from_email) NOT IN (SELECT e FROM mine)
+                UNION ALL
+                SELECT json_extract(j.value, '$.name'), json_extract(j.value, '$.email'), 3
+                FROM messages m, json_each(m.to_json || '') j WHERE lower(m.from_email) IN (SELECT e FROM mine)
+                UNION ALL
+                SELECT json_extract(j.value, '$.name'), json_extract(j.value, '$.email'), 3
+                FROM messages m, json_each(m.cc_json || '') j WHERE lower(m.from_email) IN (SELECT e FROM mine)
+             )
+             SELECT COALESCE(MAX(name), ''), email, SUM(w) c FROM people
+             WHERE email LIKE '%@%' AND (email LIKE ?1 OR name LIKE ?1) AND lower(email) NOT IN (SELECT e FROM mine)
+             GROUP BY lower(email) ORDER BY c DESC LIMIT ?2",
         )?;
         let v = st
             .query_map(params![like, limit as i64], |r| Ok(Contact { name: r.get(0)?, email: r.get(1)? }))?
@@ -987,6 +1037,19 @@ mod tests {
         let p = crate::test_db_path("sp-test");
         let _ = std::fs::remove_file(&p);
         Store::open(&p).unwrap()
+    }
+
+    #[test]
+    fn suggests_people_you_mail_but_not_yourself() {
+        let s = tmp();
+        demo::seed(&s).unwrap();
+        let maya = s.suggest_contacts("may", 5).unwrap();
+        assert_eq!(maya.first().map(|c| (c.name.as_str(), c.email.as_str())), Some(("Maya Chen", "maya@chen.family")));
+        let me = s.accounts().unwrap()[0].email.clone();
+        let mine = s.suggest_contacts(&me[..4], 20).unwrap();
+        assert!(mine.iter().all(|c| !c.email.eq_ignore_ascii_case(&me)));
+        // Sam is someone Alex wrote to, so sorts well even by first name.
+        assert!(s.suggest_contacts("sam", 5).unwrap().iter().any(|c| c.email == "sam@northwind.demo"));
     }
 
     #[test]

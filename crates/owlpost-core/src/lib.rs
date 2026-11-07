@@ -12,6 +12,7 @@ pub mod parse;
 pub mod presets;
 pub mod smtp;
 pub mod snooze;
+pub mod snooze_sync;
 pub mod store;
 pub mod theme;
 
