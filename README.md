@@ -106,3 +106,17 @@ Data lives in `~/Library/Application Support/co.timson.OwlPost/` (override with 
 ## Not yet implemented
 
 HTML message rendering on Linux (shown as text there), inline (cid:) images in HTML email, server-side snooze that syncs across devices, drafts sync, and send-later or read receipts.
+
+## Plans
+
+- iPhone app: see [docs/ios.md](docs/ios.md) (not started).
+
+## Known issues
+
+### `imap-proto` future-incompatibility warning (needs fixing)
+
+Builds print `warning: the following packages contain code that will be rejected by a future version of Rust: imap-proto v0.10.2`. It comes from `imap` 2.4.1 (`crates/owlpost-core/Cargo.toml`), which depends on `imap-proto` 0.10.2. That crate's macros end with a trailing semicolon, which Rust is phasing out ([rust-lang/rust#79813](https://github.com/rust-lang/rust/issues/79813)). For now it's only a warning and doesn't change how OwlPost behaves. A future Rust release will make it a hard error, and the build will then fail.
+
+Planned fix: copy `imap-proto` 0.10.2 into the repo with the trailing semicolons removed, point Cargo at it with `[patch.crates-io]`, and run the test suite. This changes no behaviour. Don't upgrade to `imap` 3.0 for this: it's an alpha with a different API, and moving to it means rewriting and re-testing sync, IDLE and Google sign-in.
+
+See the details with `cargo report future-incompatibilities --package imap-proto@0.10.2`.
