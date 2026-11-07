@@ -194,12 +194,13 @@ impl FolderRole {
         }
     }
     /// Roles shown in the unified "all accounts" section of the sidebar.
-    pub const UNIFIED: [FolderRole; 6] = [
+    pub const UNIFIED: [FolderRole; 7] = [
         FolderRole::Inbox,
         FolderRole::Starred,
         FolderRole::Drafts,
         FolderRole::Sent,
         FolderRole::Archive,
+        FolderRole::Spam,
         FolderRole::Trash,
     ];
 

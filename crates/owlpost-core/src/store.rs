@@ -452,6 +452,16 @@ impl Store {
         )?)
     }
 
+    /// How many messages sit in folders with `role` across all accounts
+    /// (the sidebar's Drafts count).
+    pub fn unified_total(&self, role: FolderRole) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM messages m JOIN folders f ON f.id=m.folder_id WHERE f.role=?1",
+            params![role.as_str()],
+            |r| r.get(0),
+        )?)
+    }
+
     // ----- messages ---------------------------------------------------------
 
     /// Work out which thread a new message belongs to.

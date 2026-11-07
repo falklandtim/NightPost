@@ -46,7 +46,7 @@ pub enum Selection {
     Snoozed,
 }
 
-/// Quick filter from the funnel button above the list.
+/// Quick filter from the chips above the list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ListFilter {
     All,
@@ -60,11 +60,11 @@ impl ListFilter {
     const ALL: [ListFilter; 5] = [ListFilter::All, ListFilter::Unread, ListFilter::Starred, ListFilter::Pinned, ListFilter::Attachments];
     fn label(self) -> &'static str {
         match self {
-            ListFilter::All => "All conversations",
+            ListFilter::All => "All",
             ListFilter::Unread => "Unread",
             ListFilter::Starred => "Starred",
             ListFilter::Pinned => "Pinned",
-            ListFilter::Attachments => "With attachments",
+            ListFilter::Attachments => "Attachments",
         }
     }
     fn token(self) -> &'static str {
@@ -241,6 +241,7 @@ pub struct OwlPostApp {
     accounts: Vec<Account>,
     folders: HashMap<AccountId, Vec<Folder>>,
     unified_unread: HashMap<FolderRole, i64>,
+    unified_drafts: i64,
     snoozed_count: i64,
     collapsed_accounts: Vec<AccountId>,
     selection: Selection,
@@ -268,6 +269,8 @@ pub struct OwlPostApp {
     /// can line its sections up with the columns below.
     sidebar_right: f32,
     list_right: f32,
+    /// Where the list's rows start on screen (below its header).
+    list_top: f32,
     /// Room left for the macOS traffic lights when the toolbar is drawn in
     /// the title bar (0 when the system title bar is shown).
     pub titlebar_inset: f32,
@@ -354,12 +357,8 @@ impl OwlPostApp {
         }
         install_image_loaders(ctx);
         let themes = theme::discover();
-        let theme_id = saved_theme
-            .filter(|id| themes.iter().any(|t| &t.id == id))
-            .unwrap_or_else(|| {
-                if ctx.style().visuals.dark_mode { "owlpost-dark".into() } else { "owlpost-light".into() }
-            });
-        let colors = Colors::new(themes.iter().find(|t| t.id == theme_id).map(Theme::palette).unwrap_or_else(|| themes[0].palette()));
+        let theme_id = saved_theme.filter(|id| themes.iter().any(|t| &t.id == id)).unwrap_or_else(|| theme::MOONLIT.into());
+        let colors = Colors::new(theme_palette(&themes, &theme_id, system_dark(ctx)));
         colors.apply(ctx);
         let worker = Worker::spawn(store.path().to_path_buf(), ctx.clone());
         // Tests never touch the real keychain.
@@ -377,6 +376,7 @@ impl OwlPostApp {
             accounts: vec![],
             folders: HashMap::new(),
             unified_unread: HashMap::new(),
+            unified_drafts: 0,
             snoozed_count: 0,
             collapsed_accounts: vec![],
             selection: Selection::Unified(FolderRole::Inbox),
@@ -401,6 +401,7 @@ impl OwlPostApp {
             show_sidebar: true,
             sidebar_right: 220.0,
             list_right: 620.0,
+            list_top: 0.0,
             titlebar_inset: 0.0,
             list_settings: ListSettings::default(),
             hidden_pinned: 0,
@@ -510,6 +511,7 @@ impl OwlPostApp {
             .iter()
             .map(|r| (*r, self.store.unified_unread(*r).unwrap_or(0)))
             .collect();
+        self.unified_drafts = self.store.unified_total(FolderRole::Drafts).unwrap_or(0);
         self.snoozed_count = self.store.snoozed_count().unwrap_or(0);
         self.sigs = SignatureBook::load(&self.store);
 
@@ -800,8 +802,16 @@ impl OwlPostApp {
     fn set_theme(&mut self, ctx: &egui::Context, id: &str) {
         if let Some(t) = self.themes.iter().find(|t| t.id == id) {
             self.theme_id = t.id.clone();
-            self.colors = Colors::new(t.palette());
+            self.colors = Colors::new(theme_palette(&self.themes, id, system_dark(ctx)));
             self.colors.apply(ctx);
+        }
+    }
+
+    /// "Moonlit" follows the system: switch when the Mac's appearance does.
+    fn follow_system_theme(&mut self, ctx: &egui::Context) {
+        if self.theme_id == theme::MOONLIT && system_dark(ctx) != self.colors.p.dark {
+            let id = self.theme_id.clone();
+            self.set_theme(ctx, &id);
         }
     }
 
@@ -1010,7 +1020,7 @@ impl OwlPostApp {
         let pinned = current.as_ref().map(|(a, k)| self.store.is_pinned(*a, k).unwrap_or(false)).unwrap_or(false);
         let gmail = current.as_ref().and_then(|(a, _)| self.accounts.iter().find(|x| x.id == *a)).is_some_and(|a| a.is_gmail());
         egui::TopBottomPanel::top("toolbar")
-            .exact_height(52.0)
+            .exact_height(60.0)
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(col.toolbar))
             .show(ctx, |ui| {
@@ -1026,65 +1036,37 @@ impl OwlPostApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
                     }
                 }
-                let leading = self.titlebar_inset + 40.0;
-                let a_right = if self.show_sidebar { self.sidebar_right.max(leading) } else { leading };
-                let b_right = self.list_right.max(a_right + 240.0);
                 let (top, bottom) = (full.top(), full.bottom());
                 let p = ui.painter().clone();
-                if self.show_sidebar {
-                    p.rect_filled(egui::Rect::from_min_max(full.min, egui::pos2(a_right, bottom)), 0.0, col.sidebar);
-                    p.vline(a_right - 0.5, top..=bottom, egui::Stroke::new(1.0_f32, col.border));
-                }
-                p.vline(b_right - 0.5, top..=bottom, egui::Stroke::new(1.0_f32, col.border));
                 p.hline(full.x_range(), bottom - 0.5, egui::Stroke::new(1.0_f32, col.border));
                 let section = |l: f32, r: f32| egui::Rect::from_min_max(egui::pos2(l, top), egui::pos2(r.max(l), bottom));
-                let centered = |dir: egui::Layout| dir.with_cross_align(egui::Align::Center);
 
-                // Sidebar toggle, just right of the traffic lights.
-                let toggle_x = if self.show_sidebar { a_right - 40.0 } else { self.titlebar_inset + 6.0 };
-                ui.scope_builder(egui::UiBuilder::new().max_rect(section(toggle_x, toggle_x + 32.0)).layout(centered(egui::Layout::left_to_right(egui::Align::Center))), |ui| {
-                    let (fg, bg) = if self.show_sidebar { (col.sidebar_text, col.sidebar) } else { (col.toolbar_text, col.toolbar) };
-                    if icons::bare(ui, Icon::Sidebar, if self.show_sidebar { "Hide sidebar" } else { "Show sidebar" }, fg, bg).clicked() {
+                // Brand: the owl and the name, after the traffic lights.
+                let logo_x = self.titlebar_inset + if self.titlebar_inset > 0.0 { 4.0 } else { 18.0 };
+                let logo = egui::Rect::from_center_size(egui::pos2(logo_x + 15.0, full.center().y), egui::vec2(30.0, 30.0));
+                egui::Image::new(egui::include_image!("../assets/logo-128.png")).corner_radius(8).paint_at(ui, logo);
+                if col.p.dark {
+                    p.rect_stroke(logo, 8.0, egui::Stroke::new(1.0_f32, col.border), egui::StrokeKind::Inside);
+                }
+                let toggle_w = 32.0;
+                let a_right = if self.show_sidebar { self.sidebar_right.max(logo.right() + toggle_w + 16.0) } else { logo.right() + toggle_w + 20.0 };
+                let toggle_x = a_right - toggle_w - 10.0;
+                let name_font = egui::FontId::proportional(19.0);
+                let name_w = p.layout_no_wrap("OwlPost".into(), name_font.clone(), col.heading).size().x;
+                if self.show_sidebar && logo.right() + 10.0 + name_w + 4.0 < toggle_x {
+                    style::bold_line(&p, egui::pos2(logo.right() + 10.0, full.center().y - 11.0), "OwlPost", name_font, col.heading, name_w + 2.0);
+                }
+                ui.scope_builder(egui::UiBuilder::new().max_rect(section(toggle_x, toggle_x + toggle_w)).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                    let fg = style::blend(col.toolbar_text, col.toolbar, 0.7);
+                    if icons::bare(ui, Icon::Sidebar, if self.show_sidebar { "Hide sidebar" } else { "Show sidebar" }, fg, col.toolbar).clicked() {
                         self.show_sidebar = !self.show_sidebar;
                     }
                 });
 
-                // List section: title on the left, list actions on the right.
-                ui.scope_builder(egui::UiBuilder::new().max_rect(section(a_right + 14.0, b_right - 10.0)).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
-                    let filtered = self.filter != ListFilter::All;
-                    let r = icons::group(
-                        ui,
-                        &col,
-                        &[
-                            Item::new(Icon::Check, "Mark all as read").enabled(!self.rows.is_empty()),
-                            Item::new(Icon::Refresh, "Check for new mail").enabled(!self.syncing),
-                            Item::new(Icon::Filter, "Filter").active(filtered),
-                        ],
-                    );
-                    if r[0].clicked() {
-                        self.mark_all_read();
-                    }
-                    if r[1].clicked() {
-                        self.sync_now();
-                    }
-                    self.filter_popup(&r[2], &col);
-                    if self.syncing {
-                        ui.add_space(4.0);
-                        ui.spinner();
-                    }
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        let mut title = self.list_title();
-                        if filtered {
-                            title = format!("{title} · {}", self.filter.label());
-                        }
-                        ui.add(egui::Label::new(RichText::new(title).size(15.0).strong().color(col.toolbar_text)).truncate());
-                    });
-                });
-
-                // Message section.
-                ui.scope_builder(egui::UiBuilder::new().max_rect(section(b_right + 12.0, full.right() - 12.0)).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    if icons::round(ui, &col, Item::new(Icon::Compose, "New message (c)")).clicked() {
+                // Actions, then search on the right.
+                ui.scope_builder(egui::UiBuilder::new().max_rect(section(a_right + 14.0, full.right() - 16.0)).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    if icons::filled(ui, Icon::Pencil, "New message", col.button_emphasis, col.button_emphasis_text).on_hover_text("New message (c)").clicked() {
                         self.compose_new();
                     }
                     let r = icons::group(
@@ -1112,6 +1094,7 @@ impl OwlPostApp {
                                 .active(pinned),
                             Item::new(Icon::Folder, "Move to folder (v)").enabled(open),
                             Item::new(Icon::Tag, if gmail || !open { "Label (l)" } else { "Labels are a Gmail feature — use Move on this account" }).enabled(open && gmail),
+                            Item::new(Icon::Trash, "Move to Trash (#)").enabled(open),
                             Item::new(Icon::More, "More").enabled(open),
                         ],
                     );
@@ -1126,10 +1109,13 @@ impl OwlPostApp {
                         self.folder_popup(&r[3], FolderUse::Move, &target);
                         self.folder_popup(&r[4], FolderUse::Label, &target);
                     }
-                    self.more_popup(&r[5], starred);
+                    if r[5].clicked() {
+                        self.act_move(FolderRole::Trash);
+                    }
+                    self.more_popup(&r[6], starred);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let w = ui.available_width().clamp(120.0, 380.0);
-                        let r = icons::search_field(ui, &col, &mut self.search, w, "Search");
+                        let w = ui.available_width().clamp(140.0, 400.0);
+                        let r = icons::search_field(ui, &col, &mut self.search, w, "Search mail");
                         if self.focus_search {
                             r.request_focus();
                             self.focus_search = false;
@@ -1142,26 +1128,6 @@ impl OwlPostApp {
                     });
                 });
             });
-    }
-
-    fn filter_popup(&mut self, btn: &egui::Response, col: &Colors) {
-        let mut chosen = None;
-        egui::Popup::menu(btn).show(|ui| {
-            ui.set_min_width(190.0);
-            for f in ListFilter::ALL {
-                let mark = if f == self.filter { "✔" } else { " " };
-                if ui.add(egui::Button::new(format!("{mark}  {}", f.label())).frame(false)).clicked() {
-                    chosen = Some(f);
-                }
-            }
-            let _ = col;
-        });
-        if let Some(f) = chosen {
-            self.filter = f;
-            self.selected = None;
-            self.open = None;
-            self.reload();
-        }
     }
 
     /// The folder being viewed, if it belongs to `account` (so a move only
@@ -1336,9 +1302,9 @@ impl OwlPostApp {
         let col = self.colors.clone();
         let panel = egui::SidePanel::left("sidebar")
             .resizable(true)
-            .default_width(220.0)
-            .width_range(170.0..=320.0)
-            .frame(egui::Frame::new().fill(col.sidebar).inner_margin(egui::Margin::symmetric(8, 10)))
+            .default_width(244.0)
+            .width_range(180.0..=320.0)
+            .frame(egui::Frame::new().fill(col.sidebar).inner_margin(egui::Margin { left: 12, right: 12, top: 18, bottom: 10 }))
             .show(ctx, |ui| {
                 // Footer: preferences and sync status.
                 egui::TopBottomPanel::bottom("sidebar_footer")
@@ -1361,31 +1327,45 @@ impl OwlPostApp {
                     }
                     for role in FolderRole::UNIFIED {
                         let label = if role == FolderRole::Inbox && multi { "Unified Inbox" } else { role.label() };
-                        let count = if matches!(role, FolderRole::Inbox | FolderRole::Spam) { self.unified_unread.get(&role).copied().unwrap_or(0) } else { 0 };
+                        let count = match role {
+                            FolderRole::Inbox | FolderRole::Spam => self.unified_unread.get(&role).copied().unwrap_or(0),
+                            // Drafts show how many there are, as Mailspring does.
+                            FolderRole::Drafts => self.unified_drafts,
+                            _ => 0,
+                        };
                         let sel = self.selection == Selection::Unified(role) && self.search.is_empty();
-                        if nav_item(ui, &col, role.icon(), label, count, sel, None) {
+                        if nav_item(ui, &col, role_icon(role), label, count, sel) {
                             self.set_selection(Selection::Unified(role));
                         }
                         if role == FolderRole::Starred {
                             let sel = self.selection == Selection::Snoozed && self.search.is_empty();
-                            if nav_item(ui, &col, "⏰", "Snoozed", self.snoozed_count, sel, Some(col.snooze)) {
+                            if nav_item(ui, &col, Icon::Snooze, "Snoozed", self.snoozed_count, sel) {
                                 self.set_selection(Selection::Snoozed);
                             }
                         }
                     }
-                    ui.add_space(10.0);
+                    ui.add_space(22.0);
                     let accounts = self.accounts.clone();
                     for a in &accounts {
                         let collapsed = self.collapsed_accounts.contains(&a.id);
                         let header = ui.horizontal(|ui| {
-                            let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
-                            ui.painter().circle_filled(dot.center(), 4.0, style::hex(&a.color));
-                            let label = RichText::new(format!("{} {}", if collapsed { "⏵" } else { "⏷" }, a.email.to_uppercase()))
-                                .small()
-                                .strong()
-                                .color(col.sidebar_text);
-                            ui.add(egui::Label::new(label).truncate().sense(Sense::click()))
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.add_space(4.0);
+                            let (chev, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
+                            let c = chev.center();
+                            let sub = col.sidebar_text.gamma_multiply(0.75);
+                            let pts = if collapsed { vec![c + egui::vec2(-1.5, -3.5), c + egui::vec2(2.0, 0.0), c + egui::vec2(-1.5, 3.5)] } else { vec![c + egui::vec2(-3.5, -1.5), c + egui::vec2(0.0, 2.0), c + egui::vec2(3.5, -1.5)] };
+                            ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.4_f32, sub)));
+                            if multi {
+                                let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
+                                ui.painter().circle_filled(dot.center(), 4.0, style::hex(&a.color));
+                            }
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(&a.email.to_uppercase(), 0.0, egui::TextFormat { font_id: egui::FontId::proportional(11.0), color: sub, extra_letter_spacing: 1.1, ..Default::default() });
+                            job.wrap = egui::text::TextWrapping::truncate_at_width(ui.available_width());
+                            ui.add(egui::Label::new(job).sense(Sense::click()))
                         });
+                        ui.add_space(6.0);
                         if !a.demo {
                             header.inner.context_menu(|ui| {
                                 if ui.button("⟳ Sync now").clicked() {
@@ -1407,11 +1387,13 @@ impl OwlPostApp {
                             continue;
                         }
                         let folders = self.folders.get(&a.id).cloned().unwrap_or_default();
-                        for f in folders.iter().filter(|f| f.role != FolderRole::Other) {
+                        // With one account the list above already is that
+                        // account's Inbox, Sent and so on.
+                        for f in folders.iter().filter(|f| f.role != FolderRole::Other && (multi || !FolderRole::UNIFIED.contains(&f.role))) {
                             let count = if matches!(f.role, FolderRole::Inbox | FolderRole::Spam | FolderRole::Other) { f.unread } else { 0 };
                             let sel = self.selection == Selection::Folder(f.id) && self.search.is_empty();
                             let label = if f.role == FolderRole::All { "All Mail".to_string() } else { f.role.label().to_string() };
-                            if nav_item(ui, &col, f.role.icon(), &label, count, sel, None) {
+                            if nav_item(ui, &col, role_icon(f.role), &label, count, sel) {
                                 self.set_selection(Selection::Folder(f.id));
                             }
                         }
@@ -1419,8 +1401,8 @@ impl OwlPostApp {
                             let depth = f.path.matches(['/', '.']).count();
                             let sel = self.selection == Selection::Folder(f.id) && self.search.is_empty();
                             ui.horizontal(|ui| {
-                                ui.add_space(depth as f32 * 10.0);
-                                if nav_item(ui, &col, "📁", &f.name, f.unread, sel, None) {
+                                ui.add_space(depth as f32 * 14.0);
+                                if nav_item(ui, &col, Icon::Folder, &f.name, f.unread, sel) {
                                     self.set_selection(Selection::Folder(f.id));
                                 }
                             });
@@ -1458,6 +1440,76 @@ impl OwlPostApp {
         }
     }
 
+    /// Unread conversations in what the list shows, for the header.
+    fn list_unread(&self) -> i64 {
+        if !self.search.trim().is_empty() || self.filter != ListFilter::All {
+            return self.rows.iter().filter(|r| r.t.unread).count() as i64;
+        }
+        match &self.selection {
+            Selection::Unified(r) => self.unified_unread.get(r).copied().unwrap_or(0),
+            Selection::Folder(id) => self.folders.values().flatten().find(|f| f.id == *id).map(|f| f.unread).unwrap_or(0),
+            Selection::Snoozed => self.rows.iter().filter(|r| r.t.unread).count() as i64,
+        }
+    }
+
+    /// Above the list: the folder's name, today's date and unread count,
+    /// list actions, and the filter chips.
+    fn list_header(&mut self, ui: &mut egui::Ui, col: &Colors) {
+        let mut chosen = None;
+        egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 14, top: 20, bottom: 12 }).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let fg = col.subtle;
+                    let refresh = ui.add_enabled_ui(!self.syncing, |ui| icons::bare(ui, Icon::Refresh, "Check for new mail", fg, col.list)).inner;
+                    if refresh.clicked() {
+                        self.sync_now();
+                    }
+                    let unread = self.rows.iter().any(|r| r.t.unread);
+                    if ui.add_enabled_ui(unread, |ui| icons::bare(ui, Icon::Check, "Mark all as read", fg, col.list)).inner.clicked() {
+                        self.mark_all_read();
+                    }
+                    if self.syncing {
+                        ui.add_space(4.0);
+                        ui.spinner();
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), Sense::hover());
+                        style::bold_line(ui.painter(), r.left_top() + egui::vec2(0.0, 1.0), &self.list_title(), egui::FontId::proportional(32.0), col.heading, r.width());
+                    });
+                });
+            });
+            let mut sub = chrono::Local::now().format("%A %-d %B").to_string();
+            let unread = self.list_unread();
+            if unread > 0 {
+                sub.push_str(&format!(" · {unread} unread"));
+            }
+            ui.label(RichText::new(sub).size(13.0).color(col.subtle));
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                for f in ListFilter::ALL {
+                    // "With attachments" is a paperclip, so the chips fit on one line.
+                    let r = if f == ListFilter::Attachments {
+                        filter_chip(ui, col, "", f == self.filter).on_hover_text("With attachments")
+                    } else {
+                        filter_chip(ui, col, f.label(), f == self.filter)
+                    };
+                    if r.clicked() && f != self.filter {
+                        chosen = Some(f);
+                    }
+                }
+            });
+        });
+        if let Some(f) = chosen {
+            self.filter = f;
+            self.selected = None;
+            self.open = None;
+            self.reload();
+        }
+    }
+
     fn thread_list(&mut self, ctx: &egui::Context) {
         let col = self.colors.clone();
         // Two-finger trackpad swipes arrive as horizontal wheel deltas.
@@ -1488,6 +1540,7 @@ impl OwlPostApp {
             .width_range(300.0..=640.0)
             .frame(egui::Frame::new().fill(col.list).stroke(egui::Stroke::new(1.0_f32, col.border)))
             .show(ctx, |ui| {
+                self.list_header(ui, &col);
                 if self.rows.is_empty() {
                     self.swipe = None;
                     ui.add_space(60.0);
@@ -1558,6 +1611,7 @@ impl OwlPostApp {
                 let grouped = self.selection != Selection::Snoozed;
                 let layout = list_layout(&self.rows, grouped, self.hidden_pinned, Utc::now());
                 let total = layout.last().map(|(y, h, _)| y + h).unwrap_or(0.0) + 12.0;
+                self.list_top = ui.cursor().top();
                 egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_source(egui::scroll_area::ScrollSource { mouse_wheel: !swiping, ..egui::scroll_area::ScrollSource::ALL }).show_viewport(ui, |ui, viewport| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     let width = ui.available_width();
@@ -1638,18 +1692,22 @@ impl OwlPostApp {
 
                         let selected = self.selected == Some(i);
                         let hovered = resp.contains_pointer() && !swiping;
-                        let (bg, fg, sub) = if selected {
+                        // A soft highlight (Moonlit) keeps the normal text colours;
+                        // a strong one (most Mailspring themes) inverts them.
+                        let soft = selected && col.p.list_focused.over(col.p.list).contrast(col.p.list) < 1.6;
+                        let (bg, fg, sub) = if selected && !soft {
                             (col.list_focused, col.list_focused_text, col.list_focused_text.gamma_multiply(0.8))
+                        } else if selected {
+                            (col.list_focused, col.list_focused_text, col.subtle)
                         } else if hovered {
                             (col.list_hover, col.text, col.subtle)
                         } else {
                             (col.list, col.text, col.subtle)
                         };
-                        // Canary-style: no dividers, a rounded highlight inset from the edges.
-                        p.rect_filled(rect_c, 0.0, col.list);
-                        if bg != col.list {
-                            p.rect_filled(rect_c.shrink2(egui::vec2(8.0, 2.0)), 9.0, bg);
-                        }
+                        let selected = selected && !soft;
+                        // Full-width rows with a hairline between them.
+                        p.rect_filled(rect_c, 0.0, bg);
+                        p.hline(rect_c.x_range(), rect_c.bottom() - 0.5, egui::Stroke::new(1.0_f32, col.list_border));
                         let rect = rect_c;
                         let top = rect.top();
                         let latest = t.participants.last().cloned().unwrap_or_default();
@@ -1745,10 +1803,9 @@ impl OwlPostApp {
                             let w = seg * items.len() as f32 + 6.0;
                             let qr = egui::Rect::from_min_size(egui::pos2(rect.right() - 20.0 - w, rect.center().y - h / 2.0), egui::vec2(w, h));
                             // Cover the right-hand end of the row, fading in from the left.
-                            // Stay inside the row's rounded highlight.
-                            let hl = rect.shrink2(egui::vec2(8.0, 2.0));
+                            let hl = egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.bottom() - 1.0));
                             let cover = egui::Rect::from_min_max(egui::pos2(qr.left() - 8.0, hl.top()), hl.right_bottom());
-                            p.rect_filled(cover, egui::CornerRadius { nw: 0, sw: 0, ne: 9, se: 9 }, bg);
+                            p.rect_filled(cover, 0.0, bg);
                             let fade = egui::Rect::from_min_max(egui::pos2(cover.left() - 28.0, cover.top()), egui::pos2(cover.left(), cover.bottom()));
                             let mut mesh = egui::Mesh::default();
                             let clear = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 0);
@@ -1861,10 +1918,10 @@ impl OwlPostApp {
 
     fn reader(&mut self, ctx: &egui::Context) {
         let col = self.colors.clone();
-        // Mailspring paints the message area with @background-secondary and
-        // the messages as cards on top of it.
+        // The conversation reads like a page: messages sit straight on the
+        // background, separated by rules.
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(col.bg_secondary))
+            .frame(egui::Frame::new().fill(col.bg))
             .show(ctx, |ui| {
                 let Some(open) = &self.open else {
                     ui.centered_and_justified(|ui| {
@@ -1878,6 +1935,16 @@ impl OwlPostApp {
                     return;
                 };
                 let subject = open.messages.first().map(|m| style::drawable(&m.subject).into_owned()).unwrap_or_default();
+                // "OLLAMA · SAT 7 NOV, 12:53 PM": who wrote last, and when.
+                let kicker = open
+                    .messages
+                    .last()
+                    .map(|m| {
+                        let who = if m.from.name.is_empty() { m.from.email.clone() } else { m.from.name.clone() };
+                        let when = m.date.with_timezone(&chrono::Local).format("%a %-d %b, %-I:%M %p");
+                        format!("{} · {}", style::drawable(&who), when).to_uppercase()
+                    })
+                    .unwrap_or_default();
                 let snoozed = open.snoozed_until;
                 let pinned = self.store.is_pinned(open.account_id, &open.thread_key).unwrap_or(false);
                 let in_folders = self.store.thread_folder_ids(open.account_id, &open.thread_key).unwrap_or_default();
@@ -1890,7 +1957,8 @@ impl OwlPostApp {
                 let mut remove_label: Option<Folder> = None;
                 let mut attachment_req: Option<(Message, usize, AttachmentClick)> = None;
                 let downloading = self.downloading.clone();
-                let account = self.accounts.iter().find(|a| a.id == open.account_id).cloned();
+                // The account only needs naming when there's more than one.
+                let account = self.accounts.iter().find(|a| a.id == open.account_id).filter(|_| self.accounts.len() > 1).cloned();
 
                 // HTML email: the subject stays here and the web view shows
                 // the conversation below it.
@@ -1898,12 +1966,18 @@ impl OwlPostApp {
                 let Some(open) = &mut self.open else { return };
                 let mut draw = |ui: &mut egui::Ui| {
                     // Generous space around the conversation, like Canary.
-                    let margin = egui::Margin { left: 36, right: 36, top: 22, bottom: if web { 10 } else { 36 } };
+                    let margin = egui::Margin { left: 48, right: 48, top: 34, bottom: if web { 4 } else { 36 } };
                     egui::Frame::new().inner_margin(margin).show(ui, |ui| {
                         let max_w = ui.available_width().min(860.0);
                         ui.set_max_width(max_w);
-                        ui.label(RichText::new(&subject).size(21.0).strong().color(col.heading));
-                        ui.horizontal(|ui| {
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(&kicker, 0.0, egui::TextFormat { font_id: egui::FontId::proportional(12.0), color: col.link, extra_letter_spacing: 1.4, ..Default::default() });
+                        job.wrap = egui::text::TextWrapping::truncate_at_width(max_w);
+                        ui.label(job);
+                        ui.add_space(6.0);
+                        heavy_text(ui, &subject, 30.0, col.heading);
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
                             if let Some(a) = &account {
                                 chip(ui, &a.email, style::hex(&a.color));
                             }
@@ -1924,7 +1998,7 @@ impl OwlPostApp {
                         if web {
                             return;
                         }
-                        ui.add_space(20.0);
+                        ui.add_space(16.0);
                         let n = open.messages.len();
                         for (i, m) in open.messages.iter().enumerate() {
                             let expanded = open.expanded.get(i).copied().unwrap_or(true);
@@ -1945,7 +2019,7 @@ impl OwlPostApp {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             for (i, (icon, label)) in [(Icon::Reply, "Reply"), (Icon::ReplyAll, "Reply all"), (Icon::Forward, "Forward")].into_iter().enumerate() {
-                                if icons::labeled(ui, icon, label, col.text, col.bg_secondary).clicked() {
+                                if icons::labeled(ui, icon, label, col.text, col.bg).clicked() {
                                     ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("reply_click"), i as u8));
                                 }
                             }
@@ -2018,16 +2092,16 @@ impl OwlPostApp {
             view.hide();
             return;
         }
+        let col = &self.colors;
         let key = (open.account_id, open.thread_key.clone());
         let remote = self.load_images || self.remote_images.contains(&key);
         let page_key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             let faces: Vec<bool> = open.messages.iter().map(|m| self.faces.texture(&m.from.email).is_some()).collect();
-            (&key, remote, &self.theme_id, open.messages.iter().map(|m| (m.id, m.starred, m.attachments.len())).collect::<Vec<_>>(), faces).hash(&mut h);
+            (&key, remote, &self.theme_id, col.p.dark, open.messages.iter().map(|m| (m.id, m.starred, m.attachments.len())).collect::<Vec<_>>(), faces).hash(&mut h);
             h.finish()
         };
-        let col = &self.colors;
         let faces = &self.faces;
         view.show(rect, ctx.zoom_factor(), page_key, || {
             let nonce = format!("{:x}", page_key ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7));
@@ -2360,6 +2434,41 @@ pub fn install_image_loaders(ctx: &egui::Context) {
 /// A section heading in the message list ("Pinned", "Today"…). For Pinned,
 /// `pinned` is how many are hidden, and a Hide / Show button folds the
 /// section. Returns true when that button is clicked.
+/// Wrapped text drawn twice, half a point apart, for a heavier weight
+/// (egui's bundled font has no bold).
+fn heavy_text(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32) {
+    let w = ui.available_width();
+    let mut job = egui::text::LayoutJob::single_section(text.to_string(), egui::TextFormat::simple(egui::FontId::proportional(size), color));
+    job.wrap.max_width = w - 1.0;
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, galley.size().y), Sense::hover());
+    ui.painter().galley(rect.min + egui::vec2(0.6, 0.0), galley.clone(), color);
+    ui.painter().galley(rect.min, galley, color);
+}
+
+/// A rounded filter chip; the chosen one is filled with the accent.
+fn filter_chip(ui: &mut egui::Ui, col: &Colors, label: &str, on: bool) -> egui::Response {
+    let font = egui::FontId::proportional(13.5);
+    let fg = if on { col.button_emphasis_text } else { col.text };
+    let g = ui.painter().layout_no_wrap(label.to_string(), font, fg);
+    // No label means the paperclip.
+    let w = if label.is_empty() { 40.0 } else { g.size().x + 26.0 };
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(w, 30.0), Sense::click());
+    let p = ui.painter();
+    if on {
+        p.rect_filled(rect, 15.0, col.button_emphasis);
+        p.galley(rect.center() - g.size() / 2.0 + egui::vec2(0.5, 0.0), g.clone(), fg);
+    } else {
+        let fill = if r.hovered() { col.list_hover } else { style::blend(col.bg, col.list, 0.6) };
+        p.rect(rect, 15.0, fill, egui::Stroke::new(1.0_f32, col.border), egui::StrokeKind::Inside);
+    }
+    if label.is_empty() {
+        icons::paint(p, rect.center(), 15.0, Icon::Paperclip, fg);
+    }
+    p.galley(rect.center() - g.size() / 2.0, g, fg);
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn section_header(ui: &mut egui::Ui, col: &Colors, rect: egui::Rect, title: &str, pinned: Option<usize>) -> bool {
     let p = ui.painter_at(rect);
     let y = rect.bottom() - 9.0;
@@ -2440,10 +2549,24 @@ fn participants_parts(ps: &[Contact], me: Option<&Account>) -> (String, String, 
     (name(first), rest, is_me(first))
 }
 
+/// Whether the system asks for dark mode (light when it doesn't say).
+fn system_dark(ctx: &egui::Context) -> bool {
+    ctx.system_theme() == Some(egui::Theme::Dark)
+}
+
+/// The palette for theme `id`; "Moonlit" picks its light or dark variant.
+fn theme_palette(themes: &[Theme], id: &str, dark: bool) -> owlpost_core::theme::Palette {
+    let id = if id == theme::MOONLIT { if dark { theme::MOONLIT_DARK } else { theme::MOONLIT_LIGHT } } else { id };
+    themes.iter().find(|t| t.id == id).unwrap_or(&themes[0]).palette()
+}
+
+/// A small letter-spaced heading in the sidebar ("ALL ACCOUNTS").
 fn section(ui: &mut egui::Ui, col: &Colors, text: &str) {
-    ui.add_space(2.0);
-    ui.label(RichText::new(text).small().strong().color(col.sidebar_text));
-    ui.add_space(2.0);
+    let mut job = egui::text::LayoutJob::default();
+    let sub = col.sidebar_text.gamma_multiply(0.75);
+    job.append(text, 4.0, egui::TextFormat { font_id: egui::FontId::proportional(11.0), color: sub, extra_letter_spacing: 1.1, ..Default::default() });
+    ui.label(job);
+    ui.add_space(4.0);
 }
 
 fn chip(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
@@ -2479,39 +2602,52 @@ fn folder_label(f: &Folder) -> String {
     }
 }
 
-fn nav_item(ui: &mut egui::Ui, col: &Colors, icon: &str, label: &str, count: i64, selected: bool, accent: Option<egui::Color32>) -> bool {
-    let h = 28.0;
+/// The sidebar's line icon for a folder role.
+fn role_icon(role: FolderRole) -> Icon {
+    match role {
+        FolderRole::Inbox => Icon::Inbox,
+        FolderRole::Starred => Icon::Star,
+        FolderRole::Drafts => Icon::Pencil,
+        FolderRole::Sent => Icon::Send,
+        FolderRole::Archive | FolderRole::All => Icon::Archive,
+        FolderRole::Spam => Icon::Warning,
+        FolderRole::Trash => Icon::Trash,
+        FolderRole::Other => Icon::Folder,
+    }
+}
+
+/// A sidebar row: line icon, name, and a quiet count on the right.
+fn nav_item(ui: &mut egui::Ui, col: &Colors, icon: Icon, label: &str, count: i64, selected: bool) -> bool {
+    let h = 31.0;
     let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
     let p = ui.painter_at(rect);
     if selected {
-        p.rect_filled(rect, 6.0, col.sidebar_active);
+        p.rect_filled(rect, 8.0, col.sidebar_active);
     } else if r.hovered() {
-        p.rect_filled(rect, 6.0, col.sidebar_active.gamma_multiply(0.5));
+        p.rect_filled(rect, 8.0, style::blend(col.sidebar_active, col.sidebar, 0.5));
     }
     let fg = if selected { col.sidebar_active_text } else { col.sidebar_text };
-    p.text(
-        egui::pos2(rect.left() + 18.0, rect.center().y),
-        egui::Align2::CENTER_CENTER,
-        icon,
-        egui::FontId::proportional(14.0),
-        accent.unwrap_or(fg),
-    );
-    let mut badge_w = 0.0;
+    icons::paint(&p, egui::pos2(rect.left() + 19.0, rect.center().y), 14.5, icon, fg);
+    let mut count_w = 0.0;
     if count > 0 {
-        let g = p.layout_no_wrap(count.to_string(), egui::FontId::proportional(11.0), col.inverse);
-        badge_w = g.size().x + 12.0;
-        let br = egui::Rect::from_center_size(egui::pos2(rect.right() - 6.0 - badge_w / 2.0, rect.center().y), egui::vec2(badge_w, 17.0));
-        p.rect_filled(br, 8.5, accent.unwrap_or(col.accent));
-        p.galley(br.center() - g.size() / 2.0, g, col.inverse);
+        let sub = if selected { fg } else { style::blend(col.sidebar_text, col.sidebar, 0.7) };
+        let g = p.layout_no_wrap(count.to_string(), egui::FontId::proportional(12.0), sub);
+        count_w = g.size().x + 8.0;
+        let pos = egui::pos2(rect.right() - 12.0 - g.size().x, rect.center().y - g.size().y / 2.0);
+        if selected {
+            // Drawn twice for weight, like the label.
+            p.galley(pos + egui::vec2(0.5, 0.0), g.clone(), sub);
+        }
+        p.galley(pos, g, sub);
     }
-    style::line(
-        &p,
-        egui::pos2(rect.left() + 34.0, rect.center().y - 8.5),
-        label,
-        egui::FontId::proportional(13.5),
-        fg,
-        rect.width() - 44.0 - badge_w,
-    );
+    let pos = egui::pos2(rect.left() + 38.0, rect.center().y - 8.5);
+    let font = egui::FontId::proportional(14.0);
+    let max = rect.width() - 50.0 - count_w;
+    if selected {
+        style::bold_line(&p, pos, label, font, fg, max);
+    } else {
+        style::line(&p, pos, label, font, fg, max);
+    }
     r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
@@ -2537,12 +2673,10 @@ fn message_card(
 ) -> (bool, Option<(usize, AttachmentClick)>) {
     let mut toggled = false;
     let mut clicked = None;
+    // Flat, on the page: a rule above each message instead of a card.
+    hairline(ui, col);
     egui::Frame::new()
-        .fill(col.bg)
-        .stroke(egui::Stroke::new(1.0_f32, style::blend(col.border, col.bg, 0.6)))
-        .corner_radius(10)
-        .inner_margin(egui::Margin { left: 26, right: 26, top: 20, bottom: 24 })
-        .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: egui::Color32::from_black_alpha(14) })
+        .inner_margin(egui::Margin { left: 0, right: 0, top: 18, bottom: 8 })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let header = ui.horizontal(|ui| {
@@ -2722,7 +2856,7 @@ impl eframe::App for OwlPostApp {
         // The web view hangs off the native window, so it's made here.
         if !self.mail_view_tried {
             self.mail_view_tried = true;
-            self.mail_view = crate::mail_view::MailView::new(frame, self.colors.bg_secondary);
+            self.mail_view = crate::mail_view::MailView::new(frame, self.colors.bg);
         }
         self.frame(ctx);
     }
@@ -2748,6 +2882,7 @@ impl eframe::App for OwlPostApp {
 
 impl OwlPostApp {
     pub fn frame(&mut self, ctx: &egui::Context) {
+        self.follow_system_theme(ctx);
         self.handle_events();
         self.web_rect = None;
         self.mail_view_events(ctx);
@@ -2840,7 +2975,7 @@ mod ui_tests {
 
     #[test]
     fn renders_every_builtin_theme_and_snoozes() {
-        for theme in ["owlpost-light", "owlpost-dark", "owlpost-darkside"] {
+        for theme in ["owlpost-light", "owlpost-dark", "owlpost-darkside", theme::MOONLIT_LIGHT, theme::MOONLIT_DARK] {
             let mut h = harness(theme);
             let c = h.state().colors.clone();
         c.apply(&h.ctx);
@@ -2902,7 +3037,7 @@ mod ui_tests {
         let s = h.state();
         let layout = list_layout(&s.rows, s.selection != Selection::Snoozed, s.hidden_pinned, Utc::now());
         let y = layout.iter().find(|(_, _, it)| *it == ListItem::Row(i)).map(|(y, _, _)| *y).unwrap();
-        egui::pos2((s.sidebar_right + s.list_right) / 2.0, 52.0 + y + ROW_H / 2.0)
+        egui::pos2((s.sidebar_right + s.list_right) / 2.0, s.list_top + y + ROW_H / 2.0)
     }
 
     #[test]
@@ -3363,7 +3498,7 @@ mod ui_tests {
         save(&mut h, "list-pinned");
         // Click "Hide" in the Pinned header.
         let s = h.state();
-        let at = egui::pos2(s.list_right - 30.0, 52.0 + LIST_TOP + HEADER_H - 14.0);
+        let at = egui::pos2(s.list_right - 30.0, s.list_top + LIST_TOP + HEADER_H - 14.0);
         h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
         h.run_steps(1);
         h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });

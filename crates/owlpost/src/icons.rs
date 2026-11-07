@@ -8,8 +8,6 @@ use eframe::egui::{self, pos2, vec2, Color32, Pos2, Rect, Response, Sense, Shape
 pub enum Icon {
     Check,
     Refresh,
-    Filter,
-    Compose,
     Reply,
     ReplyAll,
     Forward,
@@ -26,6 +24,12 @@ pub enum Icon {
     Folder,
     Tag,
     Paperclip,
+    Inbox,
+    Star,
+    Pencil,
+    Send,
+    Archive,
+    Warning,
 }
 
 fn quad(a: Pos2, c: Pos2, b: Pos2, n: usize) -> impl Iterator<Item = Pos2> {
@@ -83,17 +87,6 @@ pub fn paint(p: &egui::Painter, center: Pos2, size: f32, icon: Icon, color: Colo
                 vec2(v.x * c - v.y * s, v.x * s + v.y * c)
             };
             line(vec![tip + rot(back, 40.0), tip, tip + rot(back, -40.0)]);
-        }
-        Icon::Filter => {
-            ring(0.85);
-            line(vec![pt(-0.45, -0.32), pt(0.45, -0.32)]);
-            line(vec![pt(-0.28, 0.02), pt(0.28, 0.02)]);
-            line(vec![pt(-0.1, 0.36), pt(0.1, 0.36)]);
-        }
-        Icon::Compose => {
-            line(vec![pt(0.05, -0.75), pt(-0.75, -0.75), pt(-0.75, 0.75), pt(0.75, 0.75), pt(0.75, -0.05)]);
-            line(vec![pt(-0.22, 0.22), pt(0.72, -0.72)]);
-            line(vec![pt(-0.22, 0.22), pt(-0.32, 0.32)]);
         }
         Icon::Reply | Icon::Forward | Icon::ReplyAll => {
             let flip = if icon == Icon::Forward { -1.0 } else { 1.0 };
@@ -163,6 +156,38 @@ pub fn paint(p: &egui::Painter, center: Pos2, size: f32, icon: Icon, color: Colo
             pts.push((0.4, -0.6));
             line(pts.into_iter().map(rot).collect());
         }
+        Icon::Inbox => {
+            p.rect_stroke(Rect::from_min_max(pt(-0.85, -0.72), pt(0.85, 0.72)), 2.5, st, StrokeKind::Middle);
+            line(vec![pt(-0.85, 0.12), pt(-0.32, 0.12), pt(-0.2, 0.38), pt(0.2, 0.38), pt(0.32, 0.12), pt(0.85, 0.12)]);
+        }
+        Icon::Star => {
+            let pts = (0..10)
+                .map(|i| {
+                    let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+                    let r = if i % 2 == 0 { 0.92 } else { 0.4 };
+                    pt(r * a.cos(), r * a.sin() + 0.08)
+                })
+                .collect();
+            p.add(Shape::closed_line(pts, st));
+        }
+        Icon::Pencil => {
+            p.add(Shape::closed_line(vec![pt(-0.8, 0.8), pt(-0.72, 0.38), pt(0.42, -0.76), pt(0.76, -0.42), pt(-0.38, 0.72)], st));
+            line(vec![pt(0.18, -0.52), pt(0.52, -0.18)]);
+        }
+        Icon::Send => {
+            p.add(Shape::closed_line(vec![pt(-0.88, -0.06), pt(0.86, -0.82), pt(0.16, 0.86), pt(-0.06, 0.12)], st));
+            line(vec![pt(-0.06, 0.12), pt(0.86, -0.82)]);
+        }
+        Icon::Archive => {
+            p.rect_stroke(Rect::from_min_max(pt(-0.88, -0.78), pt(0.88, -0.36)), 1.5, st, StrokeKind::Middle);
+            line(vec![pt(-0.72, -0.36), pt(-0.72, 0.78), pt(0.72, 0.78), pt(0.72, -0.36)]);
+            line(vec![pt(-0.24, 0.02), pt(0.24, 0.02)]);
+        }
+        Icon::Warning => {
+            p.add(Shape::closed_line(vec![pt(0.0, -0.82), pt(0.92, 0.76), pt(-0.92, 0.76)], st));
+            line(vec![pt(0.0, -0.24), pt(0.0, 0.2)]);
+            p.circle_filled(pt(0.0, 0.47), w * 0.75, color);
+        }
         Icon::Gear => {
             ring(0.28);
             ring(0.62);
@@ -199,7 +224,6 @@ impl Item {
 
 pub const HEIGHT: f32 = 32.0;
 const SEG: f32 = 32.0;
-const PAD: f32 = 3.0;
 
 
 /// The colours a capsule is drawn with: foreground, the surface it sits on,
@@ -263,16 +287,6 @@ pub fn group_with(ui: &mut egui::Ui, tone: Tone, items: &[Item], seg: f32, heigh
         .collect()
 }
 
-/// A single circular icon button with the same chrome as [`group`].
-pub fn round(ui: &mut egui::Ui, col: &Colors, it: Item) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(HEIGHT, HEIGHT), if it.enabled { Sense::click() } else { Sense::hover() });
-    let tone = Tone::toolbar(col);
-    let (fill, stroke) = tone.chrome();
-    ui.painter().circle(rect.center(), HEIGHT / 2.0 - 0.5, fill, Stroke::new(1.0_f32, stroke));
-    paint_button(ui, tone, rect.shrink(PAD), &resp, &it, 17.0);
-    resp.on_hover_text(it.tip)
-}
-
 /// A borderless icon button (used on the sidebar edge).
 pub fn bare(ui: &mut egui::Ui, icon: Icon, tip: &'static str, fg: Color32, bg: Color32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
@@ -295,6 +309,23 @@ pub fn labeled(ui: &mut egui::Ui, icon: Icon, label: &str, fg: Color32, bg: Colo
     paint(p, pos2(rect.left() + 21.0, rect.center().y), 15.0, icon, fg);
     p.galley(pos2(rect.left() + 36.0, rect.center().y - galley.size().y / 2.0), galley, fg);
     resp
+}
+
+/// A filled capsule with an icon and a label: the toolbar's main action.
+pub fn filled(ui: &mut egui::Ui, icon: Icon, label: &str, fill: Color32, fg: Color32) -> Response {
+    let font = egui::FontId::proportional(14.0);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, fg);
+    let size = vec2(galley.size().x + 52.0, HEIGHT);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let bg = ui.visuals().panel_fill;
+    let fill = if resp.is_pointer_button_down_on() { blend(fill, bg, 0.8) } else if resp.hovered() { blend(fill, bg, 0.9) } else { fill };
+    let p = ui.painter();
+    p.rect_filled(rect, HEIGHT / 2.0, fill);
+    paint(p, pos2(rect.left() + 22.0, rect.center().y), 14.0, icon, fg);
+    // Drawn twice, half a point apart, for weight (egui's font has no bold).
+    p.galley(pos2(rect.left() + 37.5, rect.center().y - galley.size().y / 2.0), galley.clone(), fg);
+    p.galley(pos2(rect.left() + 38.0, rect.center().y - galley.size().y / 2.0), galley, fg);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// A capsule-shaped search box with a magnifier.

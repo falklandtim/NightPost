@@ -692,6 +692,14 @@ impl Palette {
 const LIGHT_LESS: &str = include_str!("../themes/owlpost-light/styles/ui-variables.less");
 const DARK_LESS: &str = include_str!("../themes/owlpost-dark/styles/ui-variables.less");
 const DARKSIDE_LESS: &str = include_str!("../themes/owlpost-darkside/styles/ui-variables.less");
+const MOONLIT_DARK_LESS: &str = include_str!("../themes/owlpost-moonlit-dark/styles/ui-variables.less");
+const MOONLIT_LIGHT_LESS: &str = include_str!("../themes/owlpost-moonlit-light/styles/ui-variables.less");
+
+/// The theme that follows the system appearance, switching between
+/// [`MOONLIT_DARK`] and [`MOONLIT_LIGHT`]. On its own it resolves as light.
+pub const MOONLIT: &str = "owlpost-moonlit";
+pub const MOONLIT_DARK: &str = "owlpost-moonlit-dark";
+pub const MOONLIT_LIGHT: &str = "owlpost-moonlit-light";
 
 pub fn base_variables() -> Variables {
     let mut v = Variables::default();
@@ -833,6 +841,9 @@ pub fn mailspring_packages_dir() -> Option<PathBuf> {
 /// Every theme available: built-ins, OwlPost themes, Mailspring themes.
 pub fn discover() -> Vec<Theme> {
     let mut themes = vec![
+        Theme::builtin(MOONLIT, "Moonlit", "Light or dark, following your system", MOONLIT_LIGHT_LESS),
+        Theme::builtin(MOONLIT_LIGHT, "Moonlit Light", "Cool off-white with a navy accent", MOONLIT_LIGHT_LESS),
+        Theme::builtin(MOONLIT_DARK, "Moonlit Dark", "Deep navy with a soft periwinkle accent", MOONLIT_DARK_LESS),
         Theme::builtin("owlpost-light", "Light", "The default OwlPost theme", ""),
         Theme::builtin("owlpost-dark", "Dark", "Easy on the eyes at night", DARK_LESS),
         Theme::builtin("owlpost-darkside", "Darkside", "Light messages, dark sidebar", DARKSIDE_LESS),
@@ -968,6 +979,12 @@ mod tests {
         }
         let dark = discover().into_iter().find(|t| t.id == "owlpost-dark").unwrap();
         assert!(dark.palette().dark);
+        let moon = |id: &str| discover().into_iter().find(|t| t.id == id).unwrap().palette();
+        assert!(moon(MOONLIT_DARK).dark && !moon(MOONLIT_LIGHT).dark && !moon(MOONLIT).dark);
+        // The mockup's colours survive the contrast fixes.
+        assert!(close(moon(MOONLIT_DARK).list_focused, "#1a2645"));
+        assert!(close(moon(MOONLIT_LIGHT).list_focused, "#dde4f9"));
+        assert!(close(moon(MOONLIT_DARK).sidebar_active_text, "#b8c7ff"));
     }
 
     #[test]

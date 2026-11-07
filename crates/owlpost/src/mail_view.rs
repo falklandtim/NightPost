@@ -348,15 +348,15 @@ pub fn document(page: &Page, col: &Colors) -> String {
 <meta http-equiv="Content-Security-Policy" content="{policy}">
 <style>
 :root {{ color-scheme: {scheme}; }}
-html, body {{ margin: 0; background: {bg2}; color: {text}; font: 14px/1.5 -apple-system, system-ui, sans-serif; }}
-body {{ padding: 6px 36px 36px; }}
+html, body {{ margin: 0; background: {bg}; color: {text}; font: 14px/1.5 -apple-system, system-ui, sans-serif; }}
+body {{ padding: 2px 48px 40px; max-width: 860px; }}
 a {{ color: {link}; }}
-.banner {{ background: {bg}; border: 1px solid {border}; border-radius: 8px; padding: 9px 14px; margin-bottom: 14px; color: {subtle}; font-size: 13px; }}
+.banner {{ background: {bg2}; border: 1px solid {border}; border-radius: 8px; padding: 9px 14px; margin-bottom: 14px; color: {subtle}; font-size: 13px; }}
 .banner.quiet {{ padding: 6px 14px; font-size: 12px; }}
 .shield::before {{ content: ""; display: inline-block; width: 11px; height: 13px; margin-right: 6px; vertical-align: -2px; background: currentColor; opacity: .7;
   -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 11 13'%3E%3Cpath d='M5.5 0 11 2v4.2C11 9.5 8.7 12 5.5 13 2.3 12 0 9.5 0 6.2V2z'/%3E%3C/svg%3E") no-repeat center / contain; }}
-.card {{ background: {bg}; border: 1px solid {border}; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,.055); margin-bottom: 16px; }}
-.card > summary {{ list-style: none; display: flex; gap: 12px; align-items: flex-start; padding: 20px 26px 0; cursor: default; }}
+.card {{ border-top: 1px solid {hair}; margin-bottom: 8px; }}
+.card > summary {{ list-style: none; display: flex; gap: 12px; align-items: flex-start; padding: 18px 0 0; cursor: default; }}
 .card:not([open]) > summary {{ padding-bottom: 18px; }}
 .card > summary::-webkit-details-marker {{ display: none; }}
 .avatar {{ flex: none; width: 36px; height: 36px; border-radius: 50%; color: #fff; display: grid; place-items: center; font-weight: 600; font-size: 15px; }}
@@ -372,7 +372,7 @@ a {{ color: {link}; }}
 .snippet {{ display: none; color: {subtle}; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 .card:not([open]) .snippet {{ display: block; }}
 .card:not([open]) .to {{ display: none; }}
-.content {{ padding: 0 26px 24px; }}
+.content {{ padding: 0 0 24px; }}
 hr {{ border: 0; border-top: 1px solid {hair}; margin: 12px 0; }}
 .content > hr:last-of-type {{ margin-bottom: 20px; }}
 .attachments {{ display: flex; flex-wrap: wrap; gap: 8px; }}

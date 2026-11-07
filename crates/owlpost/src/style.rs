@@ -25,7 +25,6 @@ pub struct Colors {
     pub text: Color32,
     pub subtle: Color32,
     pub very_subtle: Color32,
-    pub inverse: Color32,
     pub heading: Color32,
     pub link: Color32,
     pub border: Color32,
@@ -35,7 +34,6 @@ pub struct Colors {
     pub sidebar_active: Color32,
     pub sidebar_active_text: Color32,
     pub list: Color32,
-    #[allow(dead_code)] // kept for themes; the Canary-style list has no dividers
     pub list_border: Color32,
     pub list_hover: Color32,
     pub list_selected: Color32,
@@ -64,7 +62,6 @@ impl Colors {
             text: c(p.text),
             subtle: c(p.text_subtle),
             very_subtle: c(p.text_very_subtle),
-            inverse: c(p.text_inverse),
             heading: c(p.heading),
             link: c(p.link),
             border: c(p.border),
