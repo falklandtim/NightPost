@@ -30,7 +30,25 @@ Register with Claude Code:
     claude mcp add owlpost -- /path/to/owlpost mcp
 ";
 
+/// Linux: run the window through XWayland unless `OWLPOST_WAYLAND=1`.
+/// Under native Wayland the window stops answering the compositor's
+/// "are you alive?" check while it waits to draw, so KDE marks it Not
+/// Responding (seen on Fedora KDE), and the HTML views can only be placed
+/// inside an X11 window. Every Wayland desktop OwlPost targets runs XWayland.
+#[cfg(target_os = "linux")]
+fn prefer_xwayland() {
+    if std::env::var_os("OWLPOST_WAYLAND").is_some_and(|v| v == "1") {
+        return;
+    }
+    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        // Before any threads start, so changing the environment is safe.
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    prefer_xwayland();
     // Logs go to stderr so they never corrupt the MCP stdio stream.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .target(env_logger::Target::Stderr)
@@ -129,6 +147,9 @@ fn run_gui(demo: bool) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("OwlPost")
+            // Linux: matches the launcher (co.timson.OwlPost.desktop), so the
+            // window gets its icon and groups with it in the taskbar.
+            .with_app_id("co.timson.OwlPost")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 560.0])
             // On macOS the toolbar sits in the title bar, beside the traffic lights.

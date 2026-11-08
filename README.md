@@ -47,6 +47,16 @@ scripts/make-signing-cert.sh     # once: a local signing certificate (see below)
 
 The bundle script signs the app with "OwlPost Local Signing" when that certificate is in your login keychain. The Keychain recognises an app by its signature, so builds signed with it keep access to your saved passwords and Google sign-in. Without it, the app is signed ad hoc, which changes with every build, and macOS asks for Keychain access again after each install. The certificate is self-signed and trusted only for code signing on your Mac. The first time `codesign` uses it, macOS asks for your login password: choose **Always Allow**.
 
+### Linux
+
+```sh
+scripts/install-linux.sh   # build, then install to ~/.local (program, app-menu launcher, icon)
+```
+
+It needs Rust and the OpenSSL and D-Bus development files (`sudo dnf install openssl-devel dbus-devel pkgconf-pkg-config` on Fedora, `sudo pacman -S --needed openssl dbus pkgconf` on Arch). Tested on Fedora 44 KDE (ARM). Passwords and Google sign-ins go in the desktop's Secret Service (KDE Wallet or GNOME Keyring).
+
+On Wayland desktops OwlPost runs through XWayland: native Wayland windows stopped answering KDE's "are you alive?" check, and the HTML views need an X11 window. Set `OWLPOST_WAYLAND=1` to try native Wayland. HTML email on Linux still shows as text for now.
+
 The app icon lives in `crates/owlpost/assets/icon-1024.png`. After changing it, run `cargo run -p owlpost --example icon_assets` to regenerate the padded macOS version. The bundle script also does this automatically when the source is newer.
 
 ## Connecting Gmail and iCloud
