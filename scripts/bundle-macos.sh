@@ -52,8 +52,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc signature so macOS will run it locally.
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "note: codesign failed; the app may need right-click → Open the first time"
+# Sign with the local certificate (scripts/make-signing-cert.sh) so every
+# build counts as the same app and keeps its Keychain access. Without it,
+# fall back to an ad-hoc signature, which macOS treats as a new app each time.
+IDENTITY="OwlPost Local Signing"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
+  codesign --force --deep --sign "$IDENTITY" --identifier co.timson.OwlPost "$APP"
+  echo "Signed with \"$IDENTITY\""
+else
+  codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "note: codesign failed; the app may need right-click → Open the first time"
+  echo "note: signed ad hoc, so macOS will ask for Keychain access again after installing."
+  echo "      Run scripts/make-signing-cert.sh once to stop that."
+fi
 rm -rf "$WORK"
 echo "Built $APP"
 

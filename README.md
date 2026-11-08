@@ -37,7 +37,10 @@ cargo run --release -- --demo    # with sample accounts
 cargo test --workspace           # unit + offscreen UI render tests
 scripts/bundle-macos.sh          # build target/release/OwlPost.app (with icon)
 scripts/bundle-macos.sh --install   # …and copy it to /Applications
+scripts/make-signing-cert.sh     # once: a local signing certificate (see below)
 ```
+
+The bundle script signs the app with "OwlPost Local Signing" when that certificate is in your login keychain. The Keychain recognises an app by its signature, so builds signed with it keep access to your saved passwords and Google sign-in. Without it, the app is signed ad hoc, which changes with every build, and macOS asks for Keychain access again after each install. The certificate is self-signed and trusted only for code signing on your Mac. The first time `codesign` uses it, macOS asks for your login password: choose **Always Allow**.
 
 The app icon lives in `crates/owlpost/assets/icon-1024.png`. After changing it, run `cargo run -p owlpost --example icon_assets` to regenerate the padded macOS version. The bundle script also does this automatically when the source is newer.
 
