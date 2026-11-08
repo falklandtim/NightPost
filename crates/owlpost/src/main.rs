@@ -30,25 +30,23 @@ Register with Claude Code:
     claude mcp add owlpost -- /path/to/owlpost mcp
 ";
 
-/// Linux: run the window through XWayland unless `OWLPOST_WAYLAND=1`.
-/// Under native Wayland the window stops answering the compositor's
-/// "are you alive?" check while it waits to draw, so KDE marks it Not
-/// Responding (seen on Fedora KDE), and the HTML views can only be placed
-/// inside an X11 window. Every Wayland desktop OwlPost targets runs XWayland.
+/// Linux: is the window a native Wayland one? `OWLPOST_X11=1` runs it
+/// through XWayland instead.
 #[cfg(target_os = "linux")]
-fn prefer_xwayland() {
-    if std::env::var_os("OWLPOST_WAYLAND").is_some_and(|v| v == "1") {
-        return;
-    }
-    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+fn linux_wayland() -> bool {
+    if std::env::var_os("OWLPOST_X11").is_some_and(|v| v == "1") && std::env::var_os("DISPLAY").is_some() {
         // Before any threads start, so changing the environment is safe.
         std::env::remove_var("WAYLAND_DISPLAY");
+        return false;
     }
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
-    prefer_xwayland();
+    let wayland = linux_wayland();
+    #[cfg(not(target_os = "linux"))]
+    let wayland = false;
     // Logs go to stderr so they never corrupt the MCP stdio stream.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .target(env_logger::Target::Stderr)
@@ -110,7 +108,7 @@ fn main() -> Result<()> {
             eprintln!("unknown command: {other}\n\n{HELP}");
             std::process::exit(2);
         }
-        None => run_gui(demo),
+        None => run_gui(demo, wayland),
     }
 }
 
@@ -141,7 +139,7 @@ fn migrate_window_settings() {
     }
 }
 
-fn run_gui(demo: bool) -> Result<()> {
+fn run_gui(demo: bool, wayland: bool) -> Result<()> {
     migrate_window_settings();
     let store = Store::open(&store::default_db_path())?;
     let options = eframe::NativeOptions {
@@ -157,6 +155,12 @@ fn run_gui(demo: bool) -> Result<()> {
             .with_titlebar_shown(!cfg!(target_os = "macos"))
             .with_title_shown(!cfg!(target_os = "macos"))
             .with_icon(app_icon()),
+        // Wayland: don't wait for the compositor's frame callback before
+        // drawing. While waiting, the window couldn't answer the compositor's
+        // "are you alive?" check (KDE showed Not Responding, and the first
+        // frame could stall). Wayland never tears, and OwlPost only draws
+        // when something changes.
+        vsync: !wayland,
         ..Default::default()
     };
     eframe::run_native(

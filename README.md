@@ -55,7 +55,7 @@ scripts/install-linux.sh   # build, then install to ~/.local (program, app-menu 
 
 It needs Rust and the OpenSSL and D-Bus development files (`sudo dnf install openssl-devel dbus-devel pkgconf-pkg-config` on Fedora, `sudo pacman -S --needed openssl dbus pkgconf` on Arch). Tested on Fedora 44 KDE (ARM). Passwords and Google sign-ins go in the desktop's Secret Service (KDE Wallet or GNOME Keyring).
 
-On Wayland desktops OwlPost runs through XWayland: native Wayland windows stopped answering KDE's "are you alive?" check, and the HTML views need an X11 window. Set `OWLPOST_WAYLAND=1` to try native Wayland. HTML email on Linux still shows as text for now.
+OwlPost runs natively on Wayland (tested on KDE Plasma); `OWLPOST_X11=1` runs it through XWayland instead. HTML email on Linux still shows as text for now.
 
 The app icon lives in `crates/owlpost/assets/icon-1024.png`. After changing it, run `cargo run -p owlpost --example icon_assets` to regenerate the padded macOS version. The bundle script also does this automatically when the source is newer.
 
