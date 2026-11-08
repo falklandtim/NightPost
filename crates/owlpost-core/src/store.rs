@@ -150,11 +150,22 @@ impl Store {
         }
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut read = tx.prepare("SELECT id, body_text, snippet FROM messages")?;
+            let mut read = tx.prepare("SELECT id, body_text, snippet, body_html FROM messages")?;
             let mut write = tx.prepare("UPDATE messages SET snippet=?2 WHERE id=?1")?;
-            let rows = read.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+            let mut write_body = tx.prepare("UPDATE messages SET body_text=?2, snippet=?3 WHERE id=?1")?;
+            let rows = read.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
+            })?;
             for row in rows {
-                let (id, body, old) = row?;
+                let (id, body, old, html) = row?;
+                // HTML-only mail whose text was drawn with table borders by
+                // an older version: read it again.
+                if let Some(html) = html.filter(|_| crate::parse::has_table_borders(&body)) {
+                    let text = crate::parse::html_to_text(&html);
+                    let snippet = crate::parse::make_snippet(&text);
+                    write_body.execute(params![id, text, snippet])?;
+                    continue;
+                }
                 let new = crate::parse::make_snippet(&body);
                 if new != old {
                     write.execute(params![id, new])?;

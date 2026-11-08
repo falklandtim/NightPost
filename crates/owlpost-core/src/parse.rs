@@ -23,7 +23,7 @@ fn header_ids(v: &HeaderValue) -> Vec<String> {
 }
 
 /// Bump when [`make_snippet`] changes, so stored previews are rebuilt.
-pub const SNIPPET_VERSION: i64 = 1;
+pub const SNIPPET_VERSION: i64 = 2;
 
 /// Collapse whitespace and trim to a list-view preview.
 ///
@@ -45,11 +45,11 @@ pub fn make_snippet(text: &str) -> String {
             break;
         }
     }
-    let clean = strip_links(&decode_entities(&kept));
+    let clean = strip_links(&strip_footnote_refs(&decode_entities(&kept)));
     let mut out = String::with_capacity(200);
     let mut last = String::new();
     for w in clean.split_whitespace() {
-        let w: String = w.chars().filter(|c| !invisible(*c)).collect();
+        let w: String = w.chars().filter(|c| !invisible(*c) && !('\u{2500}'..='\u{257F}').contains(c)).collect();
         let lower = w.to_ascii_lowercase();
         if w.is_empty()
             || w == last
@@ -145,6 +145,48 @@ fn is_link(s: &str) -> bool {
 
 /// Drop link targets, keeping link text: `[text](url)` → `text`, and
 /// `<url>`, `<[[url]]>`, `[url]`, `(url)` → nothing.
+/// Undo html2text's link footnotes for a preview: `[text][3]` becomes
+/// `text`, and a linked picture `[ [Logo] ][1]` goes (its alt text isn't
+/// something you'd read).
+fn strip_footnote_refs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("][") {
+        let after = &rest[at + 2..];
+        let digits = after.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 || !after[digits..].starts_with(']') {
+            out.push_str(&rest[..at + 2]);
+            rest = after;
+            continue;
+        }
+        // The '[' that opens the link text (pictures nest one more).
+        let head = &rest[..at];
+        let mut depth = 0;
+        let open = head.char_indices().rev().find(|&(_, c)| {
+            match c {
+                ']' => depth += 1,
+                '[' if depth == 0 => return true,
+                '[' => depth -= 1,
+                _ => {}
+            }
+            false
+        });
+        match open {
+            Some((o, _)) => {
+                out.push_str(&head[..o]);
+                let inner = head[o + 1..].trim();
+                if !(inner.starts_with('[') && inner.ends_with(']')) {
+                    out.push_str(inner);
+                }
+            }
+            None => out.push_str(head),
+        }
+        rest = &after[digits + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn strip_links(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -204,8 +246,16 @@ fn strip_links(s: &str) -> String {
     out
 }
 
+/// Readable text from email HTML. Email layouts are built from tables, so
+/// they're read as plain lines (raw mode), never drawn with box borders
+/// that previews would show as rows of ─ and │.
 pub fn html_to_text(html: &str) -> String {
-    html2text::from_read(html.as_bytes(), 100).unwrap_or_else(|_| html.to_string())
+    html2text::config::plain().raw_mode(true).string_from_read(html.as_bytes(), 100).unwrap_or_else(|_| html.to_string())
+}
+
+/// Text made by older versions, which drew table borders.
+pub fn has_table_borders(text: &str) -> bool {
+    text.contains("──") || text.contains('│')
 }
 
 /// Make pasted signature HTML safe to drop into an email.
@@ -409,6 +459,19 @@ pub fn parse_message(raw: &[u8], account_id: AccountId, folder_id: FolderId, uid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_only_mail_reads_without_table_borders() {
+        let html = "<table><tr><td><a href=\"https://x.example\"><img src=\"https://x.example/logo.png\" alt=\"Council Logo\"></a></td></tr>\
+<tr><td>Kia ora,<br>Your latest rates notice is attached. If you have any questions, <a href=\"https://x.example/c\">contact us</a>.</td></tr>\
+<tr><td>Amount due</td><td>$1,176.24</td></tr></table>";
+        let text = html_to_text(html);
+        assert!(!has_table_borders(&text), "{text}");
+        assert!(text.contains("Amount due") && text.contains("$1,176.24"));
+        let snip = make_snippet(&text);
+        assert!(snip.starts_with("Kia ora, Your latest rates notice is attached. If you have any questions, contact us."), "{snip}");
+        assert_eq!(strip_footnote_refs("see [docs][12] and [ [Pay Now] ][3] now [x] a][b"), "see docs and  now [x] a][b");
+    }
 
     #[test]
     fn parses_basic_message() {

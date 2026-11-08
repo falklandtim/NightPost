@@ -47,6 +47,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <!-- Many emails still load pictures over plain http://. Allow that in the
+       email web view only (as Mail does); everything else stays HTTPS-only. -->
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoadsInWebContent</key><true/>
+  </dict>
   <key>NSContactsUsageDescription</key><string>OwlPost shows the photos of people in your Contacts next to their emails.</string>
 </dict>
 </plist>
