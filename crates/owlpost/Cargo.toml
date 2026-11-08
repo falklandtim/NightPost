@@ -38,6 +38,7 @@ wry = "0.57"
 # Wayland and X11).
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+javascriptcore-rs = "1.1"
 webkit2gtk = "2.0"
 wry = { version = "0.57", default-features = false, features = ["os-webview"] }
 

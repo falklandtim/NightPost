@@ -75,6 +75,17 @@ pub fn poll() -> Vec<HostEvent> {
     imp::poll()
 }
 
+/// Linux: run `f` on the GTK thread (for other GTK users, such as the
+/// reading view). Returns false when GTK isn't running.
+#[cfg(target_os = "linux")]
+pub fn on_gtk_thread(f: impl FnOnce() + Send + 'static) -> bool {
+    if !imp::available() {
+        return false;
+    }
+    gtk::glib::MainContext::default().invoke(f);
+    true
+}
+
 /// A JavaScript string literal for `s`.
 pub fn js_string(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
@@ -370,6 +381,7 @@ mod imp {
         });
         window.show_all();
         window.present();
+        log::info!("web window {id}: realized={} visible={} mapped={} size={:?}", window.is_realized(), window.is_visible(), window.is_mapped(), window.size());
         WINS.with(|w| w.borrow_mut().insert(id, Win { window, webview }));
         Ok(())
     }

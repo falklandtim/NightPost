@@ -2841,7 +2841,7 @@ impl OwlPostApp {
     /// Act on clicks and keys from the HTML message view.
     fn mail_view_events(&mut self, ctx: &egui::Context) {
         use crate::mail_view::ViewEvent;
-        let events = self.mail_view.as_ref().map(|v| v.events()).unwrap_or_default();
+        let events = self.mail_view.as_mut().map(|v| v.events()).unwrap_or_default();
         for e in events {
             match e {
                 ViewEvent::OpenLink(url) => {
@@ -2873,7 +2873,9 @@ impl OwlPostApp {
     /// Put the web view over the reading pane, or hide it while something
     /// egui draws (a menu, Preferences) would be underneath it.
     fn place_mail_view(&mut self, ctx: &egui::Context) {
-        let covered = self.prefs.is_some() || self.setup.is_some() || egui::Popup::is_any_open(ctx);
+        // The macOS view is a native overlay, so it hides under menus and
+        // windows; Linux draws the page inside egui, which layers correctly.
+        let covered = cfg!(target_os = "macos") && (self.prefs.is_some() || self.setup.is_some() || egui::Popup::is_any_open(ctx));
         let (Some(view), Some(rect), Some(open)) = (self.mail_view.as_mut(), self.web_rect, self.open.as_ref()) else {
             if let Some(v) = self.mail_view.as_mut() {
                 v.hide();
@@ -2895,7 +2897,7 @@ impl OwlPostApp {
             h.finish()
         };
         let faces = &self.faces;
-        view.show(rect, ctx.zoom_factor(), page_key, || {
+        view.show(ctx, rect, ctx.zoom_factor(), page_key, || {
             let nonce = format!("{:x}", page_key ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7));
             crate::mail_view::document(&crate::mail_view::Page { messages: &open.messages, expanded: &open.expanded, remote_images: remote, nonce: &nonce, avatar: &|e| faces.data_uri(e) }, col)
         });

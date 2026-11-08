@@ -375,7 +375,9 @@ pub fn key_events(key: &str, command: bool) -> Vec<egui::Event> {
 #[cfg(target_os = "macos")]
 pub use native::MailView;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub use offscreen::MailView;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub use fallback::MailView;
 
 #[cfg(target_os = "macos")]
@@ -438,7 +440,7 @@ mod native {
 
         /// Show `html` over `rect` (in window points). Reloads only when
         /// `key` changes.
-        pub fn show(&mut self, rect: egui::Rect, zoom: f32, key: u64, html: impl FnOnce() -> String) {
+        pub fn show(&mut self, _ctx: &egui::Context, rect: egui::Rect, zoom: f32, key: u64, html: impl FnOnce() -> String) {
             if rect != self.bounds {
                 self.bounds = rect;
                 let _ = self.view.set_bounds(wry::Rect {
@@ -468,14 +470,14 @@ mod native {
             }
         }
 
-        pub fn events(&self) -> Vec<ViewEvent> {
+        pub fn events(&mut self) -> Vec<ViewEvent> {
             self.rx.try_iter().collect()
         }
 
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod fallback {
     use super::ViewEvent;
     use eframe::egui;
@@ -487,10 +489,349 @@ mod fallback {
         pub fn new<W>(_window: &W, _bg: egui::Color32) -> Option<Self> {
             None
         }
-        pub fn show(&mut self, _rect: egui::Rect, _zoom: f32, _key: u64, _html: impl FnOnce() -> String) {}
+        pub fn show(&mut self, _ctx: &egui::Context, _rect: egui::Rect, _zoom: f32, _key: u64, _html: impl FnOnce() -> String) {}
         pub fn hide(&mut self) {}
-        pub fn events(&self) -> Vec<ViewEvent> {
+        pub fn events(&mut self) -> Vec<ViewEvent> {
             vec![]
+        }
+    }
+}
+
+/// Linux: the conversation drawn by WebKitGTK off screen, shown as a picture.
+///
+/// Wayland has no way to put another toolkit's view inside our window, so
+/// WebKitGTK renders the page in an offscreen window on the GTK thread and
+/// hands back a full-page snapshot (sharp on HiDPI screens), with where the
+/// links and folds are. The app paints it, scrolls it, and turns clicks into
+/// the same events the macOS view sends. Emails run no scripts, so a picture
+/// of the page is the page. (Text can't be selected yet.)
+#[cfg(target_os = "linux")]
+mod offscreen {
+    use super::{parse_action, ViewEvent};
+    use eframe::egui;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug)]
+    enum Hit {
+        Link(String),
+        /// An older message's header: fold it open or shut.
+        Fold(usize),
+    }
+
+    /// A clickable spot, in page (CSS) pixels.
+    #[derive(Clone, Debug)]
+    struct Target {
+        rect: egui::Rect,
+        hit: Hit,
+    }
+
+    /// A finished render.
+    struct Rendered {
+        key: u64,
+        width: u32,
+        /// Device pixels per CSS pixel.
+        scale: f32,
+        image: egui::ColorImage,
+        targets: Vec<Target>,
+    }
+
+    #[derive(Default)]
+    struct Shared {
+        rendered: Option<Rendered>,
+    }
+
+    pub struct MailView {
+        shared: Arc<Mutex<Shared>>,
+        /// What was last asked for: page key and width.
+        requested: (u64, u32),
+        /// Picture tiles: texture, top (in points), height (in points).
+        tiles: Vec<(egui::TextureHandle, f32, f32)>,
+        /// The shown page's size in points, and its targets.
+        size: egui::Vec2,
+        targets: Vec<Target>,
+        scroll: f32,
+        events: Vec<ViewEvent>,
+        bg: egui::Color32,
+        shown_key: u64,
+    }
+
+    impl MailView {
+        pub fn new<W>(_window: &W, bg: egui::Color32) -> Option<Self> {
+            if !crate::web_host::available() {
+                return None;
+            }
+            Some(Self {
+                shared: Arc::default(),
+                requested: (0, 0),
+                tiles: vec![],
+                size: egui::Vec2::ZERO,
+                targets: vec![],
+                scroll: 0.0,
+                events: vec![],
+                bg,
+                shown_key: 0,
+            })
+        }
+
+        pub fn show(&mut self, ctx: &egui::Context, rect: egui::Rect, _zoom: f32, key: u64, html: impl FnOnce() -> String) {
+            let width = rect.width().round().max(1.0) as u32;
+            if (key, width) != self.requested {
+                if key != self.requested.0 {
+                    self.scroll = 0.0;
+                }
+                self.requested = (key, width);
+                let scale = ctx.pixels_per_point();
+                request(Job::Load { key, width, scale, html: html() }, self.shared.clone(), ctx.clone());
+            }
+            self.take_render(ctx);
+            self.paint_and_handle(ctx, rect);
+        }
+
+        /// A new picture from the GTK thread, cut into texture-sized tiles.
+        fn take_render(&mut self, ctx: &egui::Context) {
+            let Some(r) = self.shared.lock().ok().and_then(|mut s| s.rendered.take()) else { return };
+            if r.key != self.requested.0 {
+                return;
+            }
+            let max = ctx.input(|i| i.max_texture_side).max(1024);
+            let [w, h] = r.image.size;
+            self.tiles.clear();
+            let mut top = 0;
+            while top < h {
+                let rows = (h - top).min(max);
+                let mut tile = egui::ColorImage::new([w, rows], vec![egui::Color32::TRANSPARENT; w * rows]);
+                tile.pixels.copy_from_slice(&r.image.pixels[top * w..(top + rows) * w]);
+                let tex = ctx.load_texture(format!("mail-view-{top}"), tile, egui::TextureOptions::LINEAR);
+                self.tiles.push((tex, top as f32 / r.scale, rows as f32 / r.scale));
+                top += rows;
+            }
+            self.size = egui::vec2(w as f32 / r.scale, h as f32 / r.scale);
+            self.targets = r.targets;
+            self.shown_key = r.key;
+            let _ = r.width;
+        }
+
+        fn paint_and_handle(&mut self, ctx: &egui::Context, rect: egui::Rect) {
+            let max_scroll = (self.size.y - rect.height()).max(0.0);
+            // Input: only when nothing (a menu, a popup) is above the pane.
+            let pointer = ctx.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p) && ctx.layer_id_at(*p).is_none_or(|l| l.order == egui::Order::Background));
+            if pointer.is_some() {
+                let dy = ctx.input(|i| i.smooth_scroll_delta.y);
+                self.scroll = (self.scroll - dy).clamp(0.0, max_scroll);
+            }
+            self.scroll = self.scroll.clamp(0.0, max_scroll);
+            let origin = rect.min - egui::vec2(0.0, self.scroll);
+            if let Some(p) = pointer {
+                let at = (p - origin).to_pos2();
+                if let Some(t) = self.targets.iter().find(|t| t.rect.contains(at)).cloned() {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    if ctx.input(|i| i.pointer.primary_clicked()) {
+                        match t.hit {
+                            Hit::Link(url) => self.events.push(parse_action(&url).unwrap_or(ViewEvent::OpenLink(url))),
+                            Hit::Fold(i) => request(Job::Fold(i), self.shared.clone(), ctx.clone()),
+                        }
+                    }
+                }
+            }
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("mail_view"))).with_clip_rect(rect);
+            painter.rect_filled(rect, 0.0, self.bg);
+            if self.tiles.is_empty() || self.shown_key != self.requested.0 {
+                painter.text(rect.center_top() + egui::vec2(0.0, 40.0), egui::Align2::CENTER_TOP, "Loading…", egui::FontId::proportional(14.0), egui::Color32::GRAY);
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                if self.tiles.is_empty() {
+                    return;
+                }
+            }
+            for (tex, top, height) in &self.tiles {
+                let r = egui::Rect::from_min_size(origin + egui::vec2(0.0, *top), egui::vec2(self.size.x, *height));
+                if r.intersects(rect) {
+                    painter.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                }
+            }
+            // A thin scroll indicator when the page is taller than the pane.
+            if max_scroll > 0.0 {
+                let frac = rect.height() / self.size.y;
+                let h = (rect.height() * frac).max(24.0);
+                let y = rect.top() + (rect.height() - h) * (self.scroll / max_scroll);
+                let bar = egui::Rect::from_min_size(egui::pos2(rect.right() - 6.0, y), egui::vec2(4.0, h));
+                painter.rect_filled(bar, 2.0, egui::Color32::from_gray(128).gamma_multiply(0.5));
+            }
+        }
+
+        pub fn hide(&mut self) {}
+
+        pub fn events(&mut self) -> Vec<ViewEvent> {
+            std::mem::take(&mut self.events)
+        }
+    }
+
+    enum Job {
+        Load { key: u64, width: u32, scale: f32, html: String },
+        Fold(usize),
+    }
+
+    /// Hand a job to the GTK thread.
+    fn request(job: Job, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
+        crate::web_host::on_gtk_thread(move || gtk_side::run(job, shared, ctx));
+    }
+
+    /// Runs on the GTK thread.
+    mod gtk_side {
+        use super::{Hit, Job, Rendered, Shared, Target};
+        use eframe::egui;
+        use gtk::prelude::*;
+        use std::cell::RefCell;
+        use std::sync::{Arc, Mutex};
+        use webkit2gtk::{LoadEvent, SnapshotOptions, SnapshotRegion, WebViewExt};
+
+        struct Off {
+            _window: gtk::OffscreenWindow,
+            view: webkit2gtk::WebView,
+            key: u64,
+            width: u32,
+            scale: f32,
+            /// Bumped per load, so a late callback from an older page is ignored.
+            gen: u64,
+            shared: Arc<Mutex<Shared>>,
+            ctx: egui::Context,
+        }
+
+        thread_local! {
+            static OFF: RefCell<Option<Off>> = const { RefCell::new(None) };
+        }
+
+        pub fn run(job: Job, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
+            match job {
+                Job::Load { key, width, scale, html } => load(key, width, scale, html, shared, ctx),
+                Job::Fold(i) => {
+                    let gen = OFF.with(|o| {
+                        o.borrow().as_ref().map(|off| {
+                            let js = format!("(function(){{var d=document.querySelectorAll('details.card')[{i}]; if(d) d.open=!d.open; return '';}})()");
+                            off.view.run_javascript(&js, None::<&gtk::gio::Cancellable>, |_| {});
+                            off.gen
+                        })
+                    });
+                    if let Some(gen) = gen {
+                        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || snapshot(gen));
+                    }
+                }
+            }
+        }
+
+        fn load(key: u64, width: u32, scale: f32, html: String, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
+            OFF.with(|o| {
+                let mut o = o.borrow_mut();
+                if o.is_none() {
+                    let window = gtk::OffscreenWindow::new();
+                    let view = webkit2gtk::WebView::new();
+                    view.connect_load_changed(|_, ev| {
+                        if ev == LoadEvent::Finished {
+                            let gen = OFF.with(|o| o.borrow().as_ref().map(|off| off.gen));
+                            if let Some(gen) = gen {
+                                // Once the email frames have sized themselves, then
+                                // again after late pictures and fonts arrive.
+                                for ms in [250, 1500] {
+                                    gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || snapshot(gen));
+                                }
+                            }
+                        }
+                    });
+                    window.add(&view);
+                    window.show_all();
+                    *o = Some(Off { _window: window, view, key: 0, width: 0, scale: 1.0, gen: 0, shared: shared.clone(), ctx: ctx.clone() });
+                }
+                let off = o.as_mut().expect("just made");
+                off.key = key;
+                off.width = width;
+                off.scale = scale;
+                off.gen += 1;
+                off.shared = shared;
+                off.ctx = ctx;
+                // GTK may already draw at the screen's scale (HiDPI); zoom the
+                // page for whatever's left, so the picture is sharp but the
+                // layout stays `width` CSS pixels wide.
+                let gdk = off.view.scale_factor().max(1) as f32;
+                let zoom = (scale / gdk).max(0.25);
+                off.view.set_zoom_level(zoom as f64);
+                off.view.set_size_request((width as f32 * zoom).round() as i32, (600.0 * zoom) as i32);
+                off.view.load_html(&html, None);
+            });
+        }
+
+        /// Where the page's links and folds are (CSS pixels), and its height.
+        const MEASURE: &str = r#"(function () {
+  var out = [];
+  function add(el, ox, oy, extra) {
+    var r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) out.push(Object.assign({ x: r.left + ox + scrollX, y: r.top + oy + scrollY, w: r.width, h: r.height }, extra));
+  }
+  document.querySelectorAll('a[href]').forEach(function (a) { add(a, 0, 0, { href: a.href }); });
+  document.querySelectorAll('details.card').forEach(function (d, i) { var s = d.querySelector('summary'); if (s) add(s, 0, 0, { fold: i }); });
+  document.querySelectorAll('.html iframe').forEach(function (f) {
+    try {
+      var fr = f.getBoundingClientRect();
+      if (fr.height === 0) return;
+      f.contentDocument.querySelectorAll('a[href]').forEach(function (a) { add(a, fr.left, fr.top, { href: a.href }); });
+    } catch (e) {}
+  });
+  var h = Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0);
+  return JSON.stringify({ h: h, t: out });
+})()"#;
+
+        fn snapshot(gen: u64) {
+            let view = OFF.with(|o| o.borrow().as_ref().filter(|off| off.gen == gen).map(|off| off.view.clone()));
+            let Some(view) = view else { return };
+            let runner = view.clone();
+            runner.run_javascript(MEASURE, None::<&gtk::gio::Cancellable>, move |r| {
+                use javascriptcore::ValueExt;
+                let json = r.ok().and_then(|r| r.js_value()).map(|v| v.to_str().to_string()).unwrap_or_default();
+                let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                let targets: Vec<Target> = v["t"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| {
+                        let rect = egui::Rect::from_min_size(egui::pos2(t["x"].as_f64()? as f32, t["y"].as_f64()? as f32), egui::vec2(t["w"].as_f64()? as f32, t["h"].as_f64()? as f32));
+                        let hit = match (t["href"].as_str(), t["fold"].as_u64()) {
+                            (Some(h), _) => Hit::Link(h.to_string()),
+                            (None, Some(i)) => Hit::Fold(i as usize),
+                            _ => return None,
+                        };
+                        Some(Target { rect, hit })
+                    })
+                    .collect();
+                view.snapshot(SnapshotRegion::FullDocument, SnapshotOptions::NONE, None::<&gtk::gio::Cancellable>, move |s| {
+                    let Ok(surface) = s else { return };
+                    let Some(image) = to_image(surface) else { return };
+                    OFF.with(|o| {
+                        if let Some(off) = o.borrow().as_ref().filter(|off| off.gen == gen) {
+                            if let Ok(mut sh) = off.shared.lock() {
+                                // Device pixels per CSS pixel, as it actually came out.
+                                let scale = image.size[0] as f32 / off.width.max(1) as f32;
+                                let _ = off.scale;
+                                sh.rendered = Some(Rendered { key: off.key, width: off.width, scale, image, targets });
+                            }
+                            off.ctx.request_repaint();
+                        }
+                    });
+                });
+            });
+        }
+
+        /// A cairo snapshot (premultiplied BGRA) as an egui image.
+        fn to_image(surface: gtk::cairo::Surface) -> Option<egui::ColorImage> {
+            let mut img = gtk::cairo::ImageSurface::try_from(surface).ok()?;
+            img.flush();
+            let (w, h, stride) = (img.width() as usize, img.height() as usize, img.stride() as usize);
+            let data = img.data().ok()?;
+            let mut rgba = Vec::with_capacity(w * h * 4);
+            for y in 0..h {
+                let row = &data[y * stride..y * stride + w * 4];
+                for px in row.chunks_exact(4) {
+                    rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                }
+            }
+            Some(egui::ColorImage::from_rgba_premultiplied([w, h], &rgba))
         }
     }
 }
