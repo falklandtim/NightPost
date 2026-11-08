@@ -276,7 +276,9 @@ pub fn document(page: &Page, col: &Colors) -> String {
         body.push_str(&format!("<div class=\"banner quiet\">{tracked}</div>"));
     }
     let n = page.messages.len();
-    for (i, m) in page.messages.iter().enumerate() {
+    // Newest first; Reply etc. sit right under the newest message.
+    for i in (0..n).rev() {
+        let m = &page.messages[i];
         let open = page.expanded.get(i).copied().unwrap_or(true) || i + 1 == n;
         let who = if m.from.name.is_empty() { m.from.email.clone() } else { m.from.name.clone() };
         let initial = who.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_default();
@@ -338,11 +340,13 @@ pub fn document(page: &Page, col: &Colors) -> String {
             None => body.push_str(&text_html(&m.body_text)),
         }
         body.push_str("</div></details>");
+        if i + 1 == n {
+            body.push_str(
+                "<div class=actions><a class=btn href=\"owlpost://reply\">Reply</a><a class=btn href=\"owlpost://reply-all\">Reply all</a>\
+                 <a class=btn href=\"owlpost://forward\">Forward</a></div>",
+            );
+        }
     }
-    body.push_str(
-        "<div class=actions><a class=btn href=\"owlpost://reply\">Reply</a><a class=btn href=\"owlpost://reply-all\">Reply all</a>\
-         <a class=btn href=\"owlpost://forward\">Forward</a></div>",
-    );
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="{policy}">
@@ -384,7 +388,7 @@ hr {{ border: 0; border-top: 1px solid {hair}; margin: 12px 0; }}
 .quoted {{ color: {subtle}; white-space: pre-wrap; border-left: 2px solid {hair}; padding-left: 10px; margin-top: 4px; }}
 .html iframe {{ border: 0; width: 100%; display: block; min-height: 40px; }}
 .html.paper {{ background: #fff; border-radius: 6px; padding: 12px; }}
-.actions {{ display: flex; gap: 8px; }}
+.actions {{ display: flex; gap: 8px; margin: 4px 0 22px; }}
 .btn {{ text-decoration: none; color: {text}; border: 1px solid {border}; border-radius: 16px; padding: 5px 16px; font-size: 13px; background: {bg2}; }}
 .btn:hover {{ filter: brightness(0.96); }}
 </style></head><body>{body}
@@ -698,6 +702,11 @@ mod tests {
         let doc = document(&Page { messages: &msgs, expanded: &[false, true], remote_images: false, nonce: "n", avatar: &|_| None }, &colors());
         assert_eq!(doc.matches("<details class=card open>").count(), 1);
         assert_eq!(doc.matches("<details class=card>").count(), 1);
+        // Newest on top, with the reply buttons under it, before older mail.
+        let b = doc.find("<body").unwrap();
+        let at = |s: &str| b + doc[b..].find(s).unwrap();
+        let (newest, reply, oldest) = (at("second"), at("owlpost://reply"), at("first"));
+        assert!(newest < reply && reply < oldest);
         assert!(!doc.contains("owlpost://load-images"), "no banner without remote content");
     }
 

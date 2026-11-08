@@ -2006,9 +2006,10 @@ impl OwlPostApp {
                         }
                         ui.add_space(16.0);
                         let n = open.messages.len();
-                        for (i, m) in open.messages.iter().enumerate() {
+                        // Newest first, like the web view.
+                        for (i, m) in open.messages.iter().enumerate().rev() {
                             let expanded = open.expanded.get(i).copied().unwrap_or(true);
-                            if i > 0 {
+                            if i + 1 < n {
                                 ui.add_space(6.0);
                             }
                             let (r, clicked) = message_card(ui, &col, m, expanded, i + 1 == n, &downloading, &self.faces);
