@@ -369,6 +369,8 @@ pub struct OwlPostApp {
     html_email: bool,
     /// Load remote images straight away (trackers are stripped regardless).
     load_images: bool,
+    /// Recolour HTML emails to match a dark theme.
+    dark_emails: bool,
     /// Where the web view goes this frame (the reading pane below the subject).
     web_rect: Option<egui::Rect>,
     /// Conversations whose remote images the user chose to load.
@@ -406,6 +408,7 @@ const LIST_KEY: &str = "owlpost.list";
 const HTML_KEY: &str = "owlpost.html";
 const IMAGES_KEY: &str = "owlpost.images";
 const FACES_KEY: &str = "owlpost.faces";
+const DARK_EMAILS_KEY: &str = "owlpost.dark_emails";
 /// Parent folders opened in the sidebar ("<account id>\t<path>" per line).
 const OPEN_FOLDERS_KEY: &str = "owlpost.open_folders";
 const COLLAPSED_ACCOUNTS_KEY: &str = "owlpost.collapsed_accounts";
@@ -424,6 +427,9 @@ impl OwlPostApp {
         }
         if let Some(i) = cc.storage.and_then(|s| s.get_string(IMAGES_KEY)) {
             app.load_images = i != "ask";
+        }
+        if let Some(d) = cc.storage.and_then(|s| s.get_string(DARK_EMAILS_KEY)) {
+            app.dark_emails = d != "0";
         }
         if let Some(f) = cc.storage.and_then(|s| s.get_string(FACES_KEY)) {
             app.faces.enabled.set(f != "0");
@@ -526,6 +532,7 @@ impl OwlPostApp {
             mail_view_tried: false,
             html_email: true,
             load_images: true,
+            dark_emails: true,
             web_rect: None,
             remote_images: HashSet::new(),
             pending_input: vec![],
@@ -2893,13 +2900,14 @@ impl OwlPostApp {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             let faces: Vec<bool> = open.messages.iter().map(|m| self.faces.texture(&m.from.email).is_some()).collect();
-            (&key, remote, &self.theme_id, col.p.dark, open.messages.iter().map(|m| (m.id, m.starred, m.attachments.len())).collect::<Vec<_>>(), faces).hash(&mut h);
+            (&key, remote, &self.theme_id, col.p.dark, self.dark_emails, open.messages.iter().map(|m| (m.id, m.starred, m.attachments.len())).collect::<Vec<_>>(), faces).hash(&mut h);
             h.finish()
         };
         let faces = &self.faces;
+        let dark_emails = self.dark_emails;
         view.show(ctx, rect, ctx.zoom_factor(), page_key, || {
             let nonce = format!("{:x}", page_key ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7));
-            crate::mail_view::document(&crate::mail_view::Page { messages: &open.messages, expanded: &open.expanded, remote_images: remote, nonce: &nonce, avatar: &|e| faces.data_uri(e) }, col)
+            crate::mail_view::document(&crate::mail_view::Page { messages: &open.messages, expanded: &open.expanded, remote_images: remote, nonce: &nonce, avatar: &|e| faces.data_uri(e), dark_emails }, col)
         });
     }
 
@@ -3099,6 +3107,7 @@ impl OwlPostApp {
             prefs.google_ready = self.google_ready;
             prefs.html_email = self.html_email;
             prefs.load_images = self.load_images;
+            prefs.dark_emails = self.dark_emails;
             prefs.faces = self.faces.enabled.get();
             prefs.google_waiting = self.google.as_ref().map(|g| g.1.clone());
             let act = prefs.ui(ctx, &col, &self.themes, &self.theme_id, &self.accounts, &mut self.list_settings, &self.sigs);
@@ -3160,6 +3169,7 @@ impl OwlPostApp {
                 PrefsAction::CancelGoogle => self.cancel_google(),
                 PrefsAction::SetHtmlEmail(on) => self.html_email = on,
                 PrefsAction::SetLoadImages(on) => self.load_images = on,
+                PrefsAction::SetDarkEmails(on) => self.dark_emails = on,
                 PrefsAction::SetFaces(on) => {
                     self.faces.enabled.set(on);
                     self.faces.clear();
@@ -3904,6 +3914,7 @@ impl eframe::App for OwlPostApp {
         storage.set_string(LIST_KEY, self.list_settings.encode());
         storage.set_string(HTML_KEY, if self.html_email { "1" } else { "0" }.into());
         storage.set_string(IMAGES_KEY, if self.load_images { "load" } else { "ask" }.into());
+        storage.set_string(DARK_EMAILS_KEY, if self.dark_emails { "1" } else { "0" }.into());
         storage.set_string(FACES_KEY, if self.faces.enabled.get() { "1" } else { "0" }.into());
         let mut open: Vec<&String> = self.open_folders.iter().collect();
         open.sort();

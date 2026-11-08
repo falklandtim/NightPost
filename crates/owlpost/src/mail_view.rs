@@ -121,12 +121,16 @@ pub struct Page<'a> {
     pub nonce: &'a str,
     /// A sender's picture as a data URI (and whether it fills the circle).
     pub avatar: &'a dyn Fn(&str) -> Option<(String, bool)>,
+    /// In a dark theme, recolour emails to match (light backgrounds go
+    /// dark, dark text goes light) instead of showing them on white paper.
+    pub dark_emails: bool,
 }
 
 /// The whole conversation as one HTML document.
 pub fn document(page: &Page, col: &Colors) -> String {
     let policy = csp(page.nonce, page.remote_images);
     let dark = col.p.dark;
+    let recolor = dark && page.dark_emails;
     // Tracking pixels never load, whatever the image setting.
     let mut trackers: Vec<String> = Vec::new();
     let bodies: Vec<Option<String>> = page
@@ -212,15 +216,20 @@ pub fn document(page: &Page, col: &Colors) -> String {
                 // Each email in its own sandbox: no scripts, no forms, its
                 // CSS kept to itself. Links go to the top page (and so to
                 // the browser).
+                let colours = if recolor {
+                    format!(":root{{color-scheme:dark;}} html{{background:{};}} body{{color:{};}} a{{color:{};}}", css(col.bg), css(col.text), css(col.link))
+                } else {
+                    "body{color:#1d1d1f;}".to_string()
+                };
                 let inner = format!(
                     "<meta charset=utf-8><meta http-equiv=\"Content-Security-Policy\" content=\"{}\"><base target=\"_top\">\
-                     <style>html,body{{margin:0;padding:0;}} body{{font:14px/1.45 -apple-system,system-ui,sans-serif;color:#1d1d1f;word-wrap:break-word;}} img{{max-width:100%;height:auto;}}</style>{}",
+                     <style>html,body{{margin:0;padding:0;}} body{{font:14px/1.45 -apple-system,system-ui,sans-serif;word-wrap:break-word;}} img{{max-width:100%;height:auto;}} {colours}</style>{}",
                     escape(&policy),
                     html
                 );
                 body.push_str(&format!(
                     "<div class=\"html{}\"><iframe sandbox=\"allow-same-origin allow-popups allow-top-navigation-by-user-activation\" srcdoc=\"{}\"></iframe></div>",
-                    if dark { " paper" } else { "" },
+                    if dark && !recolor { " paper" } else { "" },
                     escape(&inner)
                 ));
             }
@@ -279,7 +288,7 @@ hr {{ border: 0; border-top: 1px solid {hair}; margin: 12px 0; }}
 .btn {{ text-decoration: none; color: {text}; border: 1px solid {border}; border-radius: 16px; padding: 5px 16px; font-size: 13px; background: {bg2}; }}
 .btn:hover {{ filter: brightness(0.96); }}
 </style></head><body>{body}
-<script nonce="{nonce}">{script}</script></body></html>"#,
+<script nonce="{nonce}">var OWL_DARK = {dark_js};{script}</script></body></html>"#,
         policy = escape(&policy),
         scheme = if dark { "dark" } else { "light" },
         bg = css(col.bg),
@@ -292,13 +301,82 @@ hr {{ border: 0; border-top: 1px solid {hair}; margin: 12px 0; }}
         hair = css(style::blend(col.border, col.bg, 0.7)),
         star = css(col.star),
         nonce = page.nonce,
+        dark_js = if recolor { format!("{{bg:{},text:{}}}", rgb_js(col.bg), rgb_js(col.text)) } else { "null".into() },
         script = SCRIPT,
     )
+}
+
+/// A colour as a JS `[r,g,b]` array.
+fn rgb_js(c: egui::Color32) -> String {
+    format!("[{},{},{}]", c.r(), c.g(), c.b())
 }
 
 /// The page's only script: size each email frame to its content, and pass
 /// shortcut keys to the app (the web view has keyboard focus once clicked).
 const SCRIPT: &str = r#"
+// Dark theme: recolour an email to match. Light backgrounds are darkened
+// and dark text lightened, keeping each colour's hue, so a white email
+// becomes the theme's background with light text, coloured bands and
+// buttons keep their colour, and anything already dark is left alone.
+// Pictures are untouched.
+function hsl(c) {
+  var r = c[0] / 255, g = c[1] / 255, b = c[2] / 255;
+  var mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, h = 0, s = 0;
+  if (mx !== mn) {
+    var d = mx - mn; s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4; h /= 6;
+  }
+  return [h, s, l];
+}
+function css(h, s, l, a) {
+  return 'hsla(' + (h * 360).toFixed(1) + ',' + (s * 100).toFixed(1) + '%,' + (l * 100).toFixed(1) + '%,' + a + ')';
+}
+function parse(v) {
+  var m = /rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?/.exec(v || '');
+  return m ? [+m[1], +m[2], +m[3], m[4] === undefined ? 1 : +m[4]] : null;
+}
+function recolor(d) {
+  if (!OWL_DARK || !d || !d.body || d.owlDark) return;
+  d.owlDark = true;
+  var theme = hsl(OWL_DARK.bg), bgL = theme[2], textL = hsl(OWL_DARK.text)[2];
+  var els = [d.documentElement].concat(Array.prototype.slice.call(d.body.querySelectorAll('*')));
+  els.splice(1, 0, d.body);
+  // Read everything first, then write, so the page lays out once.
+  var todo = [];
+  els.forEach(function (el) {
+    if (/^(IMG|SVG|VIDEO|PICTURE|CANVAS)$/i.test(el.tagName)) return;
+    var cs = d.defaultView.getComputedStyle(el);
+    var bg = parse(cs.backgroundColor), fg = parse(cs.color), set = {};
+    var picture = cs.backgroundImage && cs.backgroundImage !== 'none';
+    if (bg && bg[3] > 0 && !picture) {
+      var b = hsl(bg);
+      // Light (L 0.5–1) maps onto theme background–mid grey; white is the theme's own.
+      var L = bgL + (1 - b[2]) * (0.5 - bgL) / 0.5;
+      // Near-white (white, cream, pale grey) becomes the theme's own
+      // background, a touch lighter the less white it was; paler colours
+      // keep their hue.
+      if (b[2] > 0.85) set.bg = css(theme[0], theme[1], L, bg[3]);
+      else if (b[2] > 0.5) set.bg = css(b[0], b[1] * 0.6, L, bg[3]);
+    }
+    if (fg && fg[3] > 0) {
+      var t = hsl(fg);
+      // Dark (L 0–0.5) maps onto theme text–mid grey; black is the theme's text.
+      if (t[2] < 0.5) set.fg = css(t[0], t[1], textL - t[2] * (textL - 0.6) / 0.5, fg[3]);
+    }
+    var bc = parse(cs.borderTopColor);
+    if (bc && bc[3] > 0 && parseFloat(cs.borderTopWidth) > 0) {
+      var k = hsl(bc);
+      if (k[2] > 0.6) set.border = css(k[0], k[1] * 0.8, bgL + (1 - k[2]) * (0.6 - bgL) / 0.4 + 0.08, bc[3]);
+    }
+    if (set.bg || set.fg || set.border) todo.push([el, set]);
+  });
+  todo.forEach(function (x) {
+    var st = x[0].style, set = x[1];
+    if (set.bg) st.setProperty('background-color', set.bg, 'important');
+    if (set.fg) st.setProperty('color', set.fg, 'important');
+    if (set.border) st.setProperty('border-color', set.border, 'important');
+  });
+}
 function fit(f) {
   try {
     var d = f.contentDocument; if (!d || !d.documentElement) return;
@@ -307,6 +385,7 @@ function fit(f) {
 }
 document.querySelectorAll('.html iframe').forEach(function (f) {
   f.addEventListener('load', function () {
+    try { recolor(f.contentDocument); } catch (e) {}
     fit(f);
     try {
       new ResizeObserver(function () { fit(f); }).observe(f.contentDocument.body);
@@ -316,7 +395,10 @@ document.querySelectorAll('.html iframe').forEach(function (f) {
   });
 });
 // Size them now too, and once everything (fonts, images) has loaded.
-document.querySelectorAll('.html iframe').forEach(fit);
+document.querySelectorAll('.html iframe').forEach(function (f) {
+  try { if (f.contentDocument && f.contentDocument.readyState === 'complete') recolor(f.contentDocument); } catch (e) {}
+  fit(f);
+});
 window.addEventListener('load', function () {
   var frames = document.querySelectorAll('.html iframe');
   frames.forEach(fit);
@@ -869,12 +951,22 @@ mod tests {
         Colors::new(owlpost_core::theme::discover().into_iter().find(|t| t.id == "owlpost-light").unwrap().palette())
     }
 
+    /// Write a dark page for an email (OWLPOST_DUMP_IN → OWLPOST_DUMP_OUT), to look at.
+    #[test]
+    #[ignore]
+    fn dump_dark_page() {
+        let html = std::fs::read_to_string(std::env::var("OWLPOST_DUMP_IN").unwrap()).unwrap();
+        let col = Colors::new(owlpost_core::theme::discover().into_iter().find(|t| t.id == owlpost_core::theme::MOONLIT_DARK).unwrap().palette());
+        let doc = document(&Page { messages: &[msg(1, "x", Some(&html))], expanded: &[true], remote_images: true, nonce: "n", avatar: &|_| None, dark_emails: true }, &col);
+        std::fs::write(std::env::var("OWLPOST_DUMP_OUT").unwrap(), doc).unwrap();
+    }
+
     #[test]
     fn html_bodies_are_sandboxed_and_locked_down() {
         let evil = r#"<p style="color:red">Sale!</p><img src="https://cdn.example/sale.jpg" width="600"><img src="https://track.example/pixel.gif"><script>alert(1)</script><form action="https://x"></form>"#;
         let mut m = msg(7, "Sale!", Some(evil));
         m.attachments = vec![Attachment { filename: "terms <1>.pdf".into(), mime_type: "application/pdf".into(), size: 2048 }];
-        let doc = document(&Page { messages: &[m.clone()], expanded: &[true], remote_images: false, nonce: "abc", avatar: &|_| None }, &colors());
+        let doc = document(&Page { messages: &[m.clone()], expanded: &[true], remote_images: false, nonce: "abc", avatar: &|_| None, dark_emails: true }, &colors());
         // The email is inside a sandboxed frame without allow-scripts or allow-forms.
         assert!(doc.contains("<iframe sandbox=\"allow-same-origin allow-popups allow-top-navigation-by-user-activation\""));
         assert!(!doc.contains("allow-scripts") && !doc.contains("allow-forms"));
@@ -887,7 +979,7 @@ mod tests {
         // Attachments link back to the app, names escaped.
         assert!(doc.contains("href=\"owlpost://attachment/7/0\"") && doc.contains("terms &lt;1&gt;.pdf"));
         // Loading images opens up https only for media, still no scripts.
-        let open = document(&Page { messages: &[m], expanded: &[true], remote_images: true, nonce: "abc", avatar: &|_| None }, &colors());
+        let open = document(&Page { messages: &[m], expanded: &[true], remote_images: true, nonce: "abc", avatar: &|_| None, dark_emails: true }, &colors());
         assert!(open.contains("img-src data: cid: https: http:") && !open.contains("owlpost://load-images"));
         assert!(open.contains("script-src 'nonce-abc'"));
         // The tracking pixel is gone either way, and the banner says so.
@@ -927,7 +1019,7 @@ mod tests {
     #[test]
     fn older_messages_start_folded() {
         let msgs = [msg(1, "first", None), msg(2, "second", None)];
-        let doc = document(&Page { messages: &msgs, expanded: &[false, true], remote_images: false, nonce: "n", avatar: &|_| None }, &colors());
+        let doc = document(&Page { messages: &msgs, expanded: &[false, true], remote_images: false, nonce: "n", avatar: &|_| None, dark_emails: true }, &colors());
         assert_eq!(doc.matches("<details class=card open>").count(), 1);
         assert_eq!(doc.matches("<details class=card>").count(), 1);
         // Newest on top, with the reply buttons under it, before older mail.
@@ -954,7 +1046,7 @@ mod tests {
         reply.from = owlpost_core::Contact::new("Alex Rivera", "alex@icloud.demo");
         msgs.insert(0, reply);
         for (name, remote) in [("mail-view", false), ("mail-view-images", true)] {
-            let doc = document(&Page { messages: &msgs, expanded: &[true, true], remote_images: remote, nonce: "n1", avatar: &|_| None }, &colors());
+            let doc = document(&Page { messages: &msgs, expanded: &[true, true], remote_images: remote, nonce: "n1", avatar: &|_| None, dark_emails: true }, &colors());
             std::fs::write(std::path::Path::new(&dir).join(format!("{name}.html")), doc).unwrap();
         }
     }
@@ -971,7 +1063,7 @@ mod tests {
             let (_, hosts) = strip_trackers(m.body_html.as_deref().unwrap_or(""));
             println!("{f}: snippet {:?}\n  trackers {hosts:?}", m.snippet);
             let name = std::path::Path::new(f).file_stem().unwrap().to_string_lossy().to_string();
-            let doc = document(&Page { messages: &[m], expanded: &[true], remote_images: true, nonce: "n1", avatar: &|_| None }, &colors());
+            let doc = document(&Page { messages: &[m], expanded: &[true], remote_images: true, nonce: "n1", avatar: &|_| None, dark_emails: true }, &colors());
             std::fs::write(std::path::Path::new(&dir).join(format!("{name}.html")), doc).unwrap();
         }
     }

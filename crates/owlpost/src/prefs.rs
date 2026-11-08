@@ -125,6 +125,8 @@ pub struct Prefs {
     pub html_email: bool,
     /// Load remote images without asking (trackers are always blocked).
     pub load_images: bool,
+    /// Recolour emails to match a dark theme.
+    pub dark_emails: bool,
     /// Show sender photos and logos.
     pub faces: bool,
 }
@@ -151,13 +153,14 @@ pub enum PrefsAction {
     /// Show emails as designed (HTML) or as plain text.
     SetHtmlEmail(bool),
     SetLoadImages(bool),
+    SetDarkEmails(bool),
     SetFaces(bool),
     Close,
 }
 
 impl Prefs {
     pub fn new(tab: Tab) -> Self {
-        Self { tab, install_path: String::new(), editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false, html_email: true, load_images: true, faces: true }
+        Self { tab, install_path: String::new(), editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false, html_email: true, load_images: true, dark_emails: true, faces: true }
     }
 
     #[allow(clippy::too_many_arguments)] // one window, one call site
@@ -204,7 +207,7 @@ impl Prefs {
         let mut act = PrefsAction::None;
         ui.label(RichText::new("Messages").strong().size(16.0));
         let mut html = self.html_email;
-        let tip = if cfg!(target_os = "macos") {
+        let tip = if cfg!(any(target_os = "macos", target_os = "linux")) {
             "HTML emails are shown with their layout, colours and fonts (WebKit). Scripts never run, and tracking pixels are always blocked."
         } else {
             "Coming soon on this platform: messages are shown as text for now."
@@ -218,6 +221,12 @@ impl Prefs {
                        Tracking pixels, which report when and where you open an email, are blocked either way.";
             if ui.checkbox(&mut load, "Load remote images (trackers are always blocked)").on_hover_text(tip).changed() {
                 act = PrefsAction::SetLoadImages(load);
+            }
+            let mut dark = self.dark_emails;
+            let tip = "With a dark theme, emails are recoloured to match: white backgrounds turn dark and black text turns light, \
+                       while coloured banners, buttons and pictures keep their look. Off: emails are shown on white, as designed.";
+            if ui.checkbox(&mut dark, "Match emails to a dark theme").on_hover_text(tip).changed() {
+                act = PrefsAction::SetDarkEmails(dark);
             }
         });
         let mut faces = self.faces;
