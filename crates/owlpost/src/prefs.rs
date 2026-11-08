@@ -57,17 +57,22 @@ pub struct ListSettings {
     pub quick_actions: bool,
     /// The Pinned section is folded away ("Hide" in its header).
     pub hide_pinned: bool,
+    /// Undo Send: seconds a sent message waits before it goes (0: off).
+    pub undo_send_secs: u32,
 }
+
+/// The Undo Send delays on offer.
+pub const UNDO_SEND_CHOICES: [u32; 6] = [0, 5, 10, 20, 30, 60];
 
 impl Default for ListSettings {
     fn default() -> Self {
-        Self { swipe_left: SwipeAction::Trash, swipe_right: SwipeAction::Archive, quick_actions: true, hide_pinned: false }
+        Self { swipe_left: SwipeAction::Trash, swipe_right: SwipeAction::Archive, quick_actions: true, hide_pinned: false, undo_send_secs: 10 }
     }
 }
 
 impl ListSettings {
     pub fn encode(&self) -> String {
-        format!("{},{},{},{}", self.swipe_left.key(), self.swipe_right.key(), self.quick_actions as u8, self.hide_pinned as u8)
+        format!("{},{},{},{},{}", self.swipe_left.key(), self.swipe_right.key(), self.quick_actions as u8, self.hide_pinned as u8, self.undo_send_secs)
     }
     pub fn decode(s: &str) -> Self {
         let mut d = Self::default();
@@ -78,6 +83,9 @@ impl ListSettings {
             d.quick_actions = *q != "0";
             // Added later: older settings have three fields.
             d.hide_pinned = rest.first().is_some_and(|h| *h == "1");
+            if let Some(u) = rest.get(1).and_then(|u| u.parse().ok()) {
+                d.undo_send_secs = u;
+            }
         }
         d
     }
@@ -624,6 +632,22 @@ fn list_settings(ui: &mut egui::Ui, col: &Colors, list: &mut ListSettings) {
         ))
         .small()
         .color(col.subtle),
+    );
+    ui.add_space(14.0);
+    ui.label(RichText::new("Undo Send").strong().size(16.0));
+    ui.horizontal(|ui| {
+        ui.label("Wait before sending");
+        let label = |s: u32| if s == 0 { "Off — send straight away".to_string() } else { format!("{s} seconds") };
+        egui::ComboBox::from_id_salt("undo_send").selected_text(label(list.undo_send_secs)).width(200.0).show_ui(ui, |ui| {
+            for s in UNDO_SEND_CHOICES {
+                ui.selectable_value(&mut list.undo_send_secs, s, label(s));
+            }
+        });
+    });
+    ui.label(
+        RichText::new("After you press Send, the message waits this long. Click Undo (or press ⌘Z) to get it back and keep editing.")
+            .small()
+            .color(col.subtle),
     );
 }
 

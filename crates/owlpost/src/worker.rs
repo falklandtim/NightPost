@@ -22,7 +22,7 @@ pub enum Cmd {
     /// Add (true) or remove a label.
     Label(AccountId, String, FolderId, bool),
     /// Create a folder/label, then optionally move or label a thread into it.
-    CreateFolder(AccountId, String, Option<(String, FolderUse)>),
+    CreateFolder(AccountId, String, Option<(Vec<String>, FolderUse)>),
     /// Send; the draft it was finished from (if any) is then deleted.
     Send(AccountId, OutgoingMessage, Option<Box<Message>>),
     /// Save to the Drafts folder, replacing the draft it was opened from.
@@ -59,7 +59,7 @@ impl Cmd {
     fn thread(&self) -> Option<(AccountId, String)> {
         match self {
             Cmd::SetUnread(a, k, _) | Cmd::SetStarred(a, k, _) | Cmd::Move(a, k, _) | Cmd::MoveTo(a, k, _, _) | Cmd::Label(a, k, _, _) | Cmd::Restore(a, k, _, _) | Cmd::Snooze(a, k, _) | Cmd::Unsnooze(a, k) => Some((*a, k.clone())),
-            Cmd::CreateFolder(a, _, Some((k, _))) => Some((*a, k.clone())),
+            Cmd::CreateFolder(a, _, Some((ks, _))) => ks.first().map(|k| (*a, k.clone())),
             _ => None,
         }
     }
@@ -582,10 +582,13 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
                 let acc = account(a)?;
                 let id = engine::create_folder(&store, &acc, &name)?;
                 let f = store.folder(id)?.ok_or_else(|| anyhow::anyhow!("folder vanished"))?;
-                match then {
-                    Some((key, FolderUse::Move)) => engine::move_thread_to(&store, &acc, &key, &f, None)?,
-                    Some((key, FolderUse::Label)) => engine::set_label(&store, &acc, &key, &f, true)?,
-                    None => {}
+                if let Some((keys, then)) = then {
+                    for key in keys {
+                        match then {
+                            FolderUse::Move => engine::move_thread_to(&store, &acc, &key, &f, None)?,
+                            FolderUse::Label => engine::set_label(&store, &acc, &key, &f, true)?,
+                        }
+                    }
                 }
                 let _ = ev.send(Event::Changed);
             }

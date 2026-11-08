@@ -367,11 +367,12 @@ impl Store {
     // ----- folders ----------------------------------------------------------
 
     pub fn upsert_folder(&self, account_id: AccountId, path: &str, role: FolderRole) -> Result<FolderId> {
-        let name = path.rsplit(['/', '.']).next().unwrap_or(path).to_string();
+        let name = crate::models::folder_leaf(path).to_string();
         let name = if path.eq_ignore_ascii_case("inbox") { "Inbox".to_string() } else { name };
+        // The name is refreshed too: older versions split `timson.co` at the dot.
         self.conn.execute(
             "INSERT INTO folders (account_id,path,name,role) VALUES (?1,?2,?3,?4)
-             ON CONFLICT(account_id,path) DO UPDATE SET role=excluded.role",
+             ON CONFLICT(account_id,path) DO UPDATE SET role=excluded.role, name=excluded.name",
             params![account_id, path, name, role.as_str()],
         )?;
         let id = self.conn.query_row(

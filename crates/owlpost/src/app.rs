@@ -12,6 +12,7 @@ use owlpost_core::snooze::{self, SnoozePreset};
 use owlpost_core::snooze_sync;
 use owlpost_core::theme::{self, Theme};
 use owlpost_core::*;
+use owlpost_core::smtp::OutgoingMessage;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -31,13 +32,18 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("l", "Label… (Gmail)"),
     ("j  /  ↓", "Next conversation"),
     ("k  /  ↑", "Previous conversation"),
+    ("⌘ click", "Add to / remove from the selection"),
+    ("Shift click", "Select a range"),
+    ("Shift ↓  /  Shift ↑", "Extend the selection"),
+    ("⌘ A", "Select every conversation in the list"),
     ("/", "Search"),
     ("g i", "Go to Inbox"),
-    ("⌘ Z", "Undo (move, archive, trash, label, snooze, pin…)"),
+    ("⌘ Z", "Undo (send, move, archive, trash, label, snooze, pin…)"),
+    ("⌘ S", "Save draft (in composer)"),
     ("⌘ ,", "Preferences"),
     ("⌘ W", "Close composer / Preferences"),
     ("⌘ ↩", "Send (in composer)"),
-    ("Esc", "Close / clear search"),
+    ("Esc", "Close / clear search / clear the selection"),
 ];
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -191,6 +197,16 @@ struct OpenThread {
     snoozed_until: Option<DateTime<Utc>>,
 }
 
+/// A message on its way: sent when `due` passes, unless Undo brings its
+/// composer back first.
+struct PendingSend {
+    id: u64,
+    account: AccountId,
+    out: OutgoingMessage,
+    composer: Composer,
+    due: Instant,
+}
+
 /// The calendar in the Snooze menu.
 #[derive(Clone, Debug)]
 struct SnoozePick {
@@ -231,6 +247,10 @@ enum Undo {
     /// Read state changed: each thread with what it was before.
     Unread { items: Vec<(AccountId, String, bool)> },
     Star { a: AccountId, k: String, was: bool },
+    /// One action on several selected conversations, undone together.
+    Batch { items: Vec<Undo>, what: String },
+    /// A message waiting to send (Undo Send).
+    Send { id: u64 },
 }
 
 impl Undo {
@@ -243,6 +263,8 @@ impl Undo {
             Undo::Unread { items } if items.len() > 1 => "mark as read".into(),
             Undo::Unread { items } => if items.first().is_some_and(|i| i.2) { "mark as read".into() } else { "mark as unread".into() },
             Undo::Star { .. } => "star".into(),
+            Undo::Batch { what, .. } => what.clone(),
+            Undo::Send { .. } => "send".into(),
         }
     }
 }
@@ -264,6 +286,20 @@ pub struct OwlPostApp {
     unified_drafts: i64,
     snoozed_count: i64,
     collapsed_accounts: Vec<AccountId>,
+    /// Conversations picked with ⌘- or ⇧-click. With two or more, actions
+    /// apply to all of them and the reading pane shows a summary.
+    marked: Vec<(AccountId, String)>,
+    /// Where a ⇧-click range starts.
+    anchor: Option<usize>,
+    /// Conversations just moved out of view: kept out of the list until the
+    /// move lands (so a reload mid-batch doesn't flash them back).
+    hiding: HashMap<(AccountId, String), Instant>,
+    /// Sent messages held back for a few seconds (Undo Send).
+    pending_sends: Vec<PendingSend>,
+    next_send_id: u64,
+    /// Parent folders whose subfolders are shown (see [`folder_key`]);
+    /// the rest start folded.
+    open_folders: HashSet<String>,
     selection: Selection,
     search: String,
     focus_search: bool,
@@ -343,6 +379,9 @@ const LIST_KEY: &str = "owlpost.list";
 const HTML_KEY: &str = "owlpost.html";
 const IMAGES_KEY: &str = "owlpost.images";
 const FACES_KEY: &str = "owlpost.faces";
+/// Parent folders opened in the sidebar ("<account id>\t<path>" per line).
+const OPEN_FOLDERS_KEY: &str = "owlpost.open_folders";
+const COLLAPSED_ACCOUNTS_KEY: &str = "owlpost.collapsed_accounts";
 
 impl OwlPostApp {
     pub fn new(cc: &eframe::CreationContext<'_>, store: Store, demo: bool) -> Self {
@@ -361,6 +400,12 @@ impl OwlPostApp {
         }
         if let Some(l) = get(LIST_KEY, LEGACY_LIST_KEY) {
             app.list_settings = ListSettings::decode(&l);
+        }
+        if let Some(f) = cc.storage.and_then(|s| s.get_string(OPEN_FOLDERS_KEY)) {
+            app.open_folders = f.lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+        }
+        if let Some(c) = cc.storage.and_then(|s| s.get_string(COLLAPSED_ACCOUNTS_KEY)) {
+            app.collapsed_accounts = c.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         }
         if cfg!(target_os = "macos") {
             app.titlebar_inset = 76.0;
@@ -404,6 +449,12 @@ impl OwlPostApp {
             unified_drafts: 0,
             snoozed_count: 0,
             collapsed_accounts: vec![],
+            open_folders: HashSet::new(),
+            marked: vec![],
+            anchor: None,
+            hiding: HashMap::new(),
+            pending_sends: vec![],
+            next_send_id: 1,
             selection: Selection::Unified(FolderRole::Inbox),
             search: String::new(),
             focus_search: false,
@@ -485,11 +536,29 @@ impl OwlPostApp {
         for t in &mut self.toasts {
             t.undo = false;
         }
-        match &u {
+        if let Undo::Send { id } = u {
+            self.cancel_send(id);
+            return;
+        }
+        self.undo_apply(&u);
+        self.toast(format!("Undid {}", u.describe()), false);
+        self.reload();
+    }
+
+    fn undo_apply(&mut self, u: &Undo) {
+        match u {
+            Undo::Batch { items, .. } => {
+                for i in items.iter().rev() {
+                    self.undo_apply(i);
+                }
+            }
+            Undo::Send { id } => self.cancel_send(*id),
             Undo::Moved { a, k, dest, sources, .. } => {
+                self.hiding.remove(&(*a, k.clone()));
                 self.worker.send(Cmd::Restore(*a, k.clone(), *dest, sources.clone()));
             }
             Undo::Label { a, k, folder, added, .. } => {
+                self.hiding.remove(&(*a, k.clone()));
                 self.worker.send(Cmd::Label(*a, k.clone(), *folder, !added));
             }
             Undo::Snoozed { a, k } => {
@@ -511,9 +580,222 @@ impl OwlPostApp {
                 self.worker.send(Cmd::SetStarred(*a, k.clone(), *was));
             }
         }
-        self.toast(format!("Undid {}", u.describe()), false);
-        self.reload();
     }
+
+    // ----- Undo Send ----------------------------------------------------------
+
+    /// Send now, or after the Undo Send delay (the composer is kept until then).
+    fn queue_send(&mut self, account: AccountId, out: OutgoingMessage, mut composer: Composer) {
+        let secs = self.list_settings.undo_send_secs;
+        if secs == 0 {
+            self.worker.send(Cmd::Send(account, out, composer.draft.take()));
+            return;
+        }
+        let id = self.next_send_id;
+        self.next_send_id += 1;
+        self.pending_sends.push(PendingSend { id, account, out, composer, due: Instant::now() + Duration::from_secs(secs as u64) });
+        self.undo.push(Undo::Send { id });
+    }
+
+    /// Hand messages whose delay has passed to the worker (all of them when `all`).
+    fn flush_sends(&mut self, all: bool) {
+        let now = Instant::now();
+        let (due, wait): (Vec<PendingSend>, Vec<PendingSend>) = std::mem::take(&mut self.pending_sends).into_iter().partition(|p| all || p.due <= now);
+        self.pending_sends = wait;
+        for mut p in due {
+            self.undo.retain(|u| !matches!(u, Undo::Send { id } if *id == p.id));
+            self.worker.send(Cmd::Send(p.account, p.out, p.composer.draft.take()));
+        }
+    }
+
+    /// Undo Send: bring the message back into its window.
+    fn cancel_send(&mut self, id: u64) {
+        self.undo.retain(|u| !matches!(u, Undo::Send { id: x } if *x == id));
+        match self.pending_sends.iter().position(|p| p.id == id) {
+            Some(i) => {
+                let p = self.pending_sends.remove(i);
+                self.composers.push(p.composer);
+                self.toast("Sending cancelled", false);
+            }
+            None => self.toast("Too late — that message has already gone", true),
+        }
+    }
+
+    /// Quitting with messages still waiting: send them before the app goes.
+    fn send_pending_now(&mut self) {
+        for mut p in std::mem::take(&mut self.pending_sends) {
+            let Some(acc) = self.accounts.iter().find(|a| a.id == p.account).cloned() else { continue };
+            match engine::send(&self.store, &acc, &p.out) {
+                Ok(_) => {
+                    if let Some(d) = p.composer.draft.take() {
+                        if let Some(da) = self.accounts.iter().find(|a| a.id == d.account_id) {
+                            let _ = engine::delete_draft(&self.store, da, &d);
+                        }
+                    }
+                }
+                // Keep it rather than lose it: save it as a draft.
+                Err(e) => {
+                    log::warn!("sending on quit failed: {e:#}");
+                    let _ = engine::save_draft(&self.store, &acc, &p.out, p.composer.draft.as_deref());
+                }
+            }
+        }
+    }
+
+    /// Send a held message straight away.
+    fn send_now(&mut self, id: u64) {
+        if let Some(p) = self.pending_sends.iter_mut().find(|p| p.id == id) {
+            p.due = Instant::now();
+        }
+        self.flush_sends(false);
+    }
+
+    // ----- multi-select -------------------------------------------------------
+
+    fn multi(&self) -> bool {
+        self.marked.len() >= 2
+    }
+
+    fn row_key(&self, i: usize) -> Option<(AccountId, String)> {
+        self.rows.get(i).map(|r| (r.t.account_id, r.t.thread_key.clone()))
+    }
+
+    fn is_marked(&self, a: AccountId, k: &str) -> bool {
+        self.multi() && self.marked.iter().any(|(ma, mk)| *ma == a && mk == k)
+    }
+
+    /// ⌘-click: add a conversation to the selection, or take it out.
+    fn toggle_mark(&mut self, i: usize) {
+        let Some(key) = self.row_key(i) else { return };
+        if self.marked.is_empty() {
+            if let Some(cur) = self.current() {
+                self.marked.push(cur);
+            }
+        }
+        match self.marked.iter().position(|x| *x == key) {
+            Some(p) => {
+                self.marked.remove(p);
+            }
+            None => self.marked.push(key),
+        }
+        self.anchor = Some(i);
+        self.marks_changed();
+    }
+
+    /// ⇧-click: everything from the anchor to here.
+    fn mark_range(&mut self, i: usize) {
+        let from = self.anchor.or(self.selected).unwrap_or(i);
+        let (lo, hi) = (from.min(i), from.max(i));
+        self.marked = (lo..=hi).filter_map(|j| self.row_key(j)).collect();
+        self.anchor = Some(from);
+        self.marks_changed();
+    }
+
+    /// ⇧↑ / ⇧↓: grow or shrink the selection from the anchor.
+    fn extend_marks(&mut self, d: i64) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let from = self.anchor.or(self.selected).unwrap_or(0);
+        // The moving end: the marked row furthest from the anchor.
+        let end = self
+            .marked
+            .iter()
+            .filter_map(|(a, k)| self.rows.iter().position(|r| r.t.account_id == *a && r.t.thread_key == *k))
+            .max_by_key(|&j| (j as i64 - from as i64).abs())
+            .unwrap_or(from);
+        let to = (end as i64 + d).clamp(0, self.rows.len() as i64 - 1) as usize;
+        let (lo, hi) = (from.min(to), from.max(to));
+        self.marked = (lo..=hi).filter_map(|j| self.row_key(j)).collect();
+        self.anchor = Some(from);
+        self.marks_changed();
+    }
+
+    fn select_all(&mut self) {
+        self.marked = (0..self.rows.len()).filter_map(|j| self.row_key(j)).collect();
+        self.anchor = Some(0);
+        self.marks_changed();
+    }
+
+    fn clear_marks(&mut self) {
+        self.marked.clear();
+    }
+
+    /// With several marked the reading pane shows a summary; back to one,
+    /// that conversation opens.
+    fn marks_changed(&mut self) {
+        match self.marked.len() {
+            0 => {}
+            1 => {
+                let (a, k) = self.marked.remove(0);
+                if let Some(i) = self.rows.iter().position(|r| r.t.account_id == a && r.t.thread_key == k) {
+                    let anchor = self.anchor;
+                    self.select(i);
+                    self.anchor = anchor;
+                }
+            }
+            _ => {
+                self.open = None;
+                self.selected = None;
+            }
+        }
+    }
+
+    /// The conversations an action applies to: the selection, or the open one.
+    fn targets(&self) -> Vec<(AccountId, String)> {
+        if self.multi() {
+            self.marked.clone()
+        } else {
+            self.current().into_iter().collect()
+        }
+    }
+
+    /// Run `f` on the open conversation, or on every selected one. With
+    /// several, their undos become one ⌘Z and one toast sums them up.
+    fn for_each_target(&mut self, text: impl FnOnce(usize) -> String, mut f: impl FnMut(&mut Self, AccountId, &str)) {
+        if !self.multi() {
+            if let Some((a, k)) = self.current() {
+                f(self, a, &k);
+            }
+            return;
+        }
+        let targets = std::mem::take(&mut self.marked);
+        self.open = None;
+        self.selected = None;
+        let (u0, t0) = (self.undo.len(), self.toasts.len());
+        for (a, k) in &targets {
+            f(self, *a, k);
+        }
+        let mut errors: Vec<Toast> = self.toasts.drain(t0..).filter(|t| t.error).collect();
+        errors.dedup_by(|x, y| x.text == y.text);
+        let items: Vec<Undo> = self.undo.drain(u0..).collect();
+        let n = targets.len();
+        let text = text(n);
+        if items.is_empty() {
+            self.toast(text, false);
+        } else {
+            let what = format!("{} on {n} conversations", items[0].describe());
+            self.did(text, Undo::Batch { items, what });
+        }
+        self.toasts.extend(errors);
+        // No reload here: moves finish in the background, and reloading now
+        // would show the conversations again until they do.
+    }
+
+    /// The rows behind the selection (for "are they all starred?" and such).
+    fn target_rows(&self) -> Vec<&ThreadSummary> {
+        let t = self.targets();
+        self.rows.iter().map(|r| &r.t).filter(|r| t.iter().any(|(a, k)| *a == r.account_id && *k == r.thread_key)).collect()
+    }
+
+    /// The account every selected conversation belongs to, if they share one
+    /// (folders and labels are per account).
+    fn targets_account(&self) -> Option<AccountId> {
+        let t = self.targets();
+        let a = t.first()?.0;
+        t.iter().all(|(x, _)| *x == a).then_some(a)
+    }
+
 
     fn view(&self) -> Option<MailboxView> {
         if !self.search.trim().is_empty() {
@@ -571,6 +853,13 @@ impl OwlPostApp {
                 })
                 .collect(),
         };
+        // Moved away but not yet landed: keep them hidden. Once a reload no
+        // longer finds one here, its move is done.
+        let now = Instant::now();
+        let listed: HashSet<(AccountId, &str)> = self.rows.iter().map(|r| (r.t.account_id, r.t.thread_key.as_str())).collect();
+        self.hiding.retain(|(a, k), at| now.duration_since(*at) < Duration::from_secs(60) && listed.contains(&(*a, k.as_str())));
+        let hiding = &self.hiding;
+        self.rows.retain(|r| !hiding.contains_key(&(r.t.account_id, r.t.thread_key.clone())));
         // A hidden Pinned section keeps its conversations out of the list
         // (and out of j/k), until "Show".
         self.hidden_pinned = 0;
@@ -579,6 +868,11 @@ impl OwlPostApp {
             self.rows.retain(|r| !r.t.pinned);
         }
         self.selected = keep.and_then(|(a, k)| self.rows.iter().position(|r| r.t.account_id == a && r.t.thread_key == k));
+        let rows = &self.rows;
+        self.marked.retain(|(a, k)| rows.iter().any(|r| r.t.account_id == *a && r.t.thread_key == *k));
+        if self.marked.len() < 2 {
+            self.marked.clear();
+        }
         if let Some(o) = &self.open {
             let (a, k) = (o.account_id, o.thread_key.clone());
             let msgs = self.store.thread_messages(a, &k).unwrap_or_default();
@@ -596,6 +890,8 @@ impl OwlPostApp {
 
     fn select(&mut self, idx: usize) {
         let Some(row) = self.rows.get(idx) else { return };
+        self.marked.clear();
+        self.anchor = Some(idx);
         self.selected = Some(idx);
         let (a, k) = (row.t.account_id, row.t.thread_key.clone());
         let msgs = self.store.thread_messages(a, &k).unwrap_or_default();
@@ -623,6 +919,7 @@ impl OwlPostApp {
     fn set_selection(&mut self, s: Selection) {
         self.selection = s;
         self.search.clear();
+        self.clear_marks();
         self.selected = None;
         self.open = None;
         self.reload();
@@ -649,9 +946,14 @@ impl OwlPostApp {
     }
 
     fn act_move(&mut self, role: FolderRole) {
-        if let Some((a, k)) = self.current() {
-            self.move_thread(a, &k, role);
-        }
+        let done = match role {
+            FolderRole::Archive => "Archived",
+            FolderRole::Trash => "Moved to Trash",
+            FolderRole::Spam => "Reported as spam",
+            FolderRole::Inbox => "Moved to Inbox",
+            _ => "Moved",
+        };
+        self.for_each_target(|n| format!("{done} {n} conversations"), |s, a, k| s.move_thread(a, k, role));
     }
 
     fn move_thread(&mut self, a: AccountId, k: &str, role: FolderRole) {
@@ -685,6 +987,7 @@ impl OwlPostApp {
 
     /// Drop a conversation from the list; if it was open, open the next one.
     fn remove_row(&mut self, a: AccountId, k: &str) {
+        self.hiding.insert((a, k.to_string()), Instant::now());
         if self.current().is_some_and(|(oa, ok)| oa == a && ok == k) {
             self.remove_current_and_advance();
             return;
@@ -700,6 +1003,23 @@ impl OwlPostApp {
     }
 
     fn act_star(&mut self) {
+        if self.multi() {
+            // Star them all, unless they all are already.
+            let star = !self.target_rows().iter().all(|t| t.starred);
+            self.for_each_target(
+                |n| format!("{} {n} conversations", if star { "Starred" } else { "Unstarred" }),
+                |s, a, k| {
+                    let was = s.rows.iter().find(|r| r.t.account_id == a && r.t.thread_key == k).is_some_and(|r| r.t.starred);
+                    if was != star {
+                        let _ = s.store.set_thread_starred(a, k, star);
+                        s.worker.send(Cmd::SetStarred(a, k.to_string(), star));
+                        s.undo.push(Undo::Star { a, k: k.to_string(), was });
+                    }
+                },
+            );
+            self.reload();
+            return;
+        }
         let Some((a, k)) = self.current() else { return };
         let starred = !self.open.as_ref().map(|o| o.messages.iter().any(|m| m.starred)).unwrap_or(false);
         let _ = self.store.set_thread_starred(a, &k, starred);
@@ -709,6 +1029,20 @@ impl OwlPostApp {
     }
 
     fn act_unread(&mut self) {
+        if self.multi() {
+            // Any unread among them: mark them all read; otherwise all unread.
+            let unread = !self.target_rows().iter().any(|t| t.unread);
+            let items: Vec<(AccountId, String, bool)> =
+                self.target_rows().iter().filter(|t| t.unread != unread).map(|t| (t.account_id, t.thread_key.clone(), t.unread)).collect();
+            for (a, k, _) in &items {
+                self.set_row_unread(*a, k, unread);
+            }
+            let n = self.marked.len();
+            self.clear_marks();
+            self.did(format!("Marked {n} conversations as {}", if unread { "unread" } else { "read" }), Undo::Unread { items });
+            self.reload();
+            return;
+        }
         let Some((a, k)) = self.current() else { return };
         let _ = self.store.set_thread_unread(a, &k, true);
         self.worker.send(Cmd::SetUnread(a, k.clone(), true));
@@ -719,6 +1053,21 @@ impl OwlPostApp {
     }
 
     fn act_snooze(&mut self, until: DateTime<Utc>) {
+        if self.multi() {
+            self.for_each_target(
+                |n| format!("Snoozed {n} conversations until {}", snooze::describe(until)),
+                |s, a, k| match s.store.snooze(a, k, until) {
+                    Ok(()) => {
+                        s.worker.send(Cmd::Snooze(a, k.to_string(), until));
+                        s.undo.push(Undo::Snoozed { a, k: k.to_string() });
+                    }
+                    Err(e) => s.toast(format!("Couldn't snooze: {e:#}"), true),
+                },
+            );
+            self.snoozed_count = self.store.snoozed_count().unwrap_or(0);
+            self.reload();
+            return;
+        }
         let Some((a, k)) = self.current() else { return };
         // Hidden here at once; the worker files it on the server.
         if let Err(e) = self.store.snooze(a, &k, until) {
@@ -755,9 +1104,22 @@ impl OwlPostApp {
     }
 
     fn act_pin(&mut self) {
-        if let Some((a, k)) = self.current() {
-            self.toggle_pin(a, &k);
+        if !self.multi() {
+            if let Some((a, k)) = self.current() {
+                self.toggle_pin(a, &k);
+            }
+            return;
         }
+        // Pin them all, unless they all are already.
+        let pin = !self.target_rows().iter().all(|t| t.pinned);
+        self.for_each_target(
+            |n| format!("{} {n} conversations", if pin { "Pinned" } else { "Unpinned" }),
+            |s, a, k| {
+                if s.store.is_pinned(a, k).unwrap_or(false) != pin {
+                    s.toggle_pin(a, k);
+                }
+            },
+        );
     }
 
     fn set_row_unread(&mut self, a: AccountId, k: &str, unread: bool) {
@@ -968,6 +1330,9 @@ impl OwlPostApp {
             }
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            if self.multi() && !ctx.wants_keyboard_input() {
+                self.clear_marks();
+            }
             if !self.search.is_empty() {
                 self.search.clear();
                 self.reload();
@@ -985,6 +1350,11 @@ impl OwlPostApp {
         // ⌘Z: undo the last action (text fields keep ⌘Z for their own undo).
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z)) {
             self.undo_last();
+            return;
+        }
+        // ⌘A: select every conversation in the list.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::A)) {
+            self.select_all();
             return;
         }
         let text: String = ctx.input(|i| {
@@ -1023,13 +1393,14 @@ impl OwlPostApp {
             "p" => self.act_pin(),
             "v" | "l" => {
                 let gmail = self.current().and_then(|(a, _)| self.accounts.iter().find(|x| x.id == a)).is_some_and(|a| a.is_gmail());
-                if self.open.is_some() && (text == "v" || gmail) {
+                let gmail = gmail || (self.multi() && self.targets_account().and_then(|a| self.accounts.iter().find(|x| x.id == a)).is_some_and(|a| a.is_gmail()));
+                if (self.open.is_some() || (self.multi() && self.targets_account().is_some())) && (text == "v" || gmail) {
                     let id = if text == "v" { "picker_open_move" } else { "picker_open_label" };
                     ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new(id), true));
                 }
             }
             "b" | "h" => {
-                if self.open.is_some() {
+                if self.open.is_some() || self.multi() {
                     ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("snooze_open"), true));
                 }
             }
@@ -1039,11 +1410,12 @@ impl OwlPostApp {
             "g" => self.pending_g = Some(Instant::now()),
             _ => {}
         }
+        let shift = ctx.input(|i| i.modifiers.shift);
         if key(Key::ArrowDown) {
-            self.move_selection(1);
+            if shift { self.extend_marks(1) } else { self.move_selection(1) }
         }
         if key(Key::ArrowUp) {
-            self.move_selection(-1);
+            if shift { self.extend_marks(-1) } else { self.move_selection(-1) }
         }
         if key(Key::Delete) || key(Key::Backspace) {
             self.act_move(FolderRole::Trash);
@@ -1067,8 +1439,11 @@ impl OwlPostApp {
     /// sidebar toggle | list title + list actions | message actions + search.
     fn toolbar(&mut self, ctx: &egui::Context) {
         let col = self.colors.clone();
-        let current = self.current();
-        let open = current.is_some();
+        let multi = self.multi();
+        // With several selected, folders and labels need them all in one account.
+        let current = if multi { self.targets_account().and_then(|a| self.marked.iter().find(|m| m.0 == a).cloned()) } else { self.current() };
+        let single = self.current().is_some() && !multi;
+        let open = single || multi;
         let starred = self.open.as_ref().map(|o| o.messages.iter().any(|m| m.starred)).unwrap_or(false);
         let snoozed = self.open.as_ref().and_then(|o| o.snoozed_until);
         let pinned = current.as_ref().map(|(a, k)| self.store.is_pinned(*a, k).unwrap_or(false)).unwrap_or(false);
@@ -1127,9 +1502,9 @@ impl OwlPostApp {
                         ui,
                         &col,
                         &[
-                            Item::new(Icon::Reply, "Reply (r)").enabled(open),
-                            Item::new(Icon::ReplyAll, "Reply all (a)").enabled(open),
-                            Item::new(Icon::Forward, "Forward (f)").enabled(open),
+                            Item::new(Icon::Reply, "Reply (r)").enabled(single),
+                            Item::new(Icon::ReplyAll, "Reply all (a)").enabled(single),
+                            Item::new(Icon::Forward, "Forward (f)").enabled(single),
                         ],
                     );
                     for (i, resp) in r.iter().enumerate() {
@@ -1146,8 +1521,8 @@ impl OwlPostApp {
                             Item::new(if pinned { Icon::PinFilled } else { Icon::Pin }, if pinned { "Unpin (p)" } else { "Pin to top (p)" })
                                 .enabled(open)
                                 .active(pinned),
-                            Item::new(Icon::Folder, "Move to folder (v)").enabled(open),
-                            Item::new(Icon::Tag, if gmail || !open { "Label (l)" } else { "Labels are a Gmail feature — use Move on this account" }).enabled(open && gmail),
+                            Item::new(Icon::Folder, if current.is_none() && multi { "Move: select conversations from one account" } else { "Move to folder (v)" }).enabled(current.is_some()),
+                            Item::new(Icon::Tag, if gmail || !open { "Label (l)" } else { "Labels are a Gmail feature — use Move on this account" }).enabled(current.is_some() && gmail),
                             Item::new(Icon::Trash, "Move to Trash (#)").enabled(open),
                             Item::new(Icon::More, "More").enabled(open),
                         ],
@@ -1310,15 +1685,26 @@ impl OwlPostApp {
             self.picker_query.clear();
         }
         match (pick, create) {
-            (Some((f, add)), _) => match kind {
-                FolderUse::Move => self.move_to(a, &k, &f),
-                FolderUse::Label => self.set_label(a, &k, &f, add),
-            },
-            (None, Some(name)) => {
-                self.worker.send(Cmd::CreateFolder(a, name.clone(), Some((k.clone(), kind))));
-                if kind == FolderUse::Move {
-                    self.remove_row(a, &k);
+            (Some((f, add)), _) => {
+                let name = folder_label(&f);
+                match kind {
+                    FolderUse::Move => self.for_each_target(|n| format!("Moved {n} conversations to {name}"), |s, a, k| s.move_to(a, k, &f)),
+                    FolderUse::Label => self.for_each_target(
+                        |n| if add { format!("Labelled {n} conversations “{name}”") } else { format!("Removed “{name}” from {n} conversations") },
+                        |s, a, k| s.set_label(a, k, &f, add),
+                    ),
                 }
+            }
+            (None, Some(name)) => {
+                let keys: Vec<String> = self.targets().into_iter().map(|(_, k)| k).collect();
+                let keys = if keys.is_empty() { vec![k.clone()] } else { keys };
+                self.worker.send(Cmd::CreateFolder(a, name.clone(), Some((keys.clone(), kind))));
+                if kind == FolderUse::Move {
+                    for k in &keys {
+                        self.remove_row(a, k);
+                    }
+                }
+                self.clear_marks();
                 self.toast(format!("Created “{name}”"), false);
             }
             _ => {}
@@ -1452,15 +1838,48 @@ impl OwlPostApp {
                                 self.set_selection(Selection::Folder(f.id));
                             }
                         }
-                        for f in folders.iter().filter(|f| f.role == FolderRole::Other && !snooze_sync::is_internal_folder(&f.path)) {
-                            let depth = f.path.matches(['/', '.']).count();
+                        // Custom folders as a tree: parents fold away their subfolders.
+                        let others: Vec<&Folder> = folders.iter().filter(|f| f.role == FolderRole::Other && !snooze_sync::is_internal_folder(&f.path)).collect();
+                        let tree = FolderTree::new(&others);
+                        let mut toggle: Option<String> = None;
+                        for (i, f) in others.iter().enumerate() {
+                            if tree.ancestors[i].iter().any(|&p| !self.open_folders.contains(&folder_key(a.id, &others[p].path))) {
+                                continue;
+                            }
+                            let key = folder_key(a.id, &f.path);
+                            let parent = tree.has_children(i);
+                            let expanded = self.open_folders.contains(&key);
+                            // A folded parent counts the unread mail inside it too.
+                            let count = if parent && !expanded { f.unread + tree.descendants(i).map(|d| others[d].unread).sum::<i64>() } else { f.unread };
                             let sel = self.selection == Selection::Folder(f.id) && self.search.is_empty();
                             ui.horizontal(|ui| {
-                                ui.add_space(depth as f32 * 14.0);
-                                if nav_item(ui, &col, Icon::Folder, &f.name, f.unread, sel) {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.add_space(tree.ancestors[i].len() as f32 * 14.0);
+                                let (slot, r) = ui.allocate_exact_size(egui::vec2(16.0, 31.0), if parent { Sense::click() } else { Sense::hover() });
+                                if parent {
+                                    let c = slot.center() + egui::vec2(2.0, 0.0);
+                                    let fg = if r.hovered() { col.sidebar_text } else { col.sidebar_text.gamma_multiply(0.6) };
+                                    let pts = if expanded {
+                                        vec![c + egui::vec2(-3.5, -1.5), c + egui::vec2(0.0, 2.0), c + egui::vec2(3.5, -1.5)]
+                                    } else {
+                                        vec![c + egui::vec2(-1.5, -3.5), c + egui::vec2(2.0, 0.0), c + egui::vec2(-1.5, 3.5)]
+                                    };
+                                    ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.4_f32, fg)));
+                                    let r = r.on_hover_text(if expanded { "Hide subfolders" } else { "Show subfolders" });
+                                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{} {}", if expanded { "Collapse" } else { "Expand" }, f.name)));
+                                    if r.clicked() {
+                                        toggle = Some(key.clone());
+                                    }
+                                }
+                                if nav_item(ui, &col, Icon::Folder, &f.name, count, sel) {
                                     self.set_selection(Selection::Folder(f.id));
                                 }
                             });
+                        }
+                        if let Some(k) = toggle {
+                            if !self.open_folders.remove(&k) {
+                                self.open_folders.insert(k);
+                            }
                         }
                         ui.add_space(8.0);
                     }
@@ -1745,7 +2164,7 @@ impl OwlPostApp {
                         }
                         let rect_c = rect.translate(egui::vec2(offset, 0.0));
 
-                        let selected = self.selected == Some(i);
+                        let selected = self.selected == Some(i) || self.is_marked(t.account_id, &t.thread_key);
                         let hovered = resp.contains_pointer() && !swiping;
                         // A soft highlight (Moonlit) keeps the normal text colours;
                         // a strong one (most Mailspring themes) inverts them.
@@ -1921,7 +2340,14 @@ impl OwlPostApp {
                 });
                 if let Some(i) = clicked {
                     if quick.is_none() {
-                        self.select(i);
+                        let m = ctx.input(|i| i.modifiers);
+                        if m.command {
+                            self.toggle_mark(i);
+                        } else if m.shift {
+                            self.mark_range(i);
+                        } else {
+                            self.select(i);
+                        }
                     }
                 }
                 if toggle_pinned {
@@ -1971,6 +2397,62 @@ impl OwlPostApp {
         }
     }
 
+    /// The reading pane while several conversations are selected.
+    fn selection_summary(&mut self, ui: &mut egui::Ui, col: &Colors) {
+        let n = self.marked.len();
+        let rows = self.target_rows();
+        let unread = rows.iter().any(|t| t.unread);
+        let starred = rows.iter().all(|t| t.starred);
+        let pinned = rows.iter().all(|t| t.pinned);
+        let mut act = None;
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.3).max(40.0));
+            ui.label(RichText::new(format!("{n} conversations selected")).size(26.0).color(col.heading));
+            ui.add_space(18.0);
+            let buttons: [(Icon, &str, u8); 6] = [
+                (Icon::Done, "Archive", 0),
+                (Icon::Trash, "Trash", 1),
+                (Icon::Done, if unread { "Mark as read" } else { "Mark as unread" }, 2),
+                (Icon::Star, if starred { "Unstar" } else { "Star" }, 3),
+                (if pinned { Icon::PinFilled } else { Icon::Pin }, if pinned { "Unpin" } else { "Pin" }, 4),
+                (Icon::Snooze, "Snooze…", 5),
+            ];
+            // Centre the row of buttons (each is its label plus 50 points).
+            let gap = 8.0;
+            let w: f32 = buttons
+                .iter()
+                .map(|(_, l, _)| ui.painter().layout_no_wrap(l.to_string(), egui::FontId::proportional(13.5), col.text).size().x + 50.0 + gap)
+                .sum::<f32>()
+                - gap;
+            let avail = ui.available_width();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.add_space(((avail - w) / 2.0).max(0.0));
+                for (icon, label, id) in buttons {
+                    if icons::labeled(ui, icon, label, col.text, col.bg).clicked() {
+                        act = Some(id);
+                    }
+                }
+            });
+            ui.add_space(16.0);
+            ui.label(RichText::new("⌘-click to add or remove · Shift-click for a range · ⌘A for all · Esc to clear").small().color(col.very_subtle));
+            ui.add_space(6.0);
+            if ui.add(egui::Button::new(RichText::new("Clear selection").color(col.link)).frame(false)).clicked() {
+                act = Some(9);
+            }
+        });
+        match act {
+            Some(0) => self.act_move(FolderRole::Archive),
+            Some(1) => self.act_move(FolderRole::Trash),
+            Some(2) => self.act_unread(),
+            Some(3) => self.act_star(),
+            Some(4) => self.act_pin(),
+            Some(5) => ui.ctx().memory_mut(|m| m.data.insert_temp(egui::Id::new("snooze_open"), true)),
+            Some(9) => self.clear_marks(),
+            _ => {}
+        }
+    }
+
     fn reader(&mut self, ctx: &egui::Context) {
         let col = self.colors.clone();
         // The conversation reads like a page: messages sit straight on the
@@ -1978,6 +2460,10 @@ impl OwlPostApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(col.bg))
             .show(ctx, |ui| {
+                if self.multi() {
+                    self.selection_summary(ui, &col);
+                    return;
+                }
                 let Some(open) = &self.open else {
                     ui.centered_and_justified(|ui| {
                         let unread = self.unified_unread.get(&FolderRole::Inbox).copied().unwrap_or(0);
@@ -2324,9 +2810,8 @@ impl OwlPostApp {
                         i += 1;
                         continue;
                     }
-                    let draft = self.composers[i].draft.take();
-                    self.worker.send(Cmd::Send(acc, *out, draft));
-                    self.composers.remove(i);
+                    let composer = self.composers.remove(i);
+                    self.queue_send(acc, *out, composer);
                 }
                 ComposerAction::SaveDraft(acc, out) => {
                     let replace = self.composers[i].draft.take();
@@ -2480,6 +2965,44 @@ impl OwlPostApp {
                     let _ = demo::remove(&self.store);
                     self.set_selection(Selection::Unified(FolderRole::Inbox));
                 }
+            }
+        }
+        // Messages waiting to send (Undo Send).
+        if !self.pending_sends.is_empty() {
+            let screen = ctx.content_rect();
+            let x = if self.list_right > self.sidebar_right { (self.sidebar_right + self.list_right) / 2.0 } else { screen.center().x };
+            let lift = 20.0 + self.toasts.len() as f32 * 48.0;
+            let mut undo = None;
+            let mut now = None;
+            egui::Area::new(egui::Id::new("pending_sends"))
+                .pivot(egui::Align2::CENTER_BOTTOM)
+                .fixed_pos(egui::pos2(x, screen.bottom() - lift))
+                .order(egui::Order::Tooltip)
+                .show(ctx, |ui| {
+                    for p in &self.pending_sends {
+                        let left = p.due.saturating_duration_since(Instant::now()).as_secs_f32().ceil() as u32;
+                        let subject = if p.out.subject.trim().is_empty() { "(no subject)".to_string() } else { p.out.subject.clone() };
+                        egui::Frame::new().fill(egui::Color32::from_rgb(40, 44, 52)).corner_radius(8).inner_margin(egui::Margin::symmetric(16, 10)).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Label::new(RichText::new(format!("Sending “{subject}” in {left} s")).color(egui::Color32::WHITE)).truncate());
+                                ui.add_space(10.0);
+                                let blue = egui::Color32::from_rgb(130, 180, 255);
+                                if ui.add(egui::Button::new(RichText::new("Undo").strong().color(blue)).frame(false)).on_hover_text("⌘Z").clicked() {
+                                    undo = Some(p.id);
+                                }
+                                if ui.add(egui::Button::new(RichText::new("Send now").color(blue)).frame(false)).clicked() {
+                                    now = Some(p.id);
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+            if let Some(id) = undo {
+                self.cancel_send(id);
+            }
+            if let Some(id) = now {
+                self.send_now(id);
             }
         }
         // Toasts.
@@ -2698,6 +3221,47 @@ fn folder_label(f: &Folder) -> String {
         FolderRole::Other => f.path.clone(),
         FolderRole::All => "Archive (All Mail)".into(),
         r => r.label().into(),
+    }
+}
+
+/// How a folder is remembered as open in the sidebar.
+fn folder_key(account: AccountId, path: &str) -> String {
+    format!("{account}\t{path}")
+}
+
+/// Custom folders as a tree, by path. A folder's ancestors are the folders
+/// above it that exist (a server may list `A/B/C` without `A/B`).
+struct FolderTree {
+    /// For each folder, the indexes of its ancestors, nearest first.
+    ancestors: Vec<Vec<usize>>,
+}
+
+impl FolderTree {
+    fn new(folders: &[&Folder]) -> Self {
+        let index: HashMap<&str, usize> = folders.iter().enumerate().map(|(i, f)| (f.path.as_str(), i)).collect();
+        let ancestors = folders
+            .iter()
+            .map(|f| {
+                let mut out = vec![];
+                let mut p = owlpost_core::folder_parent(&f.path);
+                while let Some(path) = p {
+                    if let Some(&i) = index.get(path.as_str()) {
+                        out.push(i);
+                    }
+                    p = owlpost_core::folder_parent(&path);
+                }
+                out
+            })
+            .collect();
+        Self { ancestors }
+    }
+
+    fn has_children(&self, i: usize) -> bool {
+        self.ancestors.iter().any(|a| a.first() == Some(&i))
+    }
+
+    fn descendants(&self, i: usize) -> impl Iterator<Item = usize> + '_ {
+        self.ancestors.iter().enumerate().filter(move |(_, a)| a.contains(&i)).map(|(j, _)| j)
     }
 }
 
@@ -3057,6 +3621,10 @@ fn human_size(b: usize) -> String {
 }
 
 impl eframe::App for OwlPostApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.send_pending_now();
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // The web view hangs off the native window, so it's made here.
         if !self.mail_view_tried {
@@ -3082,6 +3650,10 @@ impl eframe::App for OwlPostApp {
         storage.set_string(HTML_KEY, if self.html_email { "1" } else { "0" }.into());
         storage.set_string(IMAGES_KEY, if self.load_images { "load" } else { "ask" }.into());
         storage.set_string(FACES_KEY, if self.faces.enabled.get() { "1" } else { "0" }.into());
+        let mut open: Vec<&String> = self.open_folders.iter().collect();
+        open.sort();
+        storage.set_string(OPEN_FOLDERS_KEY, open.into_iter().cloned().collect::<Vec<_>>().join("\n"));
+        storage.set_string(COLLAPSED_ACCOUNTS_KEY, self.collapsed_accounts.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","));
     }
 }
 
@@ -3089,6 +3661,10 @@ impl OwlPostApp {
     pub fn frame(&mut self, ctx: &egui::Context) {
         self.follow_system_theme(ctx);
         self.handle_events();
+        if !self.pending_sends.is_empty() {
+            self.flush_sends(false);
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         self.web_rect = None;
         self.mail_view_events(ctx);
         if self.accounts.is_empty() {
@@ -3519,6 +4095,131 @@ mod ui_tests {
     }
 
     #[test]
+    fn multi_select_and_batch_actions() {
+        let mut h = harness("owlpost-light");
+        h.run_steps(2);
+        let before = h.state().rows.len();
+        // ⌘-click two conversations (the first one opens, the second joins it).
+        h.state_mut().toggle_mark(0);
+        assert!(!h.state().multi() && h.state().open.is_some(), "one marked: it just opens");
+        h.state_mut().toggle_mark(1);
+        assert_eq!(h.state().marked.len(), 2);
+        assert!(h.state().open.is_none());
+        // ⇧-click extends from the anchor.
+        h.state_mut().mark_range(3);
+        assert_eq!(h.state().marked.len(), 3, "rows 1 to 3");
+        h.run_steps(3);
+        save(&mut h, "multi-select");
+        let keys: Vec<String> = h.state().marked.iter().map(|m| m.1.clone()).collect();
+        h.state_mut().act_move(FolderRole::Archive);
+        h.run_steps(2);
+        assert_eq!(h.state().rows.len(), before - 3, "all three archived");
+        assert!(h.state().toasts.iter().any(|t| t.undo && t.text == "Archived 3 conversations"), "one toast for the batch");
+        assert!(h.state().marked.is_empty());
+        // Let the moves finish, then one ⌘Z brings back all three.
+        let back = |h: &mut Harness<'static, OwlPostApp>, n: usize| {
+            for _ in 0..150 {
+                h.run_steps(1);
+                h.state_mut().reload();
+                if h.state().rows.len() == n {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        assert!(back(&mut h, before - 3));
+        h.state_mut().undo_last();
+        assert!(back(&mut h, before), "⌘Z restores the whole batch");
+        assert!(keys.iter().all(|k| h.state().rows.iter().any(|r| &r.t.thread_key == k)));
+        // ⌘A, then Esc.
+        h.run_steps(1);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+        h.run_steps(1);
+        assert_eq!(h.state().marked.len(), before);
+        h.key_press(Key::Escape);
+        h.run_steps(1);
+        assert!(h.state().marked.is_empty());
+    }
+
+    #[test]
+    fn undo_send_holds_the_message() {
+        let mut h = harness("owlpost-light");
+        h.run_steps(2);
+        let acc = h.state().accounts[0].clone();
+        let sent = |h: &Harness<'static, OwlPostApp>| h.state().store.threads(&MailboxView::Unified(FolderRole::Sent), "subject:Lunch", 50).unwrap().len();
+        let compose = |id| {
+            let mut c = Composer::new(id, &acc);
+            c.to = "ann@example.com".into();
+            c.subject = "Lunch?".into();
+            c.body = "Free on Friday?".into();
+            c
+        };
+        h.state_mut().list_settings.undo_send_secs = 10;
+        let c = compose(50);
+        let out = c.draft();
+        h.state_mut().queue_send(acc.id, out.clone(), c);
+        h.run_steps(2);
+        assert_eq!(h.state().pending_sends.len(), 1, "held, not sent");
+        save(&mut h, "undo-send");
+        // ⌘Z brings the composer back.
+        h.state_mut().undo_last();
+        assert!(h.state().pending_sends.is_empty());
+        assert_eq!(h.state().composers.len(), 1, "the message is back in its window");
+        assert_eq!(h.state().composers[0].body, "Free on Friday?");
+        // Send now goes straight away.
+        let c = h.state_mut().composers.remove(0);
+        h.state_mut().queue_send(acc.id, out, c);
+        let id = h.state().pending_sends[0].id;
+        h.state_mut().send_now(id);
+        assert!(h.state().pending_sends.is_empty());
+        let mut ok = false;
+        for _ in 0..100 {
+            h.run_steps(1);
+            if sent(&h) > 0 {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ok, "sent");
+    }
+
+    #[test]
+    fn sidebar_folders_fold() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness("owlpost-light");
+        h.run_steps(2);
+        let gmail = h.state().accounts.iter().find(|a| a.is_gmail()).unwrap().id;
+        for path in ["Projects", "Projects/Website", "Projects/Website/2026", "timson.co"] {
+            h.state().store.upsert_folder(gmail, path, FolderRole::Other).unwrap();
+        }
+        // A tall window and the other account folded, so the folders are on screen.
+        h.set_size(egui::vec2(1280.0, 1100.0));
+        let others_acc: Vec<AccountId> = h.state().accounts.iter().filter(|a| a.id != gmail).map(|a| a.id).collect();
+        h.state_mut().collapsed_accounts = others_acc;
+        h.state_mut().reload();
+        h.run_steps(2);
+        // Parents start folded; dotted names stay whole.
+        let f = h.state().folders[&gmail].clone();
+        assert_eq!(f.iter().find(|x| x.path == "timson.co").unwrap().name, "timson.co");
+        let others: Vec<&Folder> = f.iter().filter(|x| x.role == FolderRole::Other).collect();
+        let tree = FolderTree::new(&others);
+        let at = |p: &str| others.iter().position(|x| x.path == p).unwrap();
+        assert!(tree.has_children(at("Projects")) && !tree.has_children(at("timson.co")));
+        assert_eq!(tree.ancestors[at("Projects/Website/2026")], vec![at("Projects/Website"), at("Projects")]);
+        assert_eq!(tree.descendants(at("Projects")).count(), 3, "Website, 2026 and OwlPost");
+        assert!(h.query_by_label("Expand Projects").is_some());
+        assert!(h.query_by_label("Expand Website").is_none(), "hidden inside Projects");
+        save(&mut h, "sidebar-folded");
+        h.get_by_label("Expand Projects").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Collapse Projects").is_some());
+        assert!(h.query_by_label("Expand Website").is_some(), "now showing");
+        save(&mut h, "sidebar-unfolded");
+    }
+
+    #[test]
     fn snooze_calendar_picks_a_time() {
         use egui_kittest::kittest::Queryable;
         let mut h = harness("owlpost-light");
@@ -3752,8 +4453,8 @@ mod ui_tests {
         h.state_mut().act_snooze(Utc::now() + chrono::Duration::hours(3));
         assert!(!in_list(&h, &key));
         h.state_mut().undo_last();
-        h.run_steps(1);
-        assert!(in_list(&h, &key), "unsnoozed");
+        // The snooze may still be finishing in the background; the undo follows it.
+        assert!(wait_for(&mut h, &key, true), "unsnoozed");
         h.state_mut().toggle_pin(acct, &key);
         assert!(h.state().store.is_pinned(acct, &key).unwrap());
         h.state_mut().undo_last();

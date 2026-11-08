@@ -225,7 +225,7 @@ impl FolderRole {
 
     /// A role guessed from the folder name alone.
     pub fn from_name(name: &str) -> Self {
-        let leaf = name.rsplit(['/', '.']).next().unwrap_or(name).to_ascii_lowercase();
+        let leaf = folder_leaf(name).to_ascii_lowercase();
         match leaf.as_str() {
             "inbox" => FolderRole::Inbox,
             "sent" | "sent mail" | "sent items" | "sent messages" => FolderRole::Sent,
@@ -239,6 +239,30 @@ impl FolderRole {
             _ => FolderRole::Other,
         }
     }
+}
+
+/// The levels of a folder path. Most servers (Gmail, iCloud, Fastmail)
+/// separate levels with `/`; servers that keep everything under `INBOX.`
+/// use dots. Elsewhere a dot is part of the name (`timson.co`, `Unroll.me`).
+pub fn folder_segments(path: &str) -> Vec<&str> {
+    if path.contains('/') {
+        path.split('/').collect()
+    } else if path.len() > 6 && path[..6].eq_ignore_ascii_case("inbox.") {
+        path.split('.').collect()
+    } else {
+        vec![path]
+    }
+}
+
+/// The last level of a folder path: what the sidebar shows.
+pub fn folder_leaf(path: &str) -> &str {
+    folder_segments(path).last().copied().unwrap_or(path)
+}
+
+/// The path of a folder's parent, if it's nested.
+pub fn folder_parent(path: &str) -> Option<String> {
+    let segs = folder_segments(path);
+    (segs.len() > 1).then(|| segs[..segs.len() - 1].join(if path.contains('/') { "/" } else { "." }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,6 +438,18 @@ pub fn normalize_subject(subject: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_paths() {
+        assert_eq!(folder_leaf("timson.co"), "timson.co");
+        assert_eq!(folder_leaf("Unroll.me/Unsubscribed"), "Unsubscribed");
+        assert_eq!(folder_parent("Home/6 Ferry Street/The Wall"), Some("Home/6 Ferry Street".to_string()));
+        assert_eq!(folder_parent("timson.co"), None);
+        assert_eq!(folder_parent("INBOX.Receipts.2026"), Some("INBOX.Receipts".to_string()));
+        assert_eq!(folder_leaf("INBOX.Receipts"), "Receipts");
+        assert_eq!(FolderRole::from_name("INBOX.Sent"), FolderRole::Sent);
+        assert_eq!(FolderRole::from_name("[Gmail]/Sent Mail"), FolderRole::Sent);
+    }
 
     #[test]
     fn parses_address_lists() {
