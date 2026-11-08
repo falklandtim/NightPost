@@ -416,6 +416,9 @@ impl OwlPostApp {
         // Built-in theme ids were renamed along with the app.
         let saved = get(THEME_KEY, LEGACY_THEME_KEY).map(|id| id.replace("springpost-", "owlpost-"));
         let mut app = Self::with_context(&cc.egui_ctx, saved, store, demo);
+        // Formatted composer windows (WebKit / WebKitGTK); without them the
+        // composer stays in egui.
+        crate::web_host::init(&cc.egui_ctx);
         if let Some(h) = cc.storage.and_then(|s| s.get_string(HTML_KEY)) {
             app.html_email = h != "0";
         }
@@ -444,6 +447,13 @@ impl OwlPostApp {
             if let Some(i) = app.rows.iter().position(|r| r.t.subject.contains(q.as_str())) {
                 app.select(i);
             }
+        }
+        // …and OWLPOST_COMPOSE=new|reply opens a composer.
+        #[cfg(debug_assertions)]
+        match std::env::var("OWLPOST_COMPOSE").as_deref() {
+            Ok("reply") => app.compose_reply(0),
+            Ok(_) => app.compose_new(),
+            Err(_) => {}
         }
         app
     }
@@ -623,6 +633,7 @@ impl OwlPostApp {
         }
         let id = self.next_send_id;
         self.next_send_id += 1;
+        composer.hide_window();
         self.pending_sends.push(PendingSend { id, account, out, composer, due: Instant::now() + Duration::from_secs(secs as u64) });
         self.undo.push(Undo::Send { id });
     }
@@ -645,6 +656,7 @@ impl OwlPostApp {
         match self.pending_sends.iter().position(|p| p.id == id) {
             Some(i) => {
                 let p = self.pending_sends.remove(i);
+                p.composer.show_window();
                 self.composers.push(p.composer);
                 self.toast("Sending cancelled", false);
             }
@@ -3010,6 +3022,7 @@ impl OwlPostApp {
     }
 
     fn windows(&mut self, ctx: &egui::Context) {
+        crate::composer::route_web_events();
         self.original_windows(ctx);
         let col = self.colors.clone();
         // Composers.

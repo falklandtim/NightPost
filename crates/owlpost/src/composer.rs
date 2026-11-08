@@ -72,6 +72,39 @@ pub struct Composer {
     save_requested: bool,
     /// "Saving…", "Saved 14:02" or a problem, shown in the footer.
     pub status: Option<String>,
+    /// The formatted editor (a web window), when the system has one.
+    pub(crate) web: WebMode,
+    /// What the editor holds: its HTML (signature and quote included) and
+    /// the same as plain text.
+    web_html: String,
+    web_text: String,
+    /// Quoted or forwarded text for the editor, as HTML.
+    quote_html: String,
+    /// A reopened draft's formatted body.
+    initial_html: Option<String>,
+    /// What the editor was last told, so it's only told about changes.
+    web_told: WebTold,
+    /// The page has sent its contents at least once.
+    web_reported: bool,
+}
+
+/// Where the composer is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WebMode {
+    /// Not tried yet: opens on the first frame if web windows are available.
+    Untried,
+    /// In its own web window.
+    Open,
+    /// The egui composer (no web windows here, or opening one failed).
+    Off,
+}
+
+#[derive(Default)]
+struct WebTold {
+    title: String,
+    status: Option<String>,
+    blocked: Option<String>,
+    attachments: String,
 }
 
 /// Drafts save themselves this long after you stop typing.
@@ -121,6 +154,13 @@ impl Composer {
             saving: false,
             save_requested: false,
             status: None,
+            web: WebMode::Untried,
+            web_html: String::new(),
+            web_text: String::new(),
+            quote_html: String::new(),
+            initial_html: None,
+            web_told: WebTold::default(),
+            web_reported: false,
         }
     }
 
@@ -150,6 +190,8 @@ impl Composer {
             None => c.body = body.trim_end().to_string(),
         }
         c.attach_paths(parts.attachments);
+        // In the formatted editor the draft opens as it was written.
+        c.initial_html = m.body_html.as_deref().map(editor_html);
         c.draft = Some(Box::new(m.clone()));
         c.focus_first = c.to.trim().is_empty();
         c.focus_body = !c.focus_first;
@@ -192,7 +234,18 @@ impl Composer {
     /// The editable fields, to tell whether anything changed.
     fn snapshot(&self) -> String {
         let files: Vec<&str> = self.attachments.iter().map(|a| a.name.as_str()).collect();
-        format!("{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{:?}\u{1}{}\u{1}{:?}", self.account_id, self.to, self.cc, self.bcc, self.subject, files, self.body, self.signature.as_ref().map(|s| s.id))
+        format!(
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{:?}\u{1}{}\u{1}{:?}\u{1}{}",
+            self.account_id,
+            self.to,
+            self.cc,
+            self.bcc,
+            self.subject,
+            files,
+            self.body,
+            self.signature.as_ref().map(|s| s.id),
+            self.web_html
+        )
     }
 
     pub fn reply(id: u64, account: &Account, m: &Message, all: bool) -> Self {
@@ -205,6 +258,7 @@ impl Composer {
         c.in_reply_to = d.in_reply_to;
         c.references = d.references;
         c.tail = owlpost_core::smtp::quote(m);
+        c.quote_html = quote_html(m);
         c.title = if all { "Reply All".into() } else { "Reply".into() };
         // Cursor goes in the body when the recipients are already set.
         c.focus_first = false;
@@ -224,6 +278,7 @@ impl Composer {
             m.body_text
         );
         c.show_tail = true;
+        c.quote_html = forward_html(m);
         c.title = "Forward".into();
         c
     }
@@ -235,6 +290,21 @@ impl Composer {
     /// The message as sent: your text, the signature, then any quoted text.
     /// An HTML signature also goes in as real HTML (see `html_signature`).
     pub(crate) fn draft(&self) -> OutgoingMessage {
+        if self.web == WebMode::Open {
+            // The formatted editor: its HTML, with plain text alongside.
+            return OutgoingMessage {
+                to: Contact::parse_list(&self.to),
+                cc: Contact::parse_list(&self.cc),
+                bcc: Contact::parse_list(&self.bcc),
+                subject: self.subject.clone(),
+                body: self.web_text.replace('\u{a0}', " ").trim_end().to_string(),
+                in_reply_to: self.in_reply_to.clone(),
+                references: self.references.clone(),
+                html_signature: None,
+                attachments: self.attachments.iter().map(|a| a.outgoing(self.image_size)).collect(),
+                html: Some(email_document(&self.web_html)),
+            };
+        }
         let mut body = self.body.trim_end().to_string();
         let mut html_signature = None;
         if let Some(sig) = &self.signature {
@@ -257,6 +327,7 @@ impl Composer {
             references: self.references.clone(),
             html_signature,
             attachments: self.attachments.iter().map(|a| a.outgoing(self.image_size)).collect(),
+            html: None,
         }
     }
 
@@ -322,6 +393,26 @@ impl Composer {
         if !self.sig_resolved {
             self.sig_resolved = true;
             self.signature = sigs.default_for(self.account_id).cloned();
+        }
+        if self.web == WebMode::Untried {
+            self.web = if crate::web_host::available() {
+                match self.open_web(accounts, col, sigs) {
+                    Ok(()) => WebMode::Open,
+                    Err(e) => {
+                        log::warn!("formatted composer unavailable: {e:#}");
+                        WebMode::Off
+                    }
+                }
+            } else {
+                WebMode::Off
+            };
+        }
+        if self.web == WebMode::Open {
+            if !self.web_reported {
+                // Wait for the page's first report before tracking changes.
+                self.tracked = false;
+            }
+            return self.web_ui(ctx, store, sigs);
         }
         let title = if self.subject.trim().is_empty() { self.title.clone() } else { self.subject.clone() };
         let id = egui::ViewportId::from_hash_of(("composer", self.id));
@@ -905,5 +996,481 @@ mod tests {
         // A plain signature: no HTML part.
         c.set_signature(Some(&plain("— A")));
         assert!(c.draft().html_signature.is_none());
+    }
+}
+
+
+impl Drop for Composer {
+    fn drop(&mut self) {
+        if self.web == WebMode::Open {
+            crate::web_host::close(self.id);
+        }
+    }
+}
+
+/// `#rrggbb` for CSS.
+fn hex(c: egui::Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+/// A signature as the editor shows it (and sends it).
+fn signature_html(sig: &Signature) -> String {
+    if sig.html {
+        editor_html(&sig.body)
+    } else {
+        owlpost_core::smtp::text_to_html(&sig.text())
+    }
+}
+
+/// HTML that's safe to put in the editor: the body of a document, without
+/// scripts, styles, frames or event handlers. (The editor's security policy
+/// blocks scripts anyway; this keeps a draft from restyling the window.)
+fn editor_html(html: &str) -> String {
+    let mut out = owlpost_core::parse::clean_signature_html(html);
+    for tag in ["iframe", "object", "embed", "form"] {
+        let lower = out.to_ascii_lowercase();
+        if let Some(i) = lower.find(&format!("<{tag}")) {
+            let end = lower[i..].find(&format!("</{tag}>")).map(|e| i + e + tag.len() + 3).or_else(|| lower[i..].find('>').map(|e| i + e + 1)).unwrap_or(out.len());
+            out.replace_range(i..end, "");
+        }
+    }
+    strip_event_handlers(&out)
+}
+
+/// Remove `on…="…"` attributes and `javascript:` links.
+fn strip_event_handlers(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let b = html.as_bytes();
+    let mut i = 0;
+    let mut in_tag = false;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'<' {
+            in_tag = true;
+        } else if c == b'>' {
+            in_tag = false;
+        }
+        // An attribute starting with "on" after whitespace, inside a tag.
+        if in_tag && c.is_ascii_whitespace() && b.get(i + 1).is_some_and(|x| x.eq_ignore_ascii_case(&b'o')) && b.get(i + 2).is_some_and(|x| x.eq_ignore_ascii_case(&b'n')) {
+            let mut j = i + 3;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
+                j += 1;
+            }
+            let mut k = j;
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < b.len() && b[k] == b'=' && j > i + 3 {
+                k += 1;
+                while k < b.len() && b[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                let end = match b.get(k) {
+                    Some(q @ (b'"' | b'\'')) => html[k + 1..].find(*q as char).map(|e| k + 1 + e + 1).unwrap_or(b.len()),
+                    _ => html[k..].find(|ch: char| ch.is_ascii_whitespace() || ch == '>').map(|e| k + e).unwrap_or(b.len()),
+                };
+                i = end;
+                continue;
+            }
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    // Byte-wise copy above is only right for ASCII; redo safely if needed.
+    let out = if html.is_ascii() { out } else { strip_event_handlers_utf8(html) };
+    out.replace("javascript:", "")
+}
+
+fn strip_event_handlers_utf8(html: &str) -> String {
+    // Same rules, working on chars so multi-byte text survives.
+    let chars: Vec<char> = html.chars().collect();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    let mut in_tag = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+        }
+        if in_tag && c.is_whitespace() && chars.get(i + 1).is_some_and(|x| x.eq_ignore_ascii_case(&'o')) && chars.get(i + 2).is_some_and(|x| x.eq_ignore_ascii_case(&'n')) {
+            let mut j = i + 3;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '-') {
+                j += 1;
+            }
+            let mut k = j;
+            while k < chars.len() && chars[k].is_whitespace() {
+                k += 1;
+            }
+            if k < chars.len() && chars[k] == '=' && j > i + 3 {
+                k += 1;
+                while k < chars.len() && chars[k].is_whitespace() {
+                    k += 1;
+                }
+                i = match chars.get(k) {
+                    Some(&q @ ('"' | '\'')) => chars[k + 1..].iter().position(|&x| x == q).map(|e| k + 1 + e + 1).unwrap_or(chars.len()),
+                    _ => chars[k..].iter().position(|x| x.is_whitespace() || *x == '>').map(|e| k + e).unwrap_or(chars.len()),
+                };
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// The quoted message under a reply (as text: someone else's HTML never
+/// goes into the editor).
+fn quote_html(m: &Message) -> String {
+    let when = m.date.with_timezone(&chrono::Local).format("%a, %e %b %Y at %H:%M");
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        "<div class=\"owlpost-quote\"><div>On {when}, {} wrote:</div><blockquote type=\"cite\">{}</blockquote></div>",
+        esc(&m.from.display()),
+        owlpost_core::smtp::text_to_html(m.body_text.trim_end())
+    )
+}
+
+/// The forwarded message under a forward.
+fn forward_html(m: &Message) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        "<div class=\"owlpost-quote\"><div>---------- Forwarded message ---------</div><div>From: {}</div><div>Date: {}</div><div>Subject: {}</div><div>To: {}</div><br>{}</div>",
+        esc(&m.from.to_header()),
+        esc(&style::long_date(m.date)),
+        esc(&m.subject),
+        esc(&Contact::join(&m.to)),
+        owlpost_core::smtp::text_to_html(m.body_text.trim_end())
+    )
+}
+
+/// The editor's HTML as a whole email.
+fn email_document(inner: &str) -> String {
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
+<style>blockquote{{margin:6px 0 6px 2px;padding-left:12px;border-left:3px solid #d0d4da;color:#555}}img{{max-width:100%;height:auto}}</style></head>\
+<body><div class=\"owlpost-body\" style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45\">{inner}</div></body></html>"
+    )
+}
+
+/// A one-off token for the editor page's script.
+fn nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    format!("{:016x}{:016x}", h.finish(), std::collections::hash_map::RandomState::new().build_hasher().finish())
+}
+
+impl Composer {
+    /// Open the formatted editor in its own window.
+    fn open_web(&mut self, accounts: &[Account], col: &Colors, sigs: &SignatureBook) -> anyhow::Result<()> {
+        let accounts: Vec<serde_json::Value> = accounts.iter().map(|a| serde_json::json!({"id": a.id, "label": format!("{} <{}>", a.display_name, a.email)})).collect();
+        let signatures: Vec<serde_json::Value> =
+            sigs.list.iter().map(|s| serde_json::json!({"id": s.id, "label": if s.html { format!("{}  (HTML)", s.title) } else { s.title.clone() }})).collect();
+        // What you'd typed in the egui composer carries over (undo, tests).
+        let html = match &self.initial_html {
+            Some(h) => h.clone(),
+            None => {
+                let typed = if self.body.trim().is_empty() { String::new() } else { format!("<div>{}</div>", owlpost_core::smtp::text_to_html(self.body.trim_end())) };
+                format!("{typed}{}", self.quote_html)
+            }
+        };
+        let colors = serde_json::json!({
+            "bg": hex(col.bg), "bg2": hex(col.bg_secondary), "text": hex(col.text), "subtle": hex(col.subtle),
+            "border": hex(col.border), "accent": hex(col.button_emphasis), "accent-text": hex(col.button_emphasis_text),
+            "hover": if col.p.dark { "rgba(255,255,255,0.08)" } else { "rgba(0,0,0,0.06)" }, "danger": hex(col.error),
+        });
+        let init = serde_json::json!({
+            "accounts": accounts,
+            "account": self.account_id,
+            "to": self.to, "cc": self.cc, "bcc": self.bcc, "subject": self.subject,
+            "html": html,
+            "signatures": signatures,
+            "signature": self.signature.as_ref().map(|s| s.id.to_string()).unwrap_or_default(),
+            "signatureHtml": if self.initial_html.is_some() { None } else { self.signature.as_ref().map(signature_html) },
+            "attachments": self.attachment_list(),
+            "hasPhotos": self.attachments.iter().any(|a| a.resizable()),
+            "imageSize": image_size_key(self.image_size),
+            "focusBody": !self.to.trim().is_empty(),
+            "colors": colors,
+        });
+        // `</` would end the script early.
+        let init = init.to_string().replace("</", "<\\/");
+        let nonce = nonce();
+        let page = include_str!("../assets/composer.html").replace("/*NONCE*/", &nonce).replace("/*INIT*/{}", &init);
+        let title = if self.subject.trim().is_empty() { self.title.clone() } else { self.subject.clone() };
+        let bg = col.bg;
+        crate::web_host::open(self.id, crate::web_host::WindowSpec { title: title.clone(), width: 760.0, height: 640.0, html: page, background: (bg.r(), bg.g(), bg.b()) })?;
+        self.web_told.title = title;
+        self.web_html = html;
+        Ok(())
+    }
+
+    /// Attachments as the editor lists them.
+    fn attachment_list(&self) -> Vec<serde_json::Value> {
+        self.attachments
+            .iter()
+            .map(|a| {
+                let size = a.bytes(self.image_size).len();
+                let shown = if a.resizable() && self.image_size != ImageSize::Actual && size != a.data.len() {
+                    format!("{} (was {})", human_size(size), human_size(a.data.len()))
+                } else {
+                    human_size(size)
+                };
+                let thumb = if a.is_image() {
+                    owlpost_core::email_view::picture_max(&a.bytes(ImageSize::Small), 96).ok().map(|p| {
+                        use base64::Engine;
+                        format!("data:{};base64,{}", p.mime, base64::engine::general_purpose::STANDARD.encode(&p.data))
+                    })
+                } else {
+                    None
+                };
+                serde_json::json!({"name": a.name, "size": shown, "thumb": thumb})
+            })
+            .collect()
+    }
+
+    fn tell_attachments(&mut self) {
+        let list = serde_json::Value::Array(self.attachment_list());
+        let key = format!("{list}{:?}", self.image_size);
+        if key != self.web_told.attachments {
+            let photos = self.attachments.iter().any(|a| a.resizable());
+            crate::web_host::eval(self.id, &format!("owl.setAttachments({list}, {photos})"));
+            self.web_told.attachments = key;
+        }
+    }
+
+    /// One frame of the formatted composer: act on what the page sent, keep
+    /// it up to date, and say what the app should do.
+    fn web_ui(&mut self, ctx: &egui::Context, store: &Store, sigs: &SignatureBook) -> ComposerAction {
+        let mut action = ComposerAction::None;
+        let msgs = self.web_inbox_take();
+        for m in msgs {
+            match m {
+                WebMsg::Close => self.request_close(&mut action),
+                WebMsg::Json(v) => self.web_message(&v, store, sigs, &mut action),
+            }
+        }
+        // Background resizes: keep the list and Send in step.
+        for a in &self.attachments {
+            for size in [ImageSize::Small, self.image_size] {
+                let ctx = ctx.clone();
+                a.prepare(size, move || ctx.request_repaint());
+            }
+        }
+        self.tell_attachments();
+        let blocked = self.can_send().err();
+        if blocked != self.web_told.blocked {
+            let arg = blocked.as_deref().map(crate::web_host::js_string).unwrap_or_else(|| "null".into());
+            crate::web_host::eval(self.id, &format!("owl.sendState({arg})"));
+            self.web_told.blocked = blocked;
+        }
+        if self.status != self.web_told.status {
+            crate::web_host::eval(self.id, &format!("owl.setStatus({})", crate::web_host::js_string(self.status.as_deref().unwrap_or(""))));
+            self.web_told.status = self.status.clone();
+        }
+        let title = if self.subject.trim().is_empty() { self.title.clone() } else { self.subject.clone() };
+        if title != self.web_told.title {
+            crate::web_host::set_title(self.id, &title);
+            self.web_told.title = title;
+        }
+        // Autosave bookkeeping, as in the egui composer (from the page's
+        // first report on).
+        let snap = self.snapshot();
+        if !self.tracked {
+        } else if snap != self.last_seen {
+            self.last_seen = snap;
+            self.last_change = std::time::Instant::now();
+        }
+        action
+    }
+
+    fn web_inbox_take(&mut self) -> Vec<WebMsg> {
+        WEB_INBOX.with(|q| q.borrow_mut().remove(&self.id).unwrap_or_default())
+    }
+
+    fn web_message(&mut self, v: &serde_json::Value, store: &Store, sigs: &SignatureBook, action: &mut ComposerAction) {
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        match v.get("t").and_then(|t| t.as_str()).unwrap_or("") {
+            "state" => {
+                if let Ok(id) = s("from").parse() {
+                    self.account_id = id;
+                }
+                self.to = s("to");
+                self.cc = s("cc");
+                self.bcc = s("bcc");
+                self.subject = s("subject");
+                self.web_html = s("html");
+                self.web_text = s("text");
+                // What you wrote, without signature and quote: for "is it empty?".
+                self.body = s("typed");
+                // The page's first report is the starting point, not a change
+                // (an untouched reply saves nothing).
+                if !self.web_reported {
+                    self.web_reported = true;
+                    self.mark_saved();
+                }
+            }
+            "from" => {
+                if let Ok(id) = s("id").parse::<AccountId>() {
+                    self.account_id = id;
+                    if !self.sig_touched {
+                        self.signature = sigs.default_for(id).cloned();
+                        let html = self.signature.as_ref().map(signature_html).unwrap_or_default();
+                        crate::web_host::eval(self.id, &format!("owl.setSignature({})", crate::web_host::js_string(&html)));
+                    }
+                }
+            }
+            "signature" => {
+                self.sig_touched = true;
+                self.signature = s("id").parse().ok().and_then(|id| sigs.get(id)).cloned();
+                let html = self.signature.as_ref().map(signature_html).unwrap_or_default();
+                crate::web_host::eval(self.id, &format!("owl.setSignature({})", crate::web_host::js_string(&html)));
+            }
+            "send" => {
+                if self.can_send().is_ok() && self.web_text_ready() {
+                    *action = ComposerAction::Send(self.account_id, Box::new(self.draft()));
+                }
+            }
+            "ready" => {
+                // Debug builds: OWLPOST_COMPOSE_SCRIPT runs in the page once it's
+                // loaded (for testing the editor end to end).
+                #[cfg(debug_assertions)]
+                if let Ok(js) = std::env::var("OWLPOST_COMPOSE_SCRIPT") {
+                    crate::web_host::eval(self.id, &js);
+                }
+            }
+            "save" => self.save_requested = true,
+            "discard" => *action = ComposerAction::DeleteDraft,
+            "close" => self.request_close(action),
+            "attach" => {
+                if let Some(paths) = rfd::FileDialog::new().set_title("Attach Files").pick_files() {
+                    self.attach_paths(paths);
+                }
+            }
+            "insertImage" => {
+                let picked = rfd::FileDialog::new().set_title("Insert Picture").add_filter("Pictures", &["png", "jpg", "jpeg", "gif", "webp"]).pick_file();
+                if let Some(data) = picked.and_then(|p| std::fs::read(p).ok()) {
+                    // Big photos are sized down for the body; GIFs stay as they are.
+                    let url = match owlpost_core::email_view::picture_max(&data, 1600) {
+                        Ok(p) if !looks_like_gif(&data) => data_url(&p.mime, &p.data),
+                        _ => data_url(if looks_like_gif(&data) { "image/gif" } else { "image/png" }, &data),
+                    };
+                    crate::web_host::eval(self.id, &format!("owl.insertImage({})", crate::web_host::js_string(&url)));
+                }
+            }
+            "files" => {
+                use base64::Engine;
+                for f in v.get("files").and_then(|f| f.as_array()).into_iter().flatten() {
+                    let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("attachment");
+                    if let Some(data) = f.get("data").and_then(|d| d.as_str()).and_then(|d| base64::engine::general_purpose::STANDARD.decode(d).ok()) {
+                        self.attachments.push(Attached::new(name, data));
+                    }
+                }
+            }
+            "remove" => {
+                if let Some(i) = v.get("index").and_then(|i| i.as_u64()).map(|i| i as usize).filter(|i| *i < self.attachments.len()) {
+                    self.attachments.remove(i);
+                }
+            }
+            "imageSize" => {
+                self.image_size = match s("value").as_str() {
+                    "large" => ImageSize::Large,
+                    "medium" => ImageSize::Medium,
+                    "small" => ImageSize::Small,
+                    _ => ImageSize::Actual,
+                };
+            }
+            "suggest" => {
+                let list: Vec<serde_json::Value> =
+                    store.suggest_contacts(&s("prefix"), 8).unwrap_or_default().into_iter().map(|c| serde_json::json!({"name": c.name, "email": c.email})).collect();
+                crate::web_host::eval(self.id, &format!("owl.suggest({}, {})", crate::web_host::js_string(&s("field")), serde_json::Value::Array(list)));
+            }
+            _ => {}
+        }
+    }
+
+    /// The page has reported its contents at least once.
+    fn web_text_ready(&self) -> bool {
+        !self.web_html.is_empty() || !self.web_text.is_empty() || !self.to.is_empty()
+    }
+
+    /// Hide the window while the message waits to send (Undo Send).
+    pub fn hide_window(&self) {
+        if self.web == WebMode::Open {
+            crate::web_host::hide(self.id);
+        }
+    }
+
+    /// Show it again (Undo).
+    pub fn show_window(&self) {
+        if self.web == WebMode::Open {
+            crate::web_host::show(self.id);
+        }
+    }
+}
+
+fn looks_like_gif(data: &[u8]) -> bool {
+    data.starts_with(b"GIF8")
+}
+
+fn data_url(mime: &str, data: &[u8]) -> String {
+    use base64::Engine;
+    format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))
+}
+
+fn image_size_key(s: ImageSize) -> &'static str {
+    match s {
+        ImageSize::Actual => "actual",
+        ImageSize::Large => "large",
+        ImageSize::Medium => "medium",
+        ImageSize::Small => "small",
+    }
+}
+
+/// Something a composer's web window said.
+pub enum WebMsg {
+    Json(serde_json::Value),
+    /// Its close button was clicked.
+    Close,
+}
+
+thread_local! {
+    /// Messages from web windows, by composer id, waiting for its next frame.
+    static WEB_INBOX: std::cell::RefCell<std::collections::HashMap<u64, Vec<WebMsg>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Sort the host's events into each composer's inbox (once per frame).
+pub fn route_web_events() {
+    for e in crate::web_host::poll() {
+        let (id, msg) = match e {
+            crate::web_host::HostEvent::Message(id, json) => match serde_json::from_str(&json) {
+                Ok(v) => (id, WebMsg::Json(v)),
+                Err(_) => continue,
+            },
+            crate::web_host::HostEvent::CloseRequested(id) => (id, WebMsg::Close),
+        };
+        WEB_INBOX.with(|q| q.borrow_mut().entry(id).or_default().push(msg));
+    }
+}
+
+#[cfg(test)]
+mod web_tests {
+    use super::*;
+
+    #[test]
+    fn editor_html_is_defanged() {
+        let h = editor_html(r#"<html><head><style>body{color:red}</style></head><body><p onclick="x()" class=a>Hi</p><img src=x onerror=alert(1)><a href="javascript:evil()">l</a><script>bad()</script><iframe src=x></iframe></body></html>"#);
+        assert!(!h.contains("onclick") && !h.contains("onerror") && !h.contains("javascript:") && !h.contains("<script") && !h.contains("<iframe") && !h.contains("color:red"), "{h}");
+        assert!(h.contains("<p class=a>Hi</p>"), "{h}");
+        assert_eq!(editor_html("<p onmouseover='x'>Kia ōra</p>"), "<p>Kia ōra</p>");
+    }
+
+    #[test]
+    fn email_document_wraps_the_editor() {
+        let d = email_document("<b>Hi</b>");
+        assert!(d.starts_with("<!DOCTYPE html>") && d.contains("<b>Hi</b>") && d.contains("owlpost-body"));
     }
 }

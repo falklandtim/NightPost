@@ -604,6 +604,7 @@ impl Server {
                     attachments,
                     in_reply_to: draft.in_reply_to,
                     references: draft.references,
+                    html: None,
                 };
                 if smtp::encoded_size(&out) > smtp::SIZE_LIMIT {
                     return Err(anyhow!("attachments are too large to email (limit about 25 MB)"));
@@ -701,6 +702,7 @@ pub fn reply_draft(account: &Account, m: &Message, reply_all: bool) -> OutgoingM
         references,
         html_signature: None,
         attachments: vec![],
+        html: None,
     }
 }
 

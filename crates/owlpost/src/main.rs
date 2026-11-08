@@ -11,6 +11,7 @@ mod icons;
 mod onboarding;
 mod prefs;
 mod style;
+mod web_host;
 mod worker;
 
 use anyhow::Result;

@@ -23,6 +23,11 @@ pub struct OutgoingMessage {
     pub html_signature: Option<HtmlSignature>,
     #[serde(default)]
     pub attachments: Vec<OutgoingAttachment>,
+    /// The formatted body as a whole HTML document (from the formatted
+    /// composer). Pictures in it as `data:` URLs are sent as inline parts.
+    /// `body` stays the plain-text version.
+    #[serde(default)]
+    pub html: Option<String>,
 }
 
 /// A file sent with a message.
@@ -53,7 +58,62 @@ pub const SIZE_LIMIT: usize = 25 * 1024 * 1024;
 
 /// Roughly how big the message will be on the wire.
 pub fn encoded_size(out: &OutgoingMessage) -> usize {
-    out.body.len() + out.attachments.iter().map(|a| a.data.len() * 4 / 3).sum::<usize>()
+    out.body.len() + out.html.as_ref().map_or(0, String::len) + out.attachments.iter().map(|a| a.data.len() * 4 / 3).sum::<usize>()
+}
+
+/// A picture placed in the body: sent as an inline part the HTML refers to.
+struct InlineImage {
+    cid: String,
+    content_type: String,
+    data: Vec<u8>,
+}
+
+/// Turn `src="data:image/…;base64,…"` pictures into `cid:` references
+/// (many mail apps, Gmail among them, don't show data: URLs) and return
+/// the pictures to attach inline.
+fn inline_images(html: &str, domain: &str) -> (String, Vec<InlineImage>) {
+    use base64::Engine;
+    let mut out = String::with_capacity(html.len());
+    let mut images: Vec<InlineImage> = Vec::new();
+    let mut rest = html;
+    while let Some(at) = rest.find("data:image/") {
+        let (before, from) = rest.split_at(at);
+        // Only inside an attribute value: the URL ends at the closing quote.
+        let quote = before.chars().last().filter(|c| *c == '"' || *c == '\'');
+        let end = match quote {
+            Some(q) => from.find(q).unwrap_or(from.len()),
+            None => {
+                out.push_str(before);
+                out.push_str("data:image/");
+                rest = &from["data:image/".len()..];
+                continue;
+            }
+        };
+        let url = &from[..end];
+        let parsed = url.split_once(',').and_then(|(meta, data)| {
+            let ct = meta.strip_prefix("data:")?.strip_suffix(";base64")?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()?;
+            Some((ct.to_string(), bytes))
+        });
+        out.push_str(before);
+        match parsed {
+            Some((ct, bytes)) => {
+                let cid = match images.iter().find(|i| i.data == bytes) {
+                    Some(i) => i.cid.clone(),
+                    None => {
+                        let cid = format!("image{}.{}@{domain}", images.len() + 1, chrono::Utc::now().timestamp_millis());
+                        images.push(InlineImage { cid: cid.clone(), content_type: ct, data: bytes });
+                        cid
+                    }
+                };
+                out.push_str(&format!("cid:{cid}"));
+            }
+            None => out.push_str(url),
+        }
+        rest = &from[end..];
+    }
+    out.push_str(rest);
+    (out, images)
 }
 
 /// The MIME type for a file name, by extension.
@@ -181,13 +241,28 @@ fn build_with(account: &Account, out: &OutgoingMessage, draft: bool) -> Result<(
     if !out.references.is_empty() {
         b = b.references(out.references.iter().map(|r| format!("<{r}>")).collect::<Vec<_>>().join(" "));
     }
-    let email = match (html_body(out), out.attachments.is_empty()) {
-        (Some(html), true) => b.multipart(MultiPart::alternative_plain_html(out.body.clone(), html))?,
+    // The formatted composer's HTML, or the plain text with an HTML signature.
+    let html = out.html.clone().or_else(|| html_body(out));
+    // Text and HTML versions; pictures in the body ride along inline.
+    let alternative = |html: String| -> MultiPart {
+        let (html, images) = inline_images(&html, domain);
+        if images.is_empty() {
+            return MultiPart::alternative_plain_html(out.body.clone(), html);
+        }
+        let mut related = MultiPart::related().singlepart(SinglePart::html(html));
+        for img in images {
+            let ct = ContentType::parse(&img.content_type).unwrap_or_else(|_| ContentType::parse("application/octet-stream").expect("valid"));
+            related = related.singlepart(lettre::message::Attachment::new_inline(img.cid).body(img.data, ct));
+        }
+        MultiPart::alternative().singlepart(SinglePart::plain(out.body.clone())).multipart(related)
+    };
+    let email = match (html, out.attachments.is_empty()) {
+        (Some(html), true) => b.multipart(alternative(html))?,
         (None, true) => b.header(ContentType::TEXT_PLAIN).body(out.body.clone())?,
         // With attachments: the text (and HTML) first, then each file.
         (html, false) => {
             let mut mixed = match html {
-                Some(html) => MultiPart::mixed().multipart(MultiPart::alternative_plain_html(out.body.clone(), html)),
+                Some(html) => MultiPart::mixed().multipart(alternative(html)),
                 None => MultiPart::mixed().singlepart(SinglePart::plain(out.body.clone())),
             };
             for a in &out.attachments {
@@ -255,6 +330,39 @@ pub fn quote(original: &crate::models::Message) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatted_html_with_pictures() {
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG fake");
+        let account = Account {
+            id: 1,
+            display_name: "Me".into(),
+            email: "me@example.com".into(),
+            username: "me@example.com".into(),
+            imap: crate::models::ServerConfig { host: "imap.example.com".into(), port: 993, security: Security::Tls },
+            smtp: crate::models::ServerConfig { host: "smtp.example.com".into(), port: 465, security: Security::Tls },
+            color: "#000".into(),
+            signature: String::new(),
+            demo: false,
+            auth: crate::models::Auth::Password,
+        };
+        let out = OutgoingMessage {
+            to: vec![Contact::new("Ann", "ann@example.com")],
+            subject: "Look".into(),
+            body: "Hello there".into(),
+            html: Some(format!("<p><b>Hello</b> there</p><img src=\"data:image/png;base64,{png}\"><img src='data:image/png;base64,{png}'>")),
+            ..Default::default()
+        };
+        let (_, raw) = build(&account, &out).unwrap();
+        let raw = String::from_utf8_lossy(&raw);
+        assert!(raw.contains("multipart/alternative") && raw.contains("multipart/related"), "{raw}");
+        assert!(raw.contains("Content-ID: <image1.") && !raw.contains("Content-ID: <image2."), "the same picture is sent once");
+        assert!(!raw.contains("data:image/png"), "no data: URLs left in the HTML");
+        let parsed = crate::parse::parse_message(raw.as_bytes(), 1, 1, 1).unwrap();
+        assert!(parsed.body_html.unwrap().contains("<b>Hello</b>"));
+        assert_eq!(parsed.body_text.trim(), "Hello there");
+    }
     use crate::models::*;
 
     #[test]

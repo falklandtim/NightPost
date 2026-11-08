@@ -4,9 +4,9 @@
 #
 #   scripts/install-linux.sh
 #
-# Needs Rust plus the OpenSSL and D-Bus development files:
-#   Fedora:  sudo dnf install openssl-devel dbus-devel pkgconf-pkg-config
-#   Arch:    sudo pacman -S --needed openssl dbus pkgconf
+# Needs Rust plus the OpenSSL, D-Bus and WebKitGTK development files:
+#   Fedora:  sudo dnf install openssl-devel dbus-devel pkgconf-pkg-config webkit2gtk4.1-devel gtk3-devel libsoup3-devel javascriptcoregtk4.1-devel hunspell-en
+#   Arch:    sudo pacman -S --needed openssl dbus pkgconf webkit2gtk-4.1 gtk3 hunspell-en_us
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
