@@ -299,6 +299,12 @@ fn seed_account(store: &Store, account: &Account, seeds: Vec<Seed>, roles: &[(&s
                 .unwrap_or_default(),
             unread: s.unread,
             starred: s.starred,
+            // The newsletter and the club's mail show off the tabs.
+            category: match s.from.1 {
+                _ if s.id == NEWSLETTER_ID => crate::category::PROMOTIONS,
+                e if e.contains("running") => crate::category::SOCIAL,
+                _ => crate::category::PRIMARY,
+            },
         };
         m.thread_key = store.resolve_thread_key(account.id, &m.message_id, &m.in_reply_to, &m.references)?;
         store.insert_message(&m)?;

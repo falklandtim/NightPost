@@ -416,6 +416,7 @@ pub fn parse_message(raw: &[u8], account_id: AccountId, folder_id: FolderId, uid
     let in_reply_to = header_ids(msg.in_reply_to()).into_iter().next().unwrap_or_default();
     let references = header_ids(msg.references());
 
+    let category = crate::category::classify(&msg);
     let body_html = msg.body_html(0).map(|s| s.to_string());
     let body_text = match msg.body_text(0) {
         Some(t) if !t.trim().is_empty() => t.to_string(),
@@ -453,6 +454,7 @@ pub fn parse_message(raw: &[u8], account_id: AccountId, folder_id: FolderId, uid
         attachments,
         unread: true,
         starred: false,
+        category,
     })
 }
 

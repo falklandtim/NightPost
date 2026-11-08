@@ -268,6 +268,8 @@ enum Undo {
     /// Read state changed: each thread with what it was before.
     Unread { items: Vec<(AccountId, String, bool)> },
     Star { a: AccountId, k: String, was: bool },
+    /// A sender rule changed: what it was before (None: automatic).
+    SenderRule { email: String, was: Option<u8> },
     /// One action on several selected conversations, undone together.
     Batch { items: Vec<Undo>, what: String },
     /// A message waiting to send (Undo Send).
@@ -284,6 +286,7 @@ impl Undo {
             Undo::Unread { items } if items.len() > 1 => "mark as read".into(),
             Undo::Unread { items } => if items.first().is_some_and(|i| i.2) { "mark as read".into() } else { "mark as unread".into() },
             Undo::Star { .. } => "star".into(),
+            Undo::SenderRule { .. } => "sorting".into(),
             Undo::Batch { what, .. } => what.clone(),
             Undo::Send { .. } => "send".into(),
         }
@@ -369,6 +372,10 @@ pub struct OwlPostApp {
     html_email: bool,
     /// Load remote images straight away (trackers are stripped regardless).
     load_images: bool,
+    /// The Inbox tab showing (an `owlpost_core::category` value).
+    category: u8,
+    /// Unread conversations in each Inbox tab.
+    tab_unread: [i64; 3],
     /// Recolour HTML emails to match a dark theme.
     dark_emails: bool,
     /// Where the web view goes this frame (the reading pane below the subject).
@@ -533,6 +540,8 @@ impl OwlPostApp {
             html_email: true,
             load_images: true,
             dark_emails: true,
+            category: owlpost_core::category::PRIMARY,
+            tab_unread: [0; 3],
             web_rect: None,
             remote_images: HashSet::new(),
             pending_input: vec![],
@@ -626,6 +635,7 @@ impl OwlPostApp {
                 let _ = self.store.set_thread_starred(*a, k, *was);
                 self.worker.send(Cmd::SetStarred(*a, k.clone(), *was));
             }
+            Undo::SenderRule { email, was } => self.put_sender_rule(email, *was),
         }
     }
 
@@ -887,7 +897,16 @@ impl OwlPostApp {
         self.sigs = SignatureBook::load(&self.store);
 
         let keep = self.selected.and_then(|i| self.rows.get(i)).map(|r| (r.t.account_id, r.t.thread_key.clone()));
-        let query = format!("{} {}", self.search, self.filter.token());
+        let mut query = format!("{} {}", self.search, self.filter.token());
+        if self.tabs_shown() {
+            query.push_str(&format!(" category:{}", owlpost_core::category::name(self.category)));
+            if let Some(v) = self.view() {
+                for c in owlpost_core::category::ALL {
+                    let q = format!("is:unread category:{}", owlpost_core::category::name(c));
+                    self.tab_unread[c as usize] = self.store.threads(&v, &q, 500).map(|t| t.len() as i64).unwrap_or(0);
+                }
+            }
+        }
         self.rows = match self.view() {
             Some(v) => self
                 .store
@@ -975,6 +994,54 @@ impl OwlPostApp {
             expanded: expanded_default(&msgs),
             messages: msgs,
         });
+    }
+
+    /// The Inbox tabs (Primary, Promotions, Social) show over an Inbox,
+    /// unified or one account's, when not searching.
+    fn tabs_shown(&self) -> bool {
+        self.search.trim().is_empty()
+            && match &self.selection {
+                Selection::Unified(r) => *r == FolderRole::Inbox,
+                Selection::Folder(id) => self.folders.values().flatten().any(|f| f.id == *id && f.role == FolderRole::Inbox),
+                Selection::Snoozed => false,
+            }
+    }
+
+    /// Always sort this sender's mail into `category` (None: automatic),
+    /// here at once and on the server in the background.
+    fn put_sender_rule(&mut self, email: &str, category: Option<u8>) {
+        let rule = owlpost_core::snooze_sync::SenderRule {
+            email: email.to_lowercase(),
+            category: category.unwrap_or(0),
+            updated: Utc::now().timestamp(),
+            removed: category.is_none(),
+        };
+        let _ = self.store.put_sender_rule(&rule);
+        self.worker.send(Cmd::SortSender(email.to_lowercase(), category));
+        self.reload();
+    }
+
+    /// Sort a sender (undoable), from the list's context menu.
+    fn sort_sender(&mut self, email: &str, category: Option<u8>) {
+        let was = self.store.sender_rule(email).ok().flatten();
+        if was == category {
+            return;
+        }
+        self.put_sender_rule(email, category);
+        let text = match category {
+            Some(c) => format!("Mail from {email} goes to {}", owlpost_core::category::label(c)),
+            None => format!("Mail from {email} is sorted automatically"),
+        };
+        self.did(text, Undo::SenderRule { email: email.to_string(), was });
+    }
+
+    /// List everything from one address (a search, so Esc or clearing it goes back).
+    fn show_sender(&mut self, email: &str) {
+        self.search = format!("from:{email}");
+        self.clear_marks();
+        self.selected = None;
+        self.open = None;
+        self.reload();
     }
 
     fn set_selection(&mut self, s: Selection) {
@@ -2154,6 +2221,7 @@ impl OwlPostApp {
     /// list actions, and the filter chips.
     fn list_header(&mut self, ui: &mut egui::Ui, col: &Colors) {
         let mut chosen = None;
+        let mut tab = None;
         egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 14, top: 20, bottom: 12 }).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -2185,6 +2253,17 @@ impl OwlPostApp {
             }
             ui.label(RichText::new(sub).size(13.0).color(col.subtle));
             ui.add_space(10.0);
+            if self.tabs_shown() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 18.0;
+                    for c in owlpost_core::category::ALL {
+                        if category_tab(ui, col, owlpost_core::category::label(c), self.tab_unread[c as usize], c == self.category).clicked() && c != self.category {
+                            tab = Some(c);
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+            }
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                 for f in ListFilter::ALL {
@@ -2200,6 +2279,13 @@ impl OwlPostApp {
                 }
             });
         });
+        if let Some(c) = tab {
+            self.category = c;
+            self.selected = None;
+            self.open = None;
+            self.clear_marks();
+            self.reload();
+        }
         if let Some(f) = chosen {
             self.filter = f;
             self.selected = None;
@@ -2248,6 +2334,7 @@ impl OwlPostApp {
                             _ if self.filter == ListFilter::Pinned => ("📌", "Nothing pinned. Press p on a conversation to keep it at the top."),
                             _ if self.filter != ListFilter::All => ("🔍", "No conversations match this filter."),
                             (Selection::Snoozed, _) => ("⏰", "Nothing snoozed. Press b on a conversation to snooze it."),
+                            _ if self.tabs_shown() && self.category != owlpost_core::category::PRIMARY => ("📭", "Nothing here right now."),
                             (Selection::Unified(FolderRole::Inbox), _) => ("🌱", "Inbox zero. Nice work!"),
                             _ => ("📭", "No conversations here."),
                         };
@@ -2303,6 +2390,8 @@ impl OwlPostApp {
                 let row_h = ROW_H;
                 let mut clicked = None;
                 let mut menu: Option<(AccountId, String, u8)> = None;
+                // Show a sender's mail, or sort it into a tab.
+                let mut sender_menu: Option<(String, Option<Option<u8>>)> = None;
                 let mut folder_menu: Option<(AccountId, String, Folder, FolderUse, bool)> = None;
                 let mut toggle_pinned = false;
                 let multi = self.accounts.len() > 1;
@@ -2552,6 +2641,29 @@ impl OwlPostApp {
                                 menu = Some((t.account_id, t.thread_key.clone(), if t.unread { 1 } else { 2 }));
                             }
                             ui.separator();
+                            // The newest sender who isn't you.
+                            let sender = t.participants.iter().rev().find(|p| !p.email.is_empty() && !self.accounts.iter().any(|a| a.email.eq_ignore_ascii_case(&p.email)));
+                            if let Some(p) = sender {
+                                let email = p.email.to_lowercase();
+                                if ui.button(format!("All mail from {email}")).clicked() {
+                                    sender_menu = Some((email.clone(), None));
+                                }
+                                let rule = self.store.sender_rule(&email).ok().flatten();
+                                ui.menu_button("Always put their mail in", |ui| {
+                                    for c in owlpost_core::category::ALL {
+                                        let mark = if rule == Some(c) { "✓" } else { "  " };
+                                        if ui.button(format!("{mark}  {}", owlpost_core::category::label(c))).clicked() {
+                                            sender_menu = Some((email.clone(), Some(Some(c))));
+                                        }
+                                    }
+                                    ui.separator();
+                                    let mark = if rule.is_none() { "✓" } else { "  " };
+                                    if ui.button(format!("{mark}  Sort automatically")).on_hover_text("OwlPost decides from each email (Gmail's own tabs on Gmail)").clicked() {
+                                        sender_menu = Some((email.clone(), Some(None)));
+                                    }
+                                });
+                                ui.separator();
+                            }
                             ui.menu_button("Move to", |ui| {
                                 for f in self.folder_choices(t.account_id, FolderUse::Move) {
                                     if ui.button(format!("{}  {}", f.role.icon(), folder_label(&f))).clicked() {
@@ -2596,6 +2708,11 @@ impl OwlPostApp {
                 match folder_menu {
                     Some((a, k, f, FolderUse::Move, _)) => self.move_to(a, &k, &f),
                     Some((a, k, f, FolderUse::Label, add)) => self.set_label(a, &k, &f, add),
+                    None => {}
+                }
+                match sender_menu {
+                    Some((email, None)) => self.show_sender(&email),
+                    Some((email, Some(c))) => self.sort_sender(&email, c),
                     None => {}
                 }
                 match menu {
@@ -3439,6 +3556,32 @@ fn theme_palette(themes: &[Theme], id: &str, dark: bool) -> owlpost_core::theme:
 }
 
 /// A small letter-spaced heading in the sidebar ("ALL ACCOUNTS").
+/// An Inbox tab: its name, unread count, and an underline when chosen.
+fn category_tab(ui: &mut egui::Ui, col: &Colors, label: &str, unread: i64, selected: bool) -> egui::Response {
+    let font = egui::FontId::proportional(14.0);
+    let fg = if selected { col.heading } else { col.subtle };
+    let name = ui.painter().layout_no_wrap(label.to_string(), font.clone(), fg);
+    let count = (unread > 0).then(|| ui.painter().layout_no_wrap(unread.to_string(), egui::FontId::proportional(11.5), if selected { col.accent } else { col.very_subtle }));
+    let w = name.size().x + count.as_ref().map_or(0.0, |c| c.size().x + 6.0);
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(w, 24.0), Sense::click());
+    let p = ui.painter();
+    let top = rect.top() + 1.0;
+    if selected {
+        style::bold_line(p, egui::pos2(rect.left(), top), label, font, fg, w + 4.0);
+    } else {
+        p.galley(egui::pos2(rect.left(), top), name.clone(), fg);
+    }
+    if let Some(c) = count {
+        p.galley(egui::pos2(rect.left() + name.size().x + 6.0, top + 2.0), c, fg);
+    }
+    if selected {
+        p.line_segment([egui::pos2(rect.left(), rect.bottom() - 1.0), egui::pos2(rect.right(), rect.bottom() - 1.0)], egui::Stroke::new(2.0_f32, col.accent));
+    } else if r.hovered() {
+        p.line_segment([egui::pos2(rect.left(), rect.bottom() - 1.0), egui::pos2(rect.right(), rect.bottom() - 1.0)], egui::Stroke::new(1.0_f32, col.border));
+    }
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn section(ui: &mut egui::Ui, col: &Colors, text: &str) {
     let mut job = egui::text::LayoutJob::default();
     let sub = col.sidebar_text.gamma_multiply(0.75);
@@ -3978,6 +4121,35 @@ mod ui_tests {
         let d = std::env::var("OWLPOST_SHOTS").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("owlpost-shots"));
         let _ = std::fs::create_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn inbox_tabs_and_sender_rules() {
+        use owlpost_core::category::{PRIMARY, PROMOTIONS, SOCIAL};
+        let mut h = harness("owlpost-light");
+        h.run();
+        assert!(h.state().tabs_shown());
+        let subjects = |h: &Harness<'static, OwlPostApp>| h.state().rows.iter().map(|r| r.t.subject.clone()).collect::<Vec<_>>();
+        assert!(!subjects(&h).iter().any(|s| s.contains("November roast")), "the newsletter isn't in Primary");
+        h.state_mut().category = PROMOTIONS;
+        h.state_mut().reload();
+        h.run();
+        assert!(subjects(&h).iter().any(|s| s.contains("November roast")));
+        save(&mut h, "tabs-promotions");
+        // Always put the coffee shop in Social; ⌘Z puts it back.
+        h.state_mut().sort_sender("hello@kowhai.demo", Some(SOCIAL));
+        assert!(h.state().rows.is_empty());
+        h.state_mut().category = SOCIAL;
+        h.state_mut().reload();
+        assert!(subjects(&h).iter().any(|s| s.contains("November roast")));
+        h.state_mut().undo_last();
+        h.state_mut().reload();
+        assert!(!subjects(&h).iter().any(|s| s.contains("November roast")));
+        // All mail from one sender, across folders and tabs.
+        h.state_mut().category = PRIMARY;
+        h.state_mut().show_sender("hello@kowhai.demo");
+        assert!(!h.state().tabs_shown());
+        assert_eq!(subjects(&h).len(), 1);
     }
 
     fn harness(theme: &str) -> Harness<'static, OwlPostApp> {

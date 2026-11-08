@@ -386,6 +386,8 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
     pub unread: bool,
     pub starred: bool,
+    /// Inbox category guessed from the headers ([`crate::category`]).
+    pub category: u8,
 }
 
 /// One row in the thread list.
@@ -407,6 +409,8 @@ pub struct ThreadSummary {
     pub pinned: bool,
     /// When it last came back from snooze, if it has.
     pub woken: Option<DateTime<Utc>>,
+    /// Inbox category of the conversation ([`crate::category`]).
+    pub category: u8,
 }
 
 impl ThreadSummary {

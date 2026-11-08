@@ -1,6 +1,7 @@
 //! OwlPost core: models, local store, IMAP/SMTP engine, snooze,
 //! Mailspring-compatible themes and the built-in MCP server.
 
+pub mod category;
 pub mod credentials;
 pub mod demo;
 pub mod email_view;

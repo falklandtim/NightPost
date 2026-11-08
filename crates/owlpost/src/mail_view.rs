@@ -944,6 +944,7 @@ mod tests {
             attachments: vec![],
             unread: false,
             starred: false,
+            category: 0,
         }
     }
 

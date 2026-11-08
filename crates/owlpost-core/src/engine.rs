@@ -211,9 +211,41 @@ fn sync_folder(store: &Store, session: &mut Session, account: &Account, folder: 
             inserted += 1;
         }
     }
+    if folder.role == FolderRole::Inbox {
+        if let Err(e) = sort_inbox(store, session, account, folder) {
+            log::warn!("sorting {} into categories failed: {e:#}", folder.path);
+        }
+    }
     let max_uid = server.iter().copied().max().unwrap_or(folder.last_uid);
     store.set_folder_sync_state(folder.id, validity, max_uid.max(folder.last_uid))?;
     Ok(inserted)
+}
+
+/// Sort the Inbox into categories. Gmail's own (its Promotions and Social
+/// tabs) win on Gmail; elsewhere mail downloaded before categories existed
+/// is sorted from its headers, once.
+fn sort_inbox(store: &Store, session: &mut Session, account: &Account, folder: &Folder) -> Result<()> {
+    use crate::category::{PRIMARY, PROMOTIONS, SOCIAL};
+    if account.is_gmail() {
+        let promos: HashSet<u32> = session.uid_search("X-GM-RAW \"category:promotions\"")?;
+        let social: HashSet<u32> = session.uid_search("X-GM-RAW \"category:social\"")?;
+        for (uid, now) in store.folder_categories(folder.id)? {
+            let want = if social.contains(&uid) { SOCIAL } else if promos.contains(&uid) { PROMOTIONS } else { PRIMARY };
+            if now != Some(want) {
+                store.set_category_by_uid(folder.id, uid, want)?;
+            }
+        }
+        return Ok(());
+    }
+    let unsorted = store.unsorted_uids(folder.id)?;
+    for chunk in unsorted.chunks(200) {
+        for f in session.uid_fetch(uid_set(chunk), "(UID BODY.PEEK[HEADER])")?.iter() {
+            if let (Some(uid), Some(h)) = (f.uid, f.header()) {
+                store.set_category_by_uid(folder.id, uid, crate::category::classify_raw(h))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn flags(f: &[imap::types::Flag]) -> (bool, bool) {

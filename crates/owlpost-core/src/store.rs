@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS messages (
     attachments  TEXT NOT NULL DEFAULT '[]',
     unread       INTEGER NOT NULL,
     starred      INTEGER NOT NULL,
+    category     INTEGER,
     UNIQUE(folder_id, uid)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(account_id, thread_key);
@@ -75,6 +76,14 @@ CREATE TABLE IF NOT EXISTS woken (
     thread_key  TEXT NOT NULL,
     at          INTEGER NOT NULL,
     PRIMARY KEY(account_id, thread_key)
+);
+-- "Always put mail from this address in this inbox category"; synced
+-- through the snooze state (removed = a tombstone).
+CREATE TABLE IF NOT EXISTS sender_rules (
+    email     TEXT PRIMARY KEY,
+    category  INTEGER NOT NULL,
+    updated   INTEGER NOT NULL,
+    removed   INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS pins (
     account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -142,6 +151,14 @@ impl Store {
             > 0;
         if !has_auth {
             store.conn.execute_batch("ALTER TABLE accounts ADD COLUMN auth TEXT NOT NULL DEFAULT 'password'")?;
+        }
+        // …and before inbox categories (NULL: not sorted yet; sync fills it in).
+        let has_category: bool = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='category'", [], |r| r.get::<_, i64>(0))?
+            > 0;
+        if !has_category {
+            store.conn.execute_batch("ALTER TABLE messages ADD COLUMN category INTEGER")?;
         }
         store.migrate_signatures()?;
         store.rebuild_snippets()?;
@@ -527,15 +544,15 @@ impl Store {
     pub fn insert_message(&self, m: &Message) -> Result<MessageId> {
         self.conn.execute(
             "INSERT INTO messages (account_id,folder_id,uid,message_id,thread_key,in_reply_to,refs,subject,
-                from_name,from_email,to_json,cc_json,date,snippet,body_text,body_html,attachments,unread,starred)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+                from_name,from_email,to_json,cc_json,date,snippet,body_text,body_html,attachments,unread,starred,category)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
              ON CONFLICT(folder_id,uid) DO UPDATE SET unread=excluded.unread, starred=excluded.starred",
             params![
                 m.account_id, m.folder_id, m.uid, m.message_id, m.thread_key, m.in_reply_to,
                 serde_json::to_string(&m.references)?, m.subject, m.from.name, m.from.email,
                 serde_json::to_string(&m.to)?, serde_json::to_string(&m.cc)?, ts(&m.date),
                 m.snippet, m.body_text, m.body_html, serde_json::to_string(&m.attachments)?,
-                m.unread, m.starred
+                m.unread, m.starred, m.category
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -584,11 +601,12 @@ impl Store {
             attachments: serde_json::from_str(&j(17)?).unwrap_or_default(),
             unread: r.get(18)?,
             starred: r.get(19)?,
+            category: r.get::<_, Option<u8>>(20)?.unwrap_or(0),
         })
     }
 
     const MSG_COLS: &'static str = "id,account_id,folder_id,uid,message_id,thread_key,in_reply_to,refs,subject,
-        from_name,from_email,to_json,cc_json,date,snippet,body_text,body_html,attachments,unread,starred";
+        from_name,from_email,to_json,cc_json,date,snippet,body_text,body_html,attachments,unread,starred,category";
 
     pub fn message(&self, id: MessageId) -> Result<Option<Message>> {
         let sql = format!("SELECT {} FROM messages WHERE id=?1", Self::MSG_COLS);
@@ -774,6 +792,12 @@ impl Store {
                     sql.push_str(" AND EXISTS (SELECT 1 FROM pins p WHERE p.account_id=m.account_id AND p.thread_key=m.thread_key) ");
                     continue;
                 }
+                // category:promotions (the inbox tabs).
+                if let Some(c) = word.strip_prefix("category:").and_then(crate::category::parse) {
+                    sql.push_str(&format!(" AND {} = ? ", Self::THREAD_CATEGORY));
+                    args.push(Box::new(c));
+                    continue;
+                }
                 if word == "has:attachment" {
                     sql.push_str(" AND m.attachments <> '[]' ");
                     continue;
@@ -843,6 +867,7 @@ impl Store {
                                 folder_id: r.get(10)?,
                                 pinned: false,
                                 woken: r.get::<_, Option<i64>>(12)?.map(from_ts),
+                                category: 0,
                             },
                             vec![msgid],
                         ),
@@ -859,6 +884,7 @@ impl Store {
              WHERE account_id=?1 AND thread_key=?2 GROUP BY lower(from_email) ORDER BY d ASC",
         )?;
         for t in &mut out {
+            t.category = self.thread_category(t.account_id, &t.thread_key)?;
             t.participants.reverse();
             t.pinned = pins.contains(&(t.account_id, t.thread_key.clone()));
             let senders: Vec<(Contact, i64)> = st
@@ -873,6 +899,76 @@ impl Store {
         // groups stay newest-first.
         out.sort_by_key(|t| !t.pinned);
         Ok(out)
+    }
+
+    // ----- inbox categories -------------------------------------------------
+
+    /// A conversation's category, as SQL over the row `m`. A sender rule
+    /// wins (the newest message from a sender with one); otherwise the
+    /// lowest of its messages' guesses, so a reply makes it Primary.
+    /// Unsorted messages don't count; none sorted is Primary.
+    const THREAD_CATEGORY: &'static str = "(SELECT COALESCE(
+        (SELECT r.category FROM messages y JOIN sender_rules r ON r.email = lower(y.from_email) AND r.removed = 0
+          WHERE y.account_id = m.account_id AND y.thread_key = m.thread_key ORDER BY y.date DESC LIMIT 1),
+        (SELECT MIN(x.category) FROM messages x WHERE x.account_id = m.account_id AND x.thread_key = m.thread_key),
+        0))";
+
+    pub fn thread_category(&self, account_id: AccountId, thread_key: &str) -> Result<u8> {
+        let sql = format!("SELECT {} FROM (SELECT ?1 AS account_id, ?2 AS thread_key) m", Self::THREAD_CATEGORY);
+        Ok(self.conn.query_row(&sql, params![account_id, thread_key], |r| r.get(0))?)
+    }
+
+    /// UIDs in a folder not sorted into a category yet.
+    pub fn unsorted_uids(&self, folder_id: FolderId) -> Result<Vec<u32>> {
+        let mut st = self.conn.prepare("SELECT uid FROM messages WHERE folder_id=?1 AND category IS NULL")?;
+        let v = st.query_map([folder_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    /// Each message in a folder with its category (None: unsorted).
+    pub fn folder_categories(&self, folder_id: FolderId) -> Result<Vec<(u32, Option<u8>)>> {
+        let mut st = self.conn.prepare("SELECT uid, category FROM messages WHERE folder_id=?1")?;
+        let v = st.query_map([folder_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    /// Sort a message (every copy of it in the account, found by the one
+    /// at `folder_id`/`uid`).
+    pub fn set_category_by_uid(&self, folder_id: FolderId, uid: u32, category: u8) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET category=?3 WHERE (account_id, message_id) IN
+               (SELECT account_id, message_id FROM messages WHERE folder_id=?1 AND uid=?2)",
+            params![folder_id, uid, category],
+        )?;
+        Ok(())
+    }
+
+    /// Every sender rule, tombstones included.
+    pub fn sender_rules(&self) -> Result<Vec<crate::snooze_sync::SenderRule>> {
+        let mut st = self.conn.prepare("SELECT email, category, updated, removed FROM sender_rules ORDER BY email")?;
+        let v = st
+            .query_map([], |r| Ok(crate::snooze_sync::SenderRule { email: r.get(0)?, category: r.get(1)?, updated: r.get(2)?, removed: r.get(3)? }))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    /// The category this address's mail always goes to, if there's a rule.
+    pub fn sender_rule(&self, email: &str) -> Result<Option<u8>> {
+        Ok(self
+            .conn
+            .query_row("SELECT category FROM sender_rules WHERE email=lower(?1) AND removed=0", [email.trim()], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Store a rule, unless the one here is newer.
+    pub fn put_sender_rule(&self, r: &crate::snooze_sync::SenderRule) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sender_rules (email,category,updated,removed) VALUES (lower(?1),?2,?3,?4)
+             ON CONFLICT(email) DO UPDATE SET category=excluded.category, updated=excluded.updated, removed=excluded.removed
+             WHERE excluded.updated >= sender_rules.updated",
+            params![r.email.trim(), r.category, r.updated, r.removed],
+        )?;
+        Ok(())
     }
 
     // ----- snooze -----------------------------------------------------------
@@ -919,6 +1015,7 @@ impl Store {
             let msgs = self.thread_messages(acc, &key)?;
             let Some(last) = msgs.last() else { continue };
             let pinned = self.is_pinned(acc, &key)?;
+            let category = self.thread_category(acc, &key)?;
             let mut participants: Vec<Contact> = Vec::new();
             for m in &msgs {
                 if !participants.iter().any(|p| p.email == m.from.email) {
@@ -940,6 +1037,7 @@ impl Store {
                     folder_id: last.folder_id,
                     pinned,
                     woken: None,
+                    category,
                 },
                 from_ts(until),
             ));

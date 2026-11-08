@@ -55,7 +55,7 @@ fn tools() -> Value {
         tool("list_threads", "List conversations in a mailbox, pinned ones first. Snoozed threads are hidden until they wake.",
             json!({"type":"object","properties":{
                 "mailbox":{"type":"string","description":"inbox, starred, sent, drafts, archive, spam, trash, snoozed — or a folder id","default":"inbox"},
-                "query":{"type":"string","description":"Optional filter. Supports words plus from:, to:, subject:, is:unread, is:starred, is:pinned, has:attachment"},
+                "query":{"type":"string","description":"Optional filter. Supports words plus from:, to:, subject:, is:unread, is:starred, is:pinned, has:attachment, category:primary|promotions|social (the inbox tabs)"},
                 "limit":{"type":"integer","default":25,"maximum":200}
             }}), true, false),
         tool("search", "Search every account's mail. Same syntax as the app's search bar.",
@@ -78,6 +78,10 @@ fn tools() -> Value {
             json!({"type":"object","required":["thread_id"],"properties":{"thread_id":thread,"read":{"type":"boolean","default":true}}}), false, false),
         tool("star_thread", "Star or unstar a conversation (IMAP \\Flagged).",
             json!({"type":"object","required":["thread_id"],"properties":{"thread_id":thread,"starred":{"type":"boolean","default":true}}}), false, false),
+        tool("sort_sender", "Always put mail from an address in an inbox tab: primary, promotions or social (category \"auto\" removes the rule and goes back to OwlPost's own sorting). Applies to mail already here and future mail, and syncs to every OwlPost.",
+            json!({"type":"object","required":["email","category"],"properties":{
+                "email":{"type":"string","description":"The sender's address"},
+                "category":{"type":"string","enum":["primary","promotions","social","auto"]}}}), false, false),
         tool("pin_thread", "Pin a conversation to the top of the list, or unpin it (pinned=false).",
             json!({"type":"object","required":["thread_id"],"properties":{"thread_id":thread,"pinned":{"type":"boolean","default":true}}}), false, false),
         tool("move_thread", "Move a conversation: archive, trash, spam, inbox, or any folder by name/path (see list_folders). On Gmail, moving to a label adds that label and takes the conversation out of the Inbox.",
@@ -246,6 +250,7 @@ impl Server {
             "starred": t.starred,
             "has_attachments": t.has_attachments,
             "pinned": t.pinned,
+            "category": crate::category::name(t.category),
             "labels": self.labels_of(t.account_id, &t.thread_key)?,
             "snoozed_until": snoozed.map(|d| d.to_rfc3339()),
         }))
@@ -499,6 +504,19 @@ impl Server {
                 engine::set_thread_starred(&self.store, &self.account(acc)?, &key, starred)?;
                 Ok(json!({"thread_id": thread_id(acc, &key), "starred": starred}))
             }
+            "sort_sender" => {
+                let email = s("email").trim().to_lowercase();
+                if !email.contains('@') {
+                    return Err(anyhow!("{email:?} isn't an email address"));
+                }
+                let cat = s("category");
+                let category = match cat.trim().to_ascii_lowercase().as_str() {
+                    "auto" => None,
+                    c => Some(crate::category::parse(c).ok_or_else(|| anyhow!("unknown category {cat:?}: use primary, promotions, social or auto"))?),
+                };
+                crate::snooze_sync::set_sender_rule(&self.store, &email, category)?;
+                Ok(json!({"email": email, "category": category.map(crate::category::name).unwrap_or("auto")}))
+            }
             "pin_thread" => {
                 let (acc, key) = split_thread_id(&s("thread_id"))?;
                 if self.store.thread_messages(acc, &key)?.is_empty() {
@@ -731,6 +749,29 @@ mod tests {
         let r = rpc(&mut s, 2, "tools/list", json!({}));
         let names: Vec<&str> = r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"snooze_thread") && names.contains(&"send_email"));
+    }
+
+    #[test]
+    fn categories_via_tools() {
+        let mut s = server();
+        let list = |s: &mut Server, id: i64, q: &str| -> Vec<String> {
+            let r = rpc(s, id, "tools/call", json!({"name":"list_threads","arguments":{"mailbox":"inbox","query":q}}));
+            r["result"]["structuredContent"]["threads"].as_array().unwrap().iter().map(|t| t["subject"].as_str().unwrap().to_string()).collect()
+        };
+        let promos = list(&mut s, 1, "category:promotions");
+        assert!(promos.len() == 1 && promos[0].contains("November roast"), "{promos:?}");
+        let all = list(&mut s, 2, "").len();
+        let primary = list(&mut s, 3, "category:primary").len();
+        let social = list(&mut s, 4, "category:social").len();
+        assert_eq!(primary + 1 + social, all, "every conversation is in exactly one tab");
+        // Move Maya's mail to Social, then back to automatic.
+        let r = rpc(&mut s, 5, "tools/call", json!({"name":"sort_sender","arguments":{"email":"Maya@Chen.family","category":"social"}}));
+        assert_eq!(r["result"]["structuredContent"]["category"], "social");
+        assert!(list(&mut s, 6, "category:social").iter().any(|t| t.contains("Dinner")));
+        rpc(&mut s, 7, "tools/call", json!({"name":"sort_sender","arguments":{"email":"maya@chen.family","category":"auto"}}));
+        assert!(!list(&mut s, 8, "category:social").iter().any(|t| t.contains("Dinner")));
+        let r = rpc(&mut s, 9, "tools/call", json!({"name":"list_threads","arguments":{"mailbox":"inbox","query":"category:promotions"}}));
+        assert_eq!(r["result"]["structuredContent"]["threads"][0]["category"], "promotions");
     }
 
     #[test]

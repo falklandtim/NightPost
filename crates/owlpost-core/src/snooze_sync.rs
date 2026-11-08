@@ -14,6 +14,9 @@
 //! Cancelled snoozes stay as tombstones for [`TOMBSTONE_DAYS`] so a machine
 //! that was offline doesn't bring them back.
 //!
+//! The same state carries the sender rules for inbox categories
+//! ([`SenderRule`]), merged the same way: the newer change to an address wins.
+//!
 //! Whichever OwlPost is running when a snooze is due moves the conversation
 //! back to the Inbox and marks it unread. If another got there first, the
 //! conversation is no longer in the Snoozed folder and nothing happens twice.
@@ -64,12 +67,43 @@ impl Entry {
     }
 }
 
+/// "Always put mail from this address in this category" (a tombstone when
+/// `removed`: back to OwlPost's own guess).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SenderRule {
+    /// Lower-case email address.
+    pub email: String,
+    pub category: u8,
+    /// When it last changed (Unix seconds); the newer change wins.
+    pub updated: i64,
+    #[serde(default)]
+    pub removed: bool,
+}
+
+/// Merge sender rules: per address the newest change wins; old tombstones go.
+pub fn merge_rules(docs: impl IntoIterator<Item = SenderRule>, now: i64) -> Vec<SenderRule> {
+    let mut out: Vec<SenderRule> = Vec::new();
+    for r in docs {
+        match out.iter_mut().find(|o| o.email == r.email) {
+            Some(o) if r.updated > o.updated => *o = r,
+            Some(_) => {}
+            None => out.push(r),
+        }
+    }
+    out.retain(|r| !(r.removed && r.updated < now - TOMBSTONE_DAYS * 86_400));
+    out.sort_by(|a, b| a.email.cmp(&b.email));
+    out
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     pub version: u32,
     #[serde(default)]
     pub entries: Vec<Entry>,
+    /// Inbox category rules by sender.
+    #[serde(default)]
+    pub senders: Vec<SenderRule>,
 }
 
 impl State {
@@ -77,6 +111,11 @@ impl State {
     /// (and their Message-IDs are pooled). Old tombstones are dropped.
     pub fn merge(docs: impl IntoIterator<Item = State>, now: i64) -> State {
         let mut out: Vec<Entry> = Vec::new();
+        let mut senders: Vec<SenderRule> = Vec::new();
+        let docs: Vec<State> = docs.into_iter().collect();
+        for d in &docs {
+            senders.extend(d.senders.iter().cloned());
+        }
         for e in docs.into_iter().flat_map(|d| d.entries) {
             match out.iter_mut().find(|o| o.same_conversation(&e.ids)) {
                 Some(o) => {
@@ -94,7 +133,7 @@ impl State {
         }
         out.retain(|e| !(e.removed && e.updated < now - TOMBSTONE_DAYS * 86_400));
         out.sort_by_key(|e| (e.removed, e.until));
-        State { version: 1, entries: out }
+        State { version: 1, entries: out, senders: merge_rules(senders, now) }
     }
 
     /// Snooze (`Some(until)`) or cancel (`None`) a conversation.
@@ -426,11 +465,24 @@ pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
     if let Some(f) = &snoozed {
         local.parked = store.thread_keys_in_folder(f.id)?.into_iter().collect();
     }
-    let (old, state) = read_state(account)?;
-    // Never snoozed anywhere: nothing to do.
+    let (old, mut state) = read_state(account)?;
+    // Sender rules: pool this machine's with the server's, keep the result
+    // here, and write it back if the server was missing anything.
+    let now = Utc::now().timestamp();
+    let rules = merge_rules(state.senders.iter().cloned().chain(store.sender_rules()?), now);
+    for r in &rules {
+        store.put_sender_rule(r)?;
+    }
+    let rules_changed = rules != state.senders;
+    state.senders = rules;
+    // Never snoozed anywhere: nothing else to do.
     if local.snoozes.is_empty() && local.parked.is_empty() && state.entries.iter().all(|e| e.removed) {
+        if rules_changed {
+            write_state(store, account, &old, &state)?;
+        }
         return Ok(0);
     }
+    let unplanned = state.clone();
     let keys: Vec<String> = local.snoozes.keys().chain(local.parked.iter()).cloned().collect();
     for k in keys {
         let ids = thread_ids(store, account, &k)?;
@@ -445,10 +497,11 @@ pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
             }
         }
     }
-    let now = Utc::now().timestamp();
     let p = plan(state, &local, now);
     if let Some(st) = &p.write {
         write_state(store, account, &old, st)?;
+    } else if rules_changed {
+        write_state(store, account, &old, &unplanned)?;
     }
     for (k, until) in &p.snooze {
         store.snooze(account.id, k, DateTime::from_timestamp(*until, 0).unwrap_or_default())?;
@@ -487,6 +540,25 @@ pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
     Ok(p.wake.len())
 }
 
+/// Always put mail from `email` in `category` (`None`: back to OwlPost's
+/// guess), here and on every account's server copy of the state.
+pub fn set_sender_rule(store: &Store, email: &str, category: Option<u8>) -> Result<()> {
+    let rule = SenderRule { email: email.trim().to_lowercase(), category: category.unwrap_or(0), updated: Utc::now().timestamp(), removed: category.is_none() };
+    store.put_sender_rule(&rule)?;
+    let mut err = None;
+    for a in store.accounts()?.into_iter().filter(|a| !a.demo) {
+        // A failure is caught up by the next sync (this machine's copy is newer).
+        if let Err(e) = update_state(store, &a, |st| st.senders.push(rule.clone())) {
+            log::warn!("couldn't save the sender rule to {}: {e:#}", a.email);
+            err = Some(e);
+        }
+    }
+    match err {
+        Some(e) => Err(e.context("Saved here; the other machines will get it at the next sync")),
+        None => Ok(()),
+    }
+}
+
 /// Wake every snooze that's due, on every account. Returns how many woke.
 pub fn wake_due(store: &Store) -> Result<usize> {
     let due: HashSet<AccountId> = store.due_snoozes()?.into_iter().map(|(a, _)| a).collect();
@@ -514,8 +586,8 @@ mod tests {
 
     #[test]
     fn newer_change_wins_and_ids_pool() {
-        let a = State { version: 1, entries: vec![entry(&["a"], NOW + 100, NOW - 50, false)] };
-        let b = State { version: 1, entries: vec![entry(&["a", "b"], 0, NOW - 10, true), entry(&["c"], NOW + 5, NOW - 5, false)] };
+        let a = State { version: 1, entries: vec![entry(&["a"], NOW + 100, NOW - 50, false)], senders: vec![] };
+        let b = State { version: 1, entries: vec![entry(&["a", "b"], 0, NOW - 10, true), entry(&["c"], NOW + 5, NOW - 5, false)], senders: vec![] };
         let m = State::merge([a.clone(), b.clone()], NOW);
         assert_eq!(m.entries.len(), 2);
         let first = m.entries.iter().find(|e| e.ids.contains(&"a".into())).unwrap();
@@ -526,14 +598,28 @@ mod tests {
     }
 
     #[test]
+    fn sender_rules_merge_newest_wins() {
+        let r = |e: &str, c: u8, at: i64, removed: bool| SenderRule { email: e.into(), category: c, updated: at, removed };
+        let a = State { version: 1, entries: vec![], senders: vec![r("shop@x.com", 1, NOW - 50, false), r("old@x.com", 0, NOW - 40 * 86_400, true)] };
+        let b = State { version: 1, entries: vec![], senders: vec![r("shop@x.com", 0, NOW - 10, true), r("li@linkedin.com", 2, NOW - 5, false)] };
+        let m = State::merge([a, b.clone()], NOW);
+        assert_eq!(m.senders, vec![r("li@linkedin.com", 2, NOW - 5, false), r("shop@x.com", 0, NOW - 10, true)]);
+        // A state without rules (an older OwlPost's) still reads.
+        let raw = State { version: 1, entries: vec![], senders: vec![] }.to_message(DateTime::from_timestamp(NOW, 0).unwrap());
+        assert_eq!(State::from_message(&raw).unwrap().senders, vec![]);
+        let back = State::from_message(&b.to_message(DateTime::from_timestamp(NOW, 0).unwrap())).unwrap();
+        assert_eq!(back.senders, b.senders);
+    }
+
+    #[test]
     fn old_tombstones_are_dropped() {
-        let s = State { version: 1, entries: vec![entry(&["a"], 0, NOW - 31 * 86_400, true), entry(&["b"], 0, NOW - 86_400, true)] };
+        let s = State { version: 1, entries: vec![entry(&["a"], 0, NOW - 31 * 86_400, true), entry(&["b"], 0, NOW - 86_400, true)], senders: vec![] };
         assert_eq!(State::merge([s], NOW).entries, vec![entry(&["b"], 0, NOW - 86_400, true)]);
     }
 
     #[test]
     fn state_round_trips_through_an_email() {
-        let s = State { version: 1, entries: vec![entry(&["abc@example.com", "dé@x"], NOW, NOW, false)] };
+        let s = State { version: 1, entries: vec![entry(&["abc@example.com", "dé@x"], NOW, NOW, false)], senders: vec![] };
         let raw = s.to_message(DateTime::from_timestamp(NOW, 0).unwrap());
         assert_eq!(State::from_message(&raw), Some(s));
         assert!(String::from_utf8(raw).unwrap().contains(STATE_FROM));
@@ -550,7 +636,7 @@ mod tests {
 
     #[test]
     fn picks_up_a_snooze_from_another_machine() {
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 60, false)] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 60, false)], senders: vec![] };
         let p = plan(st, &local(&[], &["t1"], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.snooze, vec![("t1".into(), NOW + 3600)]);
         assert!(p.write.is_none() && p.wake.is_empty() && p.release.is_empty());
@@ -558,7 +644,7 @@ mod tests {
 
     #[test]
     fn wakes_due_snoozes_once() {
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW - 1, NOW - 600, false)] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW - 1, NOW - 600, false)], senders: vec![] };
         let p = plan(st, &local(&[("t1", NOW - 1)], &["t1"], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.wake, vec!["t1".to_string()]);
         let w = p.write.expect("tombstone written");
@@ -571,7 +657,7 @@ mod tests {
 
     #[test]
     fn cancelled_elsewhere_is_dropped_here() {
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 5, true)] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 5, true)], senders: vec![] };
         let p = plan(st, &local(&[("t1", NOW + 3600)], &["t1"], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.unsnooze, vec!["t1".to_string()]);
         assert_eq!(p.release, vec!["t1".to_string()]);
@@ -589,12 +675,12 @@ mod tests {
     #[test]
     fn taken_out_of_the_folder_elsewhere_means_unsnoozed() {
         // Snoozed an hour ago, but no longer in the Snoozed folder.
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 3600, false)] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 3600, false)], senders: vec![] };
         let p = plan(st.clone(), &local(&[("t1", NOW + 3600)], &[], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.unsnooze, vec!["t1".to_string()]);
         assert!(p.write.unwrap().entries[0].removed);
         // Just snoozed (the move may still be on its way): leave it.
-        let fresh = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 30, false)] };
+        let fresh = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 30, false)], senders: vec![] };
         let p = plan(fresh, &local(&[("t1", NOW + 3600)], &[], &[("t1", &["m1"])]), NOW);
         assert!(p.unsnooze.is_empty() && p.write.is_none());
     }
@@ -614,7 +700,7 @@ mod tests {
 
     #[test]
     fn unknown_mail_is_kept_until_long_overdue() {
-        let st = State { version: 1, entries: vec![entry(&["x"], NOW + 60, NOW - 9000, false), entry(&["y"], NOW - 2 * 86_400, NOW - 9000, false)] };
+        let st = State { version: 1, entries: vec![entry(&["x"], NOW + 60, NOW - 9000, false), entry(&["y"], NOW - 2 * 86_400, NOW - 9000, false)], senders: vec![] };
         let p = plan(st, &Local::default(), NOW);
         let w = p.write.unwrap();
         assert!(!w.entries.iter().find(|e| e.ids == ids(&["x"])).unwrap().removed);
