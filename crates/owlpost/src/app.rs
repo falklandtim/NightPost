@@ -6,7 +6,7 @@ use crate::onboarding::{AccountSetup, SetupAction};
 use crate::prefs::{ListSettings, Prefs, PrefsAction, SwipeAction, Tab, QUICK_ACTIONS_MIN_WIDTH};
 use crate::style::{self, Colors};
 use crate::worker::{AttachmentDo, Cmd, Event, FolderUse, PushState, Worker};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use eframe::egui::{self, Key, RichText, Sense};
 use owlpost_core::snooze::{self, SnoozePreset};
 use owlpost_core::snooze_sync;
@@ -191,6 +191,25 @@ struct OpenThread {
     snoozed_until: Option<DateTime<Utc>>,
 }
 
+/// The calendar in the Snooze menu.
+#[derive(Clone, Debug)]
+struct SnoozePick {
+    open: bool,
+    /// First day of the month shown.
+    month: chrono::NaiveDate,
+    day: Option<chrono::NaiveDate>,
+    hour: u32,
+    minute: u32,
+}
+
+impl Default for SnoozePick {
+    fn default() -> Self {
+        let today = chrono::Local::now().date_naive();
+        // 9:00, like the presets.
+        Self { open: false, month: today.with_day(1).unwrap_or(today), day: None, hour: 9, minute: 0 }
+    }
+}
+
 struct Toast {
     text: String,
     error: bool,
@@ -262,6 +281,8 @@ pub struct OwlPostApp {
     /// Most recent last.
     undo: Vec<Undo>,
     snooze_custom: String,
+    /// The Snooze menu's date and time picker.
+    snooze_pick: SnoozePick,
     pending_g: Option<Instant>,
     last_reload: Instant,
     filter: ListFilter,
@@ -300,6 +321,9 @@ pub struct OwlPostApp {
     sigs: SignatureBook,
     /// Attachments being downloaded: (message, attachment index).
     downloading: HashSet<(MessageId, usize)>,
+    /// Drafts being fetched to edit (by Message-ID), so a double click
+    /// opens one composer.
+    opening_drafts: HashSet<String>,
     /// Push (IMAP IDLE) status per account.
     push: HashMap<AccountId, PushState>,
     /// A Google OAuth client is saved in the keychain.
@@ -396,6 +420,7 @@ impl OwlPostApp {
             toasts: vec![],
             undo: vec![],
             snooze_custom: String::new(),
+            snooze_pick: SnoozePick::default(),
             pending_g: None,
             last_reload: Instant::now(),
             filter: ListFilter::All,
@@ -419,6 +444,7 @@ impl OwlPostApp {
             picker_query: String::new(),
             sigs: SignatureBook::default(),
             downloading: HashSet::new(),
+            opening_drafts: HashSet::new(),
             push: HashMap::new(),
             // Checked in the background (a keychain read can wait on a
             // macOS permission prompt); see Event::GoogleReady.
@@ -804,6 +830,17 @@ impl OwlPostApp {
         });
     }
 
+    /// Open a saved draft in a composer (its attachments are fetched first).
+    fn edit_draft(&mut self, m: Message) {
+        if self.composers.iter().any(|c| c.draft.as_ref().is_some_and(|d| d.message_id == m.message_id)) {
+            self.toast("That draft is already open", false);
+            return;
+        }
+        if self.opening_drafts.insert(m.message_id.clone()) {
+            self.worker.send(Cmd::OpenDraft(Box::new(m)));
+        }
+    }
+
     fn set_theme(&mut self, ctx: &egui::Context, id: &str) {
         if let Some(t) = self.themes.iter().find(|t| t.id == id) {
             self.theme_id = t.id.clone();
@@ -840,6 +877,18 @@ impl OwlPostApp {
                 Event::Changed => changed = true,
                 Event::Error(e) => self.toast(e, true),
                 Event::Notice(s) => self.toast(s, false),
+                Event::DraftReady(m, r) => {
+                    self.opening_drafts.remove(&m.message_id);
+                    match (r, self.accounts.iter().find(|a| a.id == m.account_id).cloned()) {
+                        (Ok(parts), Some(acc)) => {
+                            let id = self.next_composer_id;
+                            self.next_composer_id += 1;
+                            self.composers.push(Composer::from_draft(id, &acc, &m, parts, &self.sigs));
+                        }
+                        (Err(e), _) => self.toast(e, true),
+                        (_, None) => {}
+                    }
+                }
                 Event::GoogleReady(ready) => self.google_ready = ready,
                 Event::Avatar(email, pic) => self.faces.insert(email, pic),
                 Event::GoogleWaiting(url) => {
@@ -1962,6 +2011,15 @@ impl OwlPostApp {
                 let thread_ref = (open.account_id, open.thread_key.clone());
                 let mut remove_label: Option<Folder> = None;
                 let mut attachment_req: Option<(Message, usize, AttachmentClick)> = None;
+                // The newest draft of ours in the conversation, to finish.
+                let me = self.accounts.iter().find(|a| a.id == open.account_id).map(|a| a.email.clone()).unwrap_or_default();
+                let draft = open
+                    .messages
+                    .iter()
+                    .rev()
+                    .filter(|m| m.from.email.eq_ignore_ascii_case(&me))
+                    .find_map(|m| self.store.copy_in_role(open.account_id, &m.message_id, FolderRole::Drafts).ok().flatten());
+                let mut edit_draft: Option<Message> = None;
                 let downloading = self.downloading.clone();
                 // The account only needs naming when there's more than one.
                 let account = self.accounts.iter().find(|a| a.id == open.account_id).filter(|_| self.accounts.len() > 1).cloned();
@@ -2001,6 +2059,12 @@ impl OwlPostApp {
                                 chip(ui, &format!("⏰ Snoozed until {}", snooze::describe(u)), col.snooze);
                             }
                         });
+                        if let Some(d) = &draft {
+                            ui.add_space(8.0);
+                            if icons::labeled(ui, Icon::Pencil, "Edit draft", col.text, col.bg).on_hover_text("Finish this draft in a new window").clicked() {
+                                edit_draft = Some(d.clone());
+                            }
+                        }
                         if web {
                             return;
                         }
@@ -2046,6 +2110,9 @@ impl OwlPostApp {
                 }
                 if let Some((m, idx, what)) = attachment_req {
                     self.attachment(m, idx, what);
+                }
+                if let Some(d) = edit_draft {
+                    self.edit_draft(d);
                 }
                 if let Some(mode) = ctx.memory_mut(|m| m.data.remove_temp::<u8>(egui::Id::new("reply_click"))) {
                     self.compose_reply(mode);
@@ -2157,6 +2224,9 @@ impl OwlPostApp {
         let force_open = ui.ctx().memory_mut(|m| m.data.remove_temp::<bool>(open_id)).unwrap_or(false);
         let popup_id = egui::Id::new("snooze_popup");
         let toggle = (btn.clicked() || force_open).then_some(egui::SetOpenCommand::Toggle);
+        if toggle.is_some() && !egui::Popup::is_id_open(ui.ctx(), popup_id) {
+            self.snooze_pick = SnoozePick::default();
+        }
         let mut chosen: Option<DateTime<Utc>> = None;
         let mut unsnooze = false;
         egui::Popup::from_response(btn)
@@ -2178,6 +2248,16 @@ impl OwlPostApp {
                     );
                     if r.clicked() {
                         chosen = Some(when);
+                    }
+                }
+                ui.separator();
+                let pick_label = format!("📆  Pick a date & time  {}", if self.snooze_pick.open { "⏶" } else { "⏷" });
+                if ui.add(egui::Button::new(pick_label).frame(false).min_size(egui::vec2(240.0, 26.0))).clicked() {
+                    self.snooze_pick.open = !self.snooze_pick.open;
+                }
+                if self.snooze_pick.open {
+                    if let Some(t) = snooze_calendar(ui, col, &mut self.snooze_pick) {
+                        chosen = Some(t);
                     }
                 }
                 ui.separator();
@@ -2244,7 +2324,19 @@ impl OwlPostApp {
                         i += 1;
                         continue;
                     }
-                    self.worker.send(Cmd::Send(acc, *out));
+                    let draft = self.composers[i].draft.take();
+                    self.worker.send(Cmd::Send(acc, *out, draft));
+                    self.composers.remove(i);
+                }
+                ComposerAction::SaveDraft(acc, out) => {
+                    let replace = self.composers[i].draft.take();
+                    self.worker.send(Cmd::SaveDraft(acc, *out, replace));
+                    self.composers.remove(i);
+                }
+                ComposerAction::DeleteDraft => {
+                    if let Some(d) = self.composers[i].draft.take() {
+                        self.worker.send(Cmd::DeleteDraft(d));
+                    }
                     self.composers.remove(i);
                 }
             }
@@ -2736,6 +2828,112 @@ fn message_card(
             }
         });
     (toggled, clicked)
+}
+
+/// A month calendar and a time, for "Pick a date & time" in the Snooze menu.
+/// Returns the moment once Snooze is pressed.
+fn snooze_calendar(ui: &mut egui::Ui, col: &Colors, pick: &mut SnoozePick) -> Option<DateTime<Utc>> {
+    let now = chrono::Local::now();
+    let today = now.date_naive();
+    let this_month = today.with_day(1).unwrap_or(today);
+    let cell = egui::vec2(34.0, 28.0);
+    let width = cell.x * 7.0;
+    let mut out = None;
+    ui.add_space(2.0);
+    // ‹  November 2026  ›
+    ui.allocate_ui_with_layout(egui::vec2(width, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        let back = ui.add_enabled(pick.month > this_month, egui::Button::new("‹").frame(false).min_size(egui::vec2(24.0, 22.0)));
+        if back.clicked() {
+            pick.month = snooze::add_months(pick.month, -1);
+        }
+        let title = pick.month.format("%B %Y").to_string();
+        ui.add_sized(egui::vec2(width - 56.0, 22.0), egui::Label::new(RichText::new(title).strong().color(col.text)));
+        if ui.add(egui::Button::new("›").frame(false).min_size(egui::vec2(24.0, 22.0))).clicked() {
+            pick.month = snooze::add_months(pick.month, 1);
+        }
+    });
+    let painter_font = egui::FontId::proportional(13.0);
+    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+    ui.horizontal(|ui| {
+        for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
+            ui.add_sized(egui::vec2(cell.x, 20.0), egui::Label::new(RichText::new(d).small().color(col.very_subtle)));
+        }
+    });
+    for week in snooze::month_grid(pick.month.year(), pick.month.month()) {
+        ui.horizontal(|ui| {
+            for day in week {
+                let (rect, resp) = ui.allocate_exact_size(cell, Sense::click());
+                let Some(d) = day else { continue };
+                let past = d < today;
+                let selected = pick.day == Some(d);
+                let r = rect.shrink2(egui::vec2(3.0, 2.0));
+                if selected {
+                    ui.painter().rect_filled(r, 6.0, col.button_emphasis);
+                } else if resp.hovered() && !past {
+                    ui.painter().rect_filled(r, 6.0, style::blend(col.text, col.bg, 0.08));
+                }
+                if d == today && !selected {
+                    ui.painter().rect_stroke(r, 6.0, egui::Stroke::new(1.0_f32, col.accent), egui::StrokeKind::Inside);
+                }
+                let color = if selected {
+                    col.button_emphasis_text
+                } else if past {
+                    style::blend(col.very_subtle, col.bg, 0.4)
+                } else {
+                    col.text
+                };
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, d.day().to_string(), painter_font.clone(), color);
+                if !past {
+                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        pick.day = Some(d);
+                    }
+                    if resp.double_clicked() {
+                        pick.day = Some(d);
+                        out = snooze::at_local(d, pick.hour, pick.minute);
+                    }
+                }
+            }
+        });
+    }
+    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+    ui.add_space(6.0);
+    // Time: hour and minute, plus the usual times of day.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Time").color(col.subtle));
+        ui.add(egui::DragValue::new(&mut pick.hour).range(0..=23).custom_formatter(|n, _| format!("{n:02}")));
+        ui.label(":");
+        ui.add(egui::DragValue::new(&mut pick.minute).range(0..=59).speed(0.3).custom_formatter(|n, _| format!("{n:02}")));
+        for (label, h) in [("9:00", 9), ("13:00", 13), ("18:00", 18)] {
+            let on = pick.hour == h && pick.minute == 0;
+            if ui.add(egui::Button::new(RichText::new(label).small()).selected(on)).clicked() {
+                pick.hour = h;
+                pick.minute = 0;
+            }
+        }
+    });
+    ui.add_space(4.0);
+    let when = pick.day.and_then(|d| snooze::at_local(d, pick.hour, pick.minute));
+    ui.horizontal(|ui| {
+        match when {
+            Some(t) if t <= Utc::now() => {
+                ui.label(RichText::new("That time has passed").small().color(col.error));
+            }
+            Some(t) => {
+                ui.label(RichText::new(snooze::describe(t)).small().color(col.success));
+            }
+            None => {
+                ui.label(RichText::new("Choose a day").small().color(col.subtle));
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let ok = when.is_some_and(|t| t > Utc::now());
+            if ui.add_enabled_ui(ok, |ui| style::primary_button(ui, col, "Snooze")).inner.clicked() {
+                out = when;
+            }
+        });
+    });
+    out
 }
 
 /// A thin full-width divider inside a message card.
@@ -3267,6 +3465,83 @@ mod ui_tests {
         h.run_steps(2);
         assert!(h.state().prefs.is_none());
         assert_eq!(h.state().composers.len(), 1);
+    }
+
+    #[test]
+    fn drafts_reopen_and_save() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness("owlpost-light");
+        h.run_steps(2);
+        let gmail = h.state().accounts.iter().find(|a| a.is_gmail()).cloned().unwrap();
+        let sig = h.state().store.save_signature(&Signature { id: 0, title: "Work".into(), body: "Alex Rivera\nNorthwind".into(), html: false }).unwrap();
+        h.state().store.set_default_signature(gmail.id, Some(sig)).unwrap();
+        h.state_mut().reload();
+        // A reply draft, as the MCP server's save_draft makes it.
+        let t = h.state().store.threads(&MailboxView::Everything, "subject:Dinner", 1).unwrap().remove(0);
+        let acc = h.state().accounts.iter().find(|a| a.id == t.account_id).cloned().unwrap();
+        let last = h.state().store.thread_messages(acc.id, &t.thread_key).unwrap().pop().unwrap();
+        let mut out = owlpost_core::mcp::reply_draft(&acc, &last, false);
+        out.body = format!("Sounds lovely!\n\nAlex Rivera\nNorthwind{}", owlpost_core::smtp::quote(&last));
+        out.bcc = vec![Contact::new("", "sam@example.com")];
+        owlpost_core::engine::save_draft(&h.state().store, &acc, &out, None).unwrap();
+        h.state_mut().set_selection(Selection::Unified(FolderRole::Drafts));
+        let i = h.state().rows.iter().position(|r| r.t.thread_key == t.thread_key).expect("draft listed in Drafts");
+        h.state_mut().select(i);
+        h.run_steps(3);
+        assert!(h.query_by_label("Edit draft").is_some(), "a conversation with a draft offers Edit draft");
+        save(&mut h, "thread-with-draft");
+
+        // Reopened: the signature and quote are split off again.
+        let m = h.state().store.thread_messages(acc.id, &t.thread_key).unwrap().into_iter().find(|m| m.body_text.starts_with("Sounds lovely")).unwrap();
+        let parts = owlpost_core::engine::DraftParts { bcc: vec![Contact::new("", "sam@example.com")], attachments: vec![] };
+        let c = Composer::from_draft(7, &acc, &m, parts, &h.state().sigs);
+        assert_eq!(c.body, "Sounds lovely!");
+        assert!(c.tail.contains("wrote:"), "{:?}", c.tail);
+        assert_eq!(c.bcc, "sam@example.com");
+        let again = c.draft();
+        assert_eq!(again.body.trim_end(), m.body_text.replace("\r\n", "\n").trim_end(), "saving again keeps the text as it was");
+        h.state_mut().composers.push(c);
+        h.run_steps(3);
+        // Unchanged: ⌘W closes without asking.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::W);
+        h.run_steps(2);
+        assert!(h.state().composers.is_empty(), "an unchanged draft closes straight away");
+        // Changed: ⌘W asks, offering Save draft.
+        let mut c = Composer::from_draft(8, &acc, &m, Default::default(), &h.state().sigs);
+        c.body.push_str(" See you at 7.");
+        h.state_mut().composers.push(c);
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::W);
+        h.run_steps(2);
+        assert_eq!(h.state().composers.len(), 1);
+        assert!(h.query_by_label("Save draft").is_some());
+        save(&mut h, "composer-save-draft");
+    }
+
+    #[test]
+    fn snooze_calendar_picks_a_time() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness("owlpost-light");
+        h.run_steps(2);
+        h.state_mut().select(0);
+        h.run_steps(2);
+        h.ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("snooze_open"), true));
+        h.run_steps(2);
+        h.state_mut().snooze_pick.open = true;
+        let day = chrono::Local::now().date_naive() + chrono::Duration::days(3);
+        h.state_mut().snooze_pick.day = Some(day);
+        h.state_mut().snooze_pick.month = day.with_day(1).unwrap();
+        h.state_mut().snooze_pick.hour = 13;
+        h.run_steps(3);
+        assert!(h.query_by_label(&day.format("%B %Y").to_string()).is_some(), "the month is shown");
+        save(&mut h, "snooze-calendar");
+        let before = h.state().rows.len();
+        h.get_by_label("Snooze").click();
+        h.run_steps(3);
+        assert_eq!(h.state().rows.len(), before - 1, "snoozed from the calendar");
+        let snoozed = h.state().store.snoozed_threads().unwrap();
+        let until = snoozed[0].1.with_timezone(&chrono::Local);
+        assert_eq!(until.format("%Y-%m-%d %H:%M").to_string(), format!("{} 13:00", day.format("%Y-%m-%d")));
     }
 
     #[test]

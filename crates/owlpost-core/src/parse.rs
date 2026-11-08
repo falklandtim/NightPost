@@ -4,7 +4,7 @@ use crate::models::*;
 use chrono::{TimeZone, Utc};
 use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders};
 
-fn contacts(addr: Option<&Address>) -> Vec<Contact> {
+pub(crate) fn contacts(addr: Option<&Address>) -> Vec<Contact> {
     let Some(addr) = addr else { return vec![] };
     addr.iter()
         .filter_map(|a| {

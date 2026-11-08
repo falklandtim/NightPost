@@ -137,6 +137,16 @@ pub fn build(account: &Account, out: &OutgoingMessage) -> Result<(String, Vec<u8
     if out.to.is_empty() && out.cc.is_empty() && out.bcc.is_empty() {
         return Err(anyhow!("add at least one recipient"));
     }
+    build_with(account, out, false)
+}
+
+/// Build a draft for the Drafts folder: recipients are optional and Bcc is
+/// kept, so the draft can be finished later (here or on another device).
+pub fn build_draft(account: &Account, out: &OutgoingMessage) -> Result<(String, Vec<u8>)> {
+    build_with(account, out, true)
+}
+
+fn build_with(account: &Account, out: &OutgoingMessage, draft: bool) -> Result<(String, Vec<u8>)> {
     let domain = account.email.rsplit('@').next().unwrap_or("localhost");
     let message_id = format!(
         "{}.{}@{}",
@@ -158,6 +168,12 @@ pub fn build(account: &Account, out: &OutgoingMessage) -> Result<(String, Vec<u8
     }
     for c in &out.bcc {
         b = b.bcc(mailbox(c)?);
+    }
+    if draft {
+        b = b.keep_bcc();
+        // Nothing is sent, but lettre wants an envelope even with no recipients.
+        let me: lettre::Address = account.email.parse().with_context(|| format!("invalid address: {}", account.email))?;
+        b = b.envelope(lettre::address::Envelope::new(Some(me.clone()), vec![me])?);
     }
     if let Some(irt) = &out.in_reply_to {
         b = b.in_reply_to(format!("<{irt}>"));

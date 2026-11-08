@@ -7,11 +7,12 @@ It has one binary with no Electron, a local SQLite cache, a built-in MCP server,
 
 - **Gmail, iCloud and any IMAP/SMTP account.** Presets for Gmail, iCloud, Outlook, Yahoo and Fastmail; passwords are kept in the macOS Keychain (or the Windows/Linux equivalent).
 - **Unified Inbox** plus per-account folders, conversation threading (References/In-Reply-To), and Gmail-style search (`from:`, `to:`, `subject:`, `is:unread`, `is:starred`, `is:pinned`, `has:attachment`).
-- **Snooze**: *Later today, Tonight, Tomorrow, This weekend, Next week, Next month*, or type a time like `3h`, `friday` or `2026-12-01 09:00`. Snoozed threads leave every mailbox and come back to the inbox unread when they wake. Snoozes are kept on the mail server, so every Mac running OwlPost agrees and your phone's mail app doesn't show snoozed mail in the inbox (see [Snooze sync](#snooze-sync)).
+- **Snooze**: *Later today, Tonight, Tomorrow, This weekend, Next week, Next month*, **Pick a date & time** (a calendar with an hour and minute, plus 9:00, 13:00 and 18:00 shortcuts), or type a time like `3h`, `friday` or `2026-12-01 09:00`. Snoozed threads leave every mailbox and come back to the inbox unread when they wake. Snoozes are kept on the mail server, so every Mac running OwlPost agrees and your phone's mail app doesn't show snoozed mail in the inbox (see [Snooze sync](#snooze-sync)).
 - **Pin to top** (like Canary): press `p`, click the pin in the toolbar, or right-click a conversation. Pinned conversations stay above everything else in every list they appear in. Pins are stored locally.
 - **Swipe actions**: swipe a conversation sideways with two fingers on a trackpad, or drag it with the mouse. By default swiping right archives and swiping left trashes. Each direction can be set to archive, trash, snooze, pin or mark read/unread in Preferences → Message list.
 - **Quick actions on hover**: widen the message list (at least 420 points) and hovering over a conversation shows mark read/unread, archive, trash, snooze and pin buttons, as in Mailspring.
-- **Compose in its own window**: new messages, replies and forwards each open a separate window. Closing a window that has text in it asks before discarding the draft.
+- **Compose in its own window**: new messages, replies and forwards each open a separate window. Closing a window that has text in it offers **Save draft**, and ⌘S saves a draft straight away.
+- **Drafts**: drafts are saved in the account's Drafts folder on the server, so your phone and other mail apps see them too. A conversation that holds one of your drafts shows **Edit draft**, which opens it with its recipients (Bcc included), attachments and signature. Sending it removes the draft. **Discard** on a reopened draft deletes it, and closing without changes leaves it as it was. Drafts written by an assistant through the MCP `save_draft` tool work the same way.
 - **Attachments**: click **Attach** in the composer or drag files onto its window. Each file shows as a chip with a thumbnail (for photos) and its size; × removes it. When you attach JPEG or PNG photos, an **Image size** menu offers Actual Size, Large (2048 px), Medium (1280 px) and Small (640 px), measured on the longest side. Photos are resized in the background and turned upright from their camera rotation, and the chip shows the new size next to the original. The composer shows the total message size and blocks Send above 25 MB, the limit at Gmail and iCloud. The MCP `send_email` tool takes an `attachments` list of file paths.
 - **Push mail (IMAP IDLE)**: each account keeps a connection open on its Inbox, and the server reports new mail, or messages read or deleted elsewhere, as it happens. OwlPost then syncs just the Inbox, usually within a couple of seconds. Other folders sync every 5 minutes. The connection is re-issued every 8 minutes to keep home routers from dropping it and to check it's still alive. It reconnects with backoff after failures and starts over after the Mac wakes from sleep. Preferences → Accounts shows each account's status: *instant (push)*, *reconnecting*, or *every 5 minutes* for STARTTLS accounts and servers without IDLE.
 - **HTML email (experimental, macOS)**: emails are shown as designed, using the system web view (WebKit, through `wry`). The conversation is one page of message cards; older messages fold. Each email body sits in its own sandboxed frame, so its styles can't affect anything else, and a strict Content Security Policy blocks scripts and forms. As in Canary, pictures load straight away but **tracking pixels are always removed**: tiny 1×1 images, and images from the open-tracking addresses of Marketo, Mailchimp, SendGrid, HubSpot and others, which report when and where you opened an email. A note above the message names the blocked tracker (e.g. "Blocked a tracker from go.repco.co.nz"). To load no remote content until you click **Load images**, turn off **Load remote images** in Preferences → Appearance. Links open in your browser, and keyboard shortcuts still work while a message has focus. Turn it off in Preferences → Appearance. Linux (WebKitGTK) is planned; until then messages show as text.
@@ -77,9 +78,13 @@ Otherwise, both providers accept an **app password** in place of your normal pas
 claude mcp add owlpost -- /path/to/owlpost mcp
 ```
 
-Tools: `list_accounts`, `list_folders`, `list_threads`, `search`, `read_thread`,
+Tools: `list_accounts`, `list_folders`, `list_threads`, `search`, `read_thread`, `view_message`, `get_attachment`,
 `snooze_thread`, `unsnooze_thread`, `list_snoozed`, `pin_thread`, `mark_read`, `star_thread`,
-`move_thread`, `label_thread`, `send_email`, `reply`, `sync`. The sending tools are annotated as destructive, so MCP clients ask you to confirm before anything is sent.
+`move_thread`, `label_thread`, `save_draft`, `send_email`, `reply`, `sync`. The sending tools are annotated as destructive, so MCP clients ask you to confirm before anything is sent.
+
+- `view_message` shows an email the way it was designed. It returns the text with an `[image N]` marker where each picture sits, and then the pictures. Inline (`cid:`), remote and `data:` images are included. Tracking pixels are removed and never fetched, small icons are skipped, and pictures are sized to at most 1200 px. Remote pictures are fetched from the sender's servers, as when you open the email; pass `images: false` to skip them.
+- `get_attachment` downloads an attachment (using the same cache as the app) and returns its path. Pictures come back to look at, and small text files (CSV, JSON, ICS…) come back inline. Other files, such as PDFs, are opened from the path.
+- `save_draft` writes a draft (or, with `thread_id`, a reply draft) to the Drafts folder instead of sending it. You finish it with **Edit draft** in OwlPost or in any other mail app.
 
 ## Themes (Mailspring-compatible)
 
@@ -105,7 +110,7 @@ Data lives in `~/Library/Application Support/co.timson.OwlPost/` (override with 
 
 ## Not yet implemented
 
-HTML message rendering on Linux (shown as text there), inline (cid:) images in HTML email, drafts sync, and send-later or read receipts.
+HTML message rendering on Linux (shown as text there), inline (cid:) images in the app's HTML view (the MCP `view_message` tool does include them), automatic draft saving while you type, and send-later or read receipts.
 
 ## Snooze sync
 

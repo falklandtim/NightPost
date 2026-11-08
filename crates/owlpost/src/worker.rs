@@ -23,7 +23,14 @@ pub enum Cmd {
     Label(AccountId, String, FolderId, bool),
     /// Create a folder/label, then optionally move or label a thread into it.
     CreateFolder(AccountId, String, Option<(String, FolderUse)>),
-    Send(AccountId, OutgoingMessage),
+    /// Send; the draft it was finished from (if any) is then deleted.
+    Send(AccountId, OutgoingMessage, Option<Box<Message>>),
+    /// Save to the Drafts folder, replacing the draft it was opened from.
+    SaveDraft(AccountId, OutgoingMessage, Option<Box<Message>>),
+    /// Fetch a draft's Bcc and attachments so it can be edited.
+    OpenDraft(Box<Message>),
+    /// Delete a saved draft (Discard in a composer editing it).
+    DeleteDraft(Box<Message>),
     /// Verify credentials, save the password to the keychain, then add.
     AddAccount(Box<Account>, String),
     /// Download attachment `usize` of a message (or use the cached copy),
@@ -129,6 +136,8 @@ pub enum Event {
     /// Google sign-in finished: Ok(message) or Err(reason).
     GoogleDone(Result<String, String>),
     GoogleReady(bool),
+    /// A draft is ready to edit (or couldn't be opened).
+    DraftReady(Box<Message>, Result<owlpost_core::engine::DraftParts, String>),
     /// A sender's picture (by lowercase address), or `None`: use the letter.
     Avatar(String, Option<crate::avatars::Picture>),
 }
@@ -580,18 +589,45 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
                 }
                 let _ = ev.send(Event::Changed);
             }
-            Cmd::Send(a, out) => {
+            Cmd::Send(a, out, draft) => {
                 let _ = ev.send(Event::Status("Sending…".into()));
                 let acc = account(a)?;
                 match engine::send(&store, &acc, &out) {
                     Ok(_) => {
                         let _ = ev.send(Event::Sent(format!("Message sent from {}", acc.email)));
+                        if let Some(d) = draft {
+                            if let Err(e) = account(d.account_id).and_then(|da| engine::delete_draft(&store, &da, &d)) {
+                                let _ = ev.send(Event::Error(format!("Sent, but the draft couldn't be removed: {e:#}")));
+                            }
+                        }
                         let _ = ev.send(Event::Changed);
                     }
                     Err(e) => {
                         let _ = ev.send(Event::Error(format!("Sending failed: {e:#}")));
                     }
                 }
+            }
+            Cmd::SaveDraft(a, out, replace) => {
+                let acc = account(a)?;
+                // A draft moved to another account: save it there, then
+                // delete the old one from its own account.
+                let same = replace.as_ref().is_some_and(|d| d.account_id == a);
+                let r = engine::save_draft(&store, &acc, &out, if same { replace.as_deref() } else { None });
+                if let (Ok(_), Some(d), false) = (&r, &replace, same) {
+                    let _ = account(d.account_id).and_then(|da| engine::delete_draft(&store, &da, d));
+                }
+                let _ = ev.send(Event::Changed);
+                r.map_err(|e| e.context("Couldn't save the draft"))?;
+                let _ = ev.send(Event::Notice(format!("Draft saved to {}", acc.email)));
+            }
+            Cmd::DeleteDraft(m) => {
+                let r = account(m.account_id).and_then(|acc| engine::delete_draft(&store, &acc, &m));
+                let _ = ev.send(Event::Changed);
+                r.map_err(|e| e.context("Couldn't delete the draft"))?;
+            }
+            Cmd::OpenDraft(m) => {
+                let r = account(m.account_id).and_then(|acc| engine::open_draft(&store, &acc, &m)).map_err(|e| format!("Couldn't open the draft: {e:#}"));
+                let _ = ev.send(Event::DraftReady(m, r));
             }
             Cmd::AddAccount(acc, password) => {
                 let _ = ev.send(Event::Status(format!("Connecting to {}…", acc.imap.host)));

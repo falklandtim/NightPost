@@ -63,7 +63,7 @@ fn tools() -> Value {
                 "query":{"type":"string"},
                 "limit":{"type":"integer","default":25}
             }}), true, false),
-        tool("read_thread", "Read every message in a conversation (headers + plain-text body).",
+        tool("read_thread", "Read every message in a conversation (headers + plain-text body). Messages with \"html\": true were designed in HTML: if the text looks thin or mentions images, use view_message to see the pictures.",
             json!({"type":"object","required":["thread_id"],"properties":{"thread_id":thread}}), true, false),
         tool("snooze_thread", "Snooze a conversation: hide it until a time, then return it to the inbox as unread.",
             json!({"type":"object","required":["thread_id","until"],"properties":{
@@ -103,6 +103,31 @@ fn tools() -> Value {
                 "reply_all":{"type":"boolean","default":false},
                 "include_quote":{"type":"boolean","default":true}
             }}), false, true),
+        tool("view_message", "See one email as designed: its text with an [image N] marker where each picture sits, followed by the pictures themselves (inline, remote and data: images; tracking pixels removed, icons skipped, sized to at most 1200 px). Use it for image-heavy mail such as banner-only marketing, receipts, charts or screenshots pasted into the body.",
+            json!({"type":"object","required":["thread_id"],"properties":{
+                "thread_id":thread,
+                "message_id":{"type":"string","description":"Which message (from read_thread). Defaults to the newest."},
+                "images":{"type":"boolean","default":true,"description":"Include the pictures. Remote ones are fetched from the sender's servers, as when the email is viewed."},
+                "max_images":{"type":"integer","default":8,"maximum":20}
+            }}), true, false),
+        tool("get_attachment", "Download an attachment (cached after the first time) and return its file path. Pictures are also returned to look at, and small text files (txt, csv, json, ics…) inline. Open other files, such as PDFs, from the returned path.",
+            json!({"type":"object","required":["thread_id","filename"],"properties":{
+                "thread_id":thread,
+                "filename":{"type":"string","description":"The attachment's name, as listed by read_thread"},
+                "message_id":{"type":"string","description":"Which message, when several have an attachment with that name. Defaults to the newest that has it."}
+            }}), true, false),
+        tool("save_draft", "Save a draft in the account's Drafts folder instead of sending. The user can finish and send it from OwlPost (Edit draft) or any other mail app, including on their phone. Pass thread_id to draft a reply.",
+            json!({"type":"object","required":["body"],"properties":{
+                "thread_id":{"type":"string","description":"Draft a reply to the latest message in this conversation (recipients, subject and threading are filled in)"},
+                "reply_all":{"type":"boolean","default":false},
+                "include_quote":{"type":"boolean","default":true},
+                "from":{"type":"string","description":"Account email (for a new message; defaults to the first account)"},
+                "to":{"type":"string","description":"Comma separated recipients (optional for a draft; replaces a reply's)"},
+                "cc":{"type":"string"},"bcc":{"type":"string"},
+                "subject":{"type":"string"},
+                "body":{"type":"string","description":"Plain text body; the account's signature is added"},
+                "attachments":{"type":"array","items":{"type":"string"},"description":"Paths of files on this computer to attach"}
+            }}), false, false),
         tool("sync", "Fetch new mail from the IMAP servers now.",
             json!({"type":"object","properties":{"account":{"type":"string","description":"Account email or id; omit for all"}}}), false, false),
     ])
@@ -168,9 +193,16 @@ impl Server {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let _ = crate::snooze_sync::wake_due(&self.store);
-                Ok(match self.call(name, &args) {
-                    Ok(v) => json!({"content":[{"type":"text","text": serde_json::to_string_pretty(&v).unwrap_or_default()}],
+                Ok(match self.call_rich(name, &args) {
+                    Ok((v, extra)) if extra.is_empty() => json!({"content":[{"type":"text","text": serde_json::to_string_pretty(&v).unwrap_or_default()}],
                                     "structuredContent": v, "isError": false}),
+                    // Pictures or file text go in `content` after the JSON
+                    // (no structuredContent: clients may show only that).
+                    Ok((v, extra)) => {
+                        let mut content = vec![json!({"type":"text","text": serde_json::to_string_pretty(&v).unwrap_or_default()})];
+                        content.extend(extra);
+                        json!({"content": content, "isError": false})
+                    }
                     Err(e) => json!({"content":[{"type":"text","text": format!("Error: {e:#}")}], "isError": true}),
                 })
             }
@@ -251,6 +283,109 @@ impl Server {
         Ok(MailboxView::Unified(role))
     }
 
+    /// Run a tool; some also return extra content blocks (pictures, file text).
+    pub fn call_rich(&mut self, name: &str, args: &Value) -> Result<(Value, Vec<Value>)> {
+        match name {
+            "view_message" => self.view_message(args),
+            "get_attachment" => self.get_attachment(args),
+            _ => Ok((self.call(name, args)?, vec![])),
+        }
+    }
+
+    /// A message of a thread by Message-ID, or the newest one matching `pick`.
+    fn pick_message(&self, args: &Value, pick: impl Fn(&Message) -> bool) -> Result<(Account, Message)> {
+        let tid = args.get("thread_id").and_then(Value::as_str).unwrap_or("");
+        let (acc, key) = split_thread_id(tid)?;
+        let msgs = self.store.thread_messages(acc, &key)?;
+        if msgs.is_empty() {
+            return Err(anyhow!("thread not found"));
+        }
+        let want = args.get("message_id").and_then(Value::as_str).map(|s| s.trim().trim_matches(['<', '>'])).filter(|s| !s.is_empty());
+        let m = match want {
+            Some(id) => msgs.into_iter().find(|m| m.message_id == id).ok_or_else(|| anyhow!("no message {id} in that thread"))?,
+            None => msgs.into_iter().rev().find(|m| pick(m)).ok_or_else(|| anyhow!("no matching message in that thread"))?,
+        };
+        Ok((self.account(acc)?, m))
+    }
+
+    fn view_message(&self, args: &Value) -> Result<(Value, Vec<Value>)> {
+        let (account, m) = self.pick_message(args, |_| true)?;
+        let images = args.get("images").and_then(Value::as_bool).unwrap_or(true);
+        let max = args.get("max_images").and_then(Value::as_u64).unwrap_or(8).min(20) as usize;
+        let opts = crate::email_view::Options { remote: images, max_images: if images { max } else { 0 } };
+        let v = crate::email_view::view(&self.store, &account, &m, &opts)?;
+        let mut extra = vec![];
+        let mut list = vec![];
+        for img in &v.images {
+            let mut e = json!({"image": img.n, "alt": img.alt});
+            match (&img.picture, &img.skipped) {
+                (Some(p), _) => {
+                    use base64::Engine;
+                    e["included"] = json!(true);
+                    e["size"] = json!(format!("{}x{}", p.width, p.height));
+                    extra.push(json!({"type":"text","text": format!("[image {}{}]", img.n, if img.alt.is_empty() { String::new() } else { format!(": {}", img.alt) })}));
+                    extra.push(json!({"type":"image","mimeType": p.mime, "data": base64::engine::general_purpose::STANDARD.encode(&p.data)}));
+                }
+                (None, why) => {
+                    e["included"] = json!(false);
+                    e["reason"] = json!(why.clone().unwrap_or_else(|| "not loaded".into()));
+                }
+            }
+            list.push(e);
+        }
+        let out = json!({
+            "message_id": m.message_id,
+            "from": m.from.to_header(),
+            "date": m.date.to_rfc3339(),
+            "subject": m.subject,
+            "html": v.html,
+            "trackers_blocked": v.trackers,
+            "attachments": m.attachments.iter().map(|a| a.filename.clone()).collect::<Vec<_>>(),
+            "images": list,
+            "text": v.text,
+        });
+        Ok((out, extra))
+    }
+
+    fn get_attachment(&self, args: &Value) -> Result<(Value, Vec<Value>)> {
+        let name = args.get("filename").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            return Err(anyhow!("filename is required"));
+        }
+        let (account, m) = self.pick_message(args, |m| m.attachments.iter().any(|a| a.filename.eq_ignore_ascii_case(&name)))?;
+        let index = m
+            .attachments
+            .iter()
+            .position(|a| a.filename.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| anyhow!("that message has no attachment called {name:?}"))?;
+        let meta = m.attachments[index].clone();
+        let path = engine::attachment_file(&self.store, &account, &m, index)?;
+        let mut out = json!({"filename": meta.filename, "type": meta.mime_type, "size": meta.size, "path": path.display().to_string(),
+                             "message_id": m.message_id});
+        let mut extra = vec![];
+        let mime = meta.mime_type.to_ascii_lowercase();
+        let ext = meta.filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        let texty = mime.starts_with("text/") || ["json", "csv", "tsv", "txt", "md", "ics", "vcf", "xml", "eml", "log"].contains(&ext.as_str());
+        if mime.starts_with("image/") || ["jpg", "jpeg", "png", "gif", "webp", "heic"].contains(&ext.as_str()) {
+            match std::fs::read(&path).map_err(anyhow::Error::from).and_then(|d| crate::email_view::picture(&d)) {
+                Ok(p) => {
+                    use base64::Engine;
+                    out["shown"] = json!(format!("picture, {}x{}", p.width, p.height));
+                    extra.push(json!({"type":"image","mimeType": p.mime, "data": base64::engine::general_purpose::STANDARD.encode(&p.data)}));
+                }
+                Err(e) => out["note"] = json!(format!("couldn't show the picture ({e:#}); open it from path")),
+            }
+        } else if texty && meta.size <= 200_000 {
+            let data = std::fs::read(&path)?;
+            let text = String::from_utf8_lossy(&data).to_string();
+            out["shown"] = json!("text");
+            extra.push(json!({"type":"text","text": text}));
+        } else {
+            out["note"] = json!("Read the file at path to see it (PDFs, documents and spreadsheets can be opened from there).");
+        }
+        Ok((out, extra))
+    }
+
     pub fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
         let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(25).min(200) as usize;
@@ -310,7 +445,8 @@ impl Server {
                             "cc": Contact::join(&m.cc),
                             "subject": m.subject,
                             "unread": m.unread,
-                            "attachments": m.attachments.iter().map(|a| a.filename.clone()).collect::<Vec<_>>(),
+                            "html": m.body_html.is_some(),
+                            "attachments": m.attachments.iter().map(|a| json!({"filename": a.filename, "type": a.mime_type, "size": a.size})).collect::<Vec<_>>(),
                             "body": m.body_text,
                         })
                     })
@@ -430,6 +566,53 @@ impl Server {
                 let id = engine::send(&self.store, &account, &out)?;
                 let names: Vec<_> = out.attachments.iter().map(|a| a.filename.clone()).collect();
                 Ok(json!({"sent": true, "from": account.email, "message_id": id, "attachments": names}))
+            }
+            "save_draft" => {
+                let tid = s("thread_id");
+                let (account, draft) = if tid.trim().is_empty() {
+                    let from = s("from");
+                    let account = if from.is_empty() {
+                        self.store.accounts()?.into_iter().next().ok_or_else(|| anyhow!("no accounts configured"))?
+                    } else {
+                        self.store.account_by_email(&from)?.ok_or_else(|| anyhow!("no account {from}"))?
+                    };
+                    (account, OutgoingMessage::default())
+                } else {
+                    let (acc, key) = split_thread_id(&tid)?;
+                    let account = self.account(acc)?;
+                    let msgs = self.store.thread_messages(acc, &key)?;
+                    let last = msgs.last().ok_or_else(|| anyhow!("thread not found"))?;
+                    let mut d = reply_draft(&account, last, args.get("reply_all").and_then(Value::as_bool).unwrap_or(false));
+                    if args.get("include_quote").and_then(Value::as_bool).unwrap_or(true) {
+                        d.body = smtp::quote(last);
+                    }
+                    (account, d)
+                };
+                let pick = |k: &str, default: Vec<Contact>| if s(k).trim().is_empty() { default } else { Contact::parse_list(&s(k)) };
+                let (body, html_signature) = with_signature(&self.store, &s("body"), &account);
+                let attachments = attachment_paths(args)?
+                    .iter()
+                    .map(|p| smtp::OutgoingAttachment::from_path(std::path::Path::new(p)))
+                    .collect::<Result<Vec<_>>>()?;
+                let out = OutgoingMessage {
+                    to: pick("to", draft.to),
+                    cc: pick("cc", draft.cc),
+                    bcc: pick("bcc", vec![]),
+                    subject: if s("subject").trim().is_empty() { draft.subject } else { s("subject") },
+                    body: format!("{body}{}", draft.body),
+                    html_signature,
+                    attachments,
+                    in_reply_to: draft.in_reply_to,
+                    references: draft.references,
+                };
+                if smtp::encoded_size(&out) > smtp::SIZE_LIMIT {
+                    return Err(anyhow!("attachments are too large to email (limit about 25 MB)"));
+                }
+                let id = engine::save_draft(&self.store, &account, &out, None)?;
+                let drafts = engine::folder_for_role(&self.store, &account, FolderRole::Drafts)?;
+                let thread = self.store.copy_in_role(account.id, &id, FolderRole::Drafts)?.map(|m| thread_id(account.id, &m.thread_key));
+                Ok(json!({"saved": true, "account": account.email, "folder": drafts.path, "message_id": id,
+                          "thread_id": thread, "to": Contact::join(&out.to), "subject": out.subject}))
             }
             "reply" => {
                 let (acc, key) = split_thread_id(&s("thread_id"))?;
@@ -612,6 +795,48 @@ mod tests {
         assert!(r["result"]["structuredContent"]["to"].as_str().unwrap().contains("maya@chen.family"));
         let r = rpc(&mut s, 3, "tools/call", json!({"name":"read_thread","arguments":{"thread_id":tid}}));
         assert_eq!(r["result"]["structuredContent"]["messages"].as_array().unwrap().len() as i64, before + 1);
+    }
+
+    #[test]
+    fn drafts_view_and_attachments_via_tools() {
+        let mut s = server();
+        let r = rpc(&mut s, 1, "tools/call", json!({"name":"search","arguments":{"query":"subject:Dinner"}}));
+        let tid = r["result"]["structuredContent"]["threads"][0]["thread_id"].as_str().unwrap().to_string();
+        let sent = |s: &mut Server| rpc(s, 0, "tools/call", json!({"name":"list_threads","arguments":{"mailbox":"sent","limit":200}}))["result"]["structuredContent"]["count"].clone();
+        let sent_before = sent(&mut s);
+        // A reply draft lands in Drafts, in the same conversation, and sends nothing.
+        let r = rpc(&mut s, 2, "tools/call", json!({"name":"save_draft","arguments":{"thread_id":tid,"body":"Sounds great","bcc":"me@example.com"}}));
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let d = &r["result"]["structuredContent"];
+        assert_eq!(d["thread_id"], tid.as_str());
+        assert!(d["to"].as_str().unwrap().contains("maya@chen.family"));
+        let r = rpc(&mut s, 3, "tools/call", json!({"name":"list_threads","arguments":{"mailbox":"drafts"}}));
+        assert!(r["result"]["structuredContent"]["threads"].as_array().unwrap().iter().any(|t| t["thread_id"] == tid.as_str()));
+        assert_eq!(sent(&mut s), sent_before);
+        // A new draft needs no recipients.
+        let r = rpc(&mut s, 5, "tools/call", json!({"name":"save_draft","arguments":{"subject":"Ideas","body":"…"}}));
+        assert_eq!(r["result"]["isError"], false, "{r}");
+
+        // view_message gives the text (and no structuredContent when it adds pictures).
+        let r = rpc(&mut s, 6, "tools/call", json!({"name":"view_message","arguments":{"thread_id":tid,"images":false}}));
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        assert!(r["result"]["structuredContent"]["text"].is_string(), "{r}");
+
+        // get_attachment returns a path to open.
+        let r = rpc(&mut s, 7, "tools/call", json!({"name":"search","arguments":{"query":"has:attachment"}}));
+        let t = &r["result"]["structuredContent"]["threads"][0];
+        let tid = t["thread_id"].as_str().unwrap().to_string();
+        let r = rpc(&mut s, 8, "tools/call", json!({"name":"read_thread","arguments":{"thread_id":tid}}));
+        let name = r["result"]["structuredContent"]["messages"].as_array().unwrap().iter()
+            .find_map(|m| m["attachments"].as_array().and_then(|a| a.first()).map(|a| a["filename"].as_str().unwrap().to_string())).unwrap();
+        std::env::set_var("OWLPOST_CACHE", std::env::temp_dir().join(format!("sp-mcp-cache-{}", std::process::id())));
+        let r = rpc(&mut s, 9, "tools/call", json!({"name":"get_attachment","arguments":{"thread_id":tid,"filename":name}}));
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let body = &r["result"]["content"][0]["text"];
+        let v: Value = serde_json::from_str(body.as_str().unwrap()).unwrap();
+        assert!(std::path::Path::new(v["path"].as_str().unwrap()).is_file(), "{v}");
+        let r = rpc(&mut s, 10, "tools/call", json!({"name":"get_attachment","arguments":{"thread_id":tid,"filename":"nope.pdf"}}));
+        assert_eq!(r["result"]["isError"], true);
     }
 
     #[test]

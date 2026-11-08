@@ -163,9 +163,68 @@ pub fn describe(until: DateTime<Utc>) -> String {
     format!("{day}, {}", l.format("%H:%M"))
 }
 
+/// The weeks of a month for a date picker, Monday first. Days outside the
+/// month are `None`.
+pub fn month_grid(year: i32, month: u32) -> Vec<[Option<chrono::NaiveDate>; 7]> {
+    let Some(first) = chrono::NaiveDate::from_ymd_opt(year, month, 1) else { return vec![] };
+    let mut weeks = vec![];
+    let mut week = [None; 7];
+    let mut col = first.weekday().num_days_from_monday() as usize;
+    let mut d = first;
+    while d.month() == month {
+        week[col] = Some(d);
+        col += 1;
+        if col == 7 {
+            weeks.push(week);
+            week = [None; 7];
+            col = 0;
+        }
+        d = d.succ_opt().expect("valid date");
+    }
+    if col > 0 {
+        weeks.push(week);
+    }
+    weeks
+}
+
+/// The first day of the month `n` months after `first`'s.
+pub fn add_months(first: chrono::NaiveDate, n: i32) -> chrono::NaiveDate {
+    let m0 = first.year() * 12 + first.month0() as i32 + n;
+    chrono::NaiveDate::from_ymd_opt(m0.div_euclid(12), m0.rem_euclid(12) as u32 + 1, 1).unwrap_or(first)
+}
+
+/// A local wall-clock time on `day`. When a clock change skips that time,
+/// the first valid moment after it is used.
+pub fn at_local(day: chrono::NaiveDate, hour: u32, minute: u32) -> Option<DateTime<Utc>> {
+    let t = day.and_time(NaiveTime::from_hms_opt(hour, minute, 0)?);
+    (0..=120)
+        .step_by(30)
+        .find_map(|extra| Local.from_local_datetime(&(t + Duration::minutes(extra))).earliest())
+        .map(|l| l.with_timezone(&Utc))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_months() {
+        use chrono::NaiveDate;
+        // November 2026 starts on a Sunday: five weeks, Monday first.
+        let g = month_grid(2026, 11);
+        assert_eq!(g.len(), 6);
+        assert_eq!(g[0][6], NaiveDate::from_ymd_opt(2026, 11, 1));
+        assert_eq!(g[0][0], None);
+        assert_eq!(g[5][0], NaiveDate::from_ymd_opt(2026, 11, 30));
+        assert_eq!(g.iter().flatten().flatten().count(), 30);
+        // February 2027 starts on a Monday and fills four rows exactly.
+        assert_eq!(month_grid(2027, 2).len(), 4);
+        let nov = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        assert_eq!(add_months(nov, 2), NaiveDate::from_ymd_opt(2027, 1, 1).unwrap());
+        assert_eq!(add_months(nov, -11), NaiveDate::from_ymd_opt(2025, 12, 1).unwrap());
+        let t = at_local(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap(), 9, 30).unwrap().with_timezone(&Local);
+        assert_eq!(t.format("%Y-%m-%d %H:%M").to_string(), "2026-12-01 09:30");
+    }
 
     fn fri_10am() -> DateTime<Local> {
         // 2026-11-06 is a Friday.

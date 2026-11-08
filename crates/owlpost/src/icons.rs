@@ -308,6 +308,8 @@ pub fn labeled(ui: &mut egui::Ui, icon: Icon, label: &str, fg: Color32, bg: Colo
     p.rect(rect, HEIGHT / 2.0, blend(fg, bg, t), Stroke::new(1.0_f32, blend(fg, bg, 0.17)), StrokeKind::Inside);
     paint(p, pos2(rect.left() + 21.0, rect.center().y), 15.0, icon, fg);
     p.galley(pos2(rect.left() + 36.0, rect.center().y - galley.size().y / 2.0), galley, fg);
+    // Name the button for VoiceOver (and UI tests).
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
     resp
 }
 

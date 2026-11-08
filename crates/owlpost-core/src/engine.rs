@@ -497,6 +497,110 @@ pub fn send(store: &Store, account: &Account, out: &OutgoingMessage) -> Result<S
     Ok(id)
 }
 
+/// Save a draft in the account's Drafts folder on the server, where other
+/// mail apps (and OwlPost on other Macs) see it. `replace` is the draft this
+/// one supersedes: it's deleted once the new one is safely saved. Returns
+/// the new draft's Message-ID.
+pub fn save_draft(store: &Store, account: &Account, out: &OutgoingMessage, replace: Option<&Message>) -> Result<String> {
+    let (id, raw) = smtp::build_draft(account, out)?;
+    let drafts = folder_for_role(store, account, FolderRole::Drafts).context("this account has no Drafts folder")?;
+    if account.demo {
+        let uid = store.known_uids(drafts.id)?.into_iter().max().unwrap_or(0) + 1;
+        if let Some(mut m) = parse::parse_message(&raw, account.id, drafts.id, uid) {
+            m.unread = false;
+            m.thread_key = store.resolve_thread_key(account.id, &m.message_id, &m.in_reply_to, &m.references)?;
+            store.insert_message(&m)?;
+        }
+    } else {
+        let mut s = connect(account)?;
+        s.append_with_flags(&drafts.path, &raw, &[imap::types::Flag::Draft, imap::types::Flag::Seen])
+            .context("couldn't save the draft on the server")?;
+        let _ = sync_folder(store, &mut s, account, &drafts);
+        let _ = s.logout();
+    }
+    if let Some(old) = replace {
+        if let Err(e) = delete_draft(store, account, old) {
+            log::warn!("couldn't remove the old draft: {e:#}");
+        }
+    }
+    Ok(id)
+}
+
+/// Delete a draft from the server (after it's sent or replaced).
+pub fn delete_draft(store: &Store, account: &Account, draft: &Message) -> Result<()> {
+    let copy = store.copy_in_role(account.id, &draft.message_id, FolderRole::Drafts)?;
+    if !account.demo {
+        if let Some(m) = &copy {
+            let folder = store.folder(m.folder_id)?.ok_or_else(|| anyhow!("the Drafts folder no longer exists"))?;
+            let mut s = connect(account)?;
+            s.select(&folder.path)?;
+            s.uid_store(m.uid.to_string(), "+FLAGS.SILENT (\\Deleted)")?;
+            s.expunge()?;
+            let _ = s.logout();
+        }
+    }
+    // Gmail also lists drafts in All Mail: forget every copy.
+    store.delete_message_everywhere(account.id, &draft.message_id)
+}
+
+/// What a draft needs, beyond what sync stores, to reopen it for editing.
+#[derive(Debug, Default)]
+pub struct DraftParts {
+    pub bcc: Vec<Contact>,
+    /// Its attachments, saved as files (inline pictures are left out).
+    pub attachments: Vec<std::path::PathBuf>,
+}
+
+/// Fetch a draft's Bcc and attachments, to finish it in the composer.
+pub fn open_draft(store: &Store, account: &Account, m: &Message) -> Result<DraftParts> {
+    if account.demo {
+        let attachments = (0..m.attachments.len()).map(|i| attachment_file(store, account, m, i)).collect::<Result<_>>()?;
+        return Ok(DraftParts { bcc: vec![], attachments });
+    }
+    let raw = fetch_raw(store, account, m)?;
+    draft_parts(&raw, &attachment_cache_dir().join("drafts").join(safe_filename(&m.message_id)))
+}
+
+/// The Bcc and attachments of a raw draft; attachments are written to `dir`.
+pub fn draft_parts(raw: &[u8], dir: &std::path::Path) -> Result<DraftParts> {
+    use mail_parser::MimeHeaders;
+    let msg = mail_parser::MessageParser::default().parse(raw).ok_or_else(|| anyhow!("couldn't read the draft"))?;
+    let mut out = DraftParts { bcc: parse::contacts(msg.bcc()), attachments: vec![] };
+    for part in msg.attachments() {
+        // Pictures shown inside the HTML (a signature's logo, say) aren't
+        // attachments the composer could show.
+        if part.content_id().is_some() && part.content_disposition().is_none_or(|d| d.is_inline()) {
+            continue;
+        }
+        std::fs::create_dir_all(dir)?;
+        let mut path = dir.join(safe_filename(part.attachment_name().unwrap_or("attachment")));
+        let mut n = 1;
+        while out.attachments.contains(&path) {
+            n += 1;
+            let name = safe_filename(part.attachment_name().unwrap_or("attachment"));
+            let (stem, ext) = name.rsplit_once('.').map(|(s, e)| (s.to_string(), format!(".{e}"))).unwrap_or((name.clone(), String::new()));
+            path = dir.join(format!("{stem} {n}{ext}"));
+        }
+        std::fs::write(&path, part.contents())?;
+        out.attachments.push(path);
+    }
+    Ok(out)
+}
+
+/// The full raw message, fetched again from the server.
+pub fn fetch_raw(store: &Store, account: &Account, m: &Message) -> Result<Vec<u8>> {
+    let folder = store.folder(m.folder_id)?.ok_or_else(|| anyhow!("the message's folder no longer exists"))?;
+    let mut s = connect(account)?;
+    s.select(&folder.path)?;
+    let fetches = s.uid_fetch(m.uid.to_string(), "BODY.PEEK[]")?;
+    let raw = fetches
+        .iter()
+        .find_map(|f| f.body().map(<[u8]>::to_vec))
+        .ok_or_else(|| anyhow!("the message is no longer on the server — try syncing"))?;
+    let _ = s.logout();
+    Ok(raw)
+}
+
 fn demo_send(store: &Store, account: &Account, out: &OutgoingMessage) -> Result<String> {
     let (id, raw) = smtp::build(account, out)?;
     let sent = store
@@ -562,15 +666,7 @@ pub fn attachment_file_in(cache: &std::path::Path, store: &Store, account: &Acco
 
 /// Fetch the message again and pull out one attachment.
 fn download_attachment(store: &Store, account: &Account, m: &Message, index: usize) -> Result<Vec<u8>> {
-    let folder = store.folder(m.folder_id)?.ok_or_else(|| anyhow!("the message's folder no longer exists"))?;
-    let mut s = connect(account)?;
-    s.select(&folder.path)?;
-    let fetches = s.uid_fetch(m.uid.to_string(), "BODY.PEEK[]")?;
-    let raw = fetches
-        .iter()
-        .find_map(|f| f.body().map(<[u8]>::to_vec))
-        .ok_or_else(|| anyhow!("the message is no longer on the server — try syncing"))?;
-    let _ = s.logout();
+    let raw = fetch_raw(store, account, m)?;
     attachment_from_raw(&raw, index, &m.attachments[index].filename)
 }
 
@@ -677,6 +773,29 @@ mod tests {
         assert_eq!(std::fs::read(attachment_file_in(&cache, &store, &account, &m, 0).unwrap()).unwrap(), b"cached");
         assert!(attachment_file_in(&cache, &store, &account, &m, 5).is_err());
         let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn drafts_keep_bcc_and_attachments() {
+        let store = Store::open(&crate::test_db_path("sp-draft")).unwrap();
+        crate::demo::seed(&store).unwrap();
+        let account = store.accounts().unwrap().remove(0);
+        let out = OutgoingMessage {
+            bcc: vec![Contact::new("Sam", "sam@example.com")],
+            subject: "Plan".into(),
+            body: "Draft text".into(),
+            attachments: vec![smtp::OutgoingAttachment::new("notes.txt", b"hello".to_vec())],
+            ..Default::default()
+        };
+        // No recipients at all: fine for a draft, not for sending.
+        let empty = OutgoingMessage { subject: "Later".into(), ..Default::default() };
+        assert!(smtp::build(&account, &empty).is_err() && smtp::build_draft(&account, &empty).is_ok());
+        let (_, raw) = smtp::build_draft(&account, &out).unwrap();
+        let dir = std::env::temp_dir().join(format!("sp-draft-{}", std::process::id()));
+        let parts = draft_parts(&raw, &dir).unwrap();
+        assert_eq!(parts.bcc[0].email, "sam@example.com");
+        assert_eq!(parts.attachments.len(), 1);
+        assert_eq!(std::fs::read(&parts.attachments[0]).unwrap(), b"hello");
     }
 
     #[test]

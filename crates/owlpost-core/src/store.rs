@@ -605,6 +605,20 @@ impl Store {
         Ok(out)
     }
 
+    /// The copy of a message kept in a folder with `role` (e.g. the Drafts
+    /// copy of a draft), if there is one.
+    pub fn copy_in_role(&self, account_id: AccountId, message_id: &str, role: FolderRole) -> Result<Option<Message>> {
+        let Some(folder) = self.folder_by_role(account_id, role)? else { return Ok(None) };
+        let sql = format!("SELECT {} FROM messages WHERE account_id=?1 AND message_id=?2 AND folder_id=?3", Self::MSG_COLS);
+        Ok(self.conn.query_row(&sql, params![account_id, message_id, folder.id], Self::message_from_row).optional()?)
+    }
+
+    /// Forget every copy of a message (a deleted draft, say).
+    pub fn delete_message_everywhere(&self, account_id: AccountId, message_id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM messages WHERE account_id=?1 AND message_id=?2", params![account_id, message_id])?;
+        Ok(())
+    }
+
     /// Every stored copy of every message in a thread (all folders).
     pub fn thread_copies(&self, account_id: AccountId, thread_key: &str) -> Result<Vec<Message>> {
         let sql = format!("SELECT {} FROM messages WHERE account_id=?1 AND thread_key=?2", Self::MSG_COLS);

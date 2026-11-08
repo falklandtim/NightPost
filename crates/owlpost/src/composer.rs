@@ -59,12 +59,23 @@ pub struct Composer {
     pub image_size: ImageSize,
     /// Height of everything under the message, measured each frame.
     bottom_h: f32,
+    /// The saved draft this window is editing: replaced when saved again,
+    /// deleted once sent or discarded.
+    pub draft: Option<Box<Message>>,
+    /// The fields as the draft was opened, to close without asking when
+    /// nothing changed.
+    pristine: Option<String>,
 }
 
 pub enum ComposerAction {
     None,
     Send(AccountId, Box<OutgoingMessage>),
+    /// Save to the Drafts folder and close.
+    SaveDraft(AccountId, Box<OutgoingMessage>),
+    /// Close, keeping any saved draft as it was.
     Discard,
+    /// Close and delete the saved draft (the Discard button on a draft).
+    DeleteDraft,
 }
 
 impl Composer {
@@ -93,7 +104,48 @@ impl Composer {
             attachments: vec![],
             image_size: ImageSize::Actual,
             bottom_h: 48.0,
+            draft: None,
+            pristine: None,
         }
+    }
+
+    /// Reopen a saved draft. Its signature (if it's one of ours) is split
+    /// off again so it can be swapped, and quoted text after it is folded.
+    pub fn from_draft(id: u64, account: &Account, m: &Message, parts: owlpost_core::engine::DraftParts, sigs: &SignatureBook) -> Self {
+        let mut c = Self::new(id, account);
+        c.to = Contact::join(&m.to);
+        c.cc = Contact::join(&m.cc);
+        c.bcc = Contact::join(&parts.bcc);
+        c.show_cc = !c.cc.is_empty() || !c.bcc.is_empty();
+        c.subject = if m.subject == "(no subject)" { String::new() } else { m.subject.clone() };
+        c.in_reply_to = (!m.in_reply_to.is_empty()).then(|| m.in_reply_to.clone());
+        c.references = m.references.clone();
+        c.title = "Draft".into();
+        c.sig_resolved = true;
+        let body = m.body_text.replace("\r\n", "\n");
+        let preferred = sigs.default_for(account.id).into_iter().chain(sigs.list.iter());
+        let found = preferred.filter(|sg| !sg.text().trim().is_empty()).find_map(|sg| body.rfind(&sg.text()).map(|pos| (sg.clone(), pos)));
+        match found {
+            Some((sg, pos)) => {
+                c.body = body[..pos].trim_end().to_string();
+                c.tail = body[pos + sg.text().len()..].to_string();
+                c.signature = Some(sg);
+                c.sig_touched = true;
+            }
+            None => c.body = body.trim_end().to_string(),
+        }
+        c.attach_paths(parts.attachments);
+        c.draft = Some(Box::new(m.clone()));
+        c.focus_first = c.to.trim().is_empty();
+        c.focus_body = !c.focus_first;
+        c.pristine = Some(c.snapshot());
+        c
+    }
+
+    /// The editable fields, to tell whether a reopened draft was changed.
+    fn snapshot(&self) -> String {
+        let files: Vec<&str> = self.attachments.iter().map(|a| a.name.as_str()).collect();
+        format!("{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{:?}\u{1}{}\u{1}{:?}", self.account_id, self.to, self.cc, self.bcc, self.subject, files, self.body, self.signature.as_ref().map(|s| s.id))
     }
 
     pub fn reply(id: u64, account: &Account, m: &Message, all: bool) -> Self {
@@ -258,7 +310,7 @@ impl Composer {
             self.take_dropped_files(ctx, col);
             // Drafts aren't saved yet, so ask before throwing away any text.
             if ctx.input(|i| i.viewport().close_requested()) {
-                if !self.is_blank() {
+                if !self.is_blank() && self.pristine.as_deref() != Some(&self.snapshot()) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 }
                 self.request_close(&mut action);
@@ -277,7 +329,7 @@ impl Composer {
     /// Close (⌘W or the close button): straight away when nothing's been
     /// typed, otherwise ask first.
     fn request_close(&mut self, action: &mut ComposerAction) {
-        if self.is_blank() {
+        if self.is_blank() || self.pristine.as_deref() == Some(&self.snapshot()) {
             *action = ComposerAction::Discard;
         } else {
             self.confirm_close = true;
@@ -296,9 +348,14 @@ impl Composer {
             egui::Frame::new().fill(col.bg_secondary).corner_radius(6).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Discard this draft?").strong());
+                    let what = if self.draft.is_some() { "Save your changes to this draft?" } else { "Save this message as a draft?" };
+                    ui.label(RichText::new(what).strong());
+                    if style::primary_button(ui, col, "Save draft").clicked() {
+                        action = ComposerAction::SaveDraft(self.account_id, Box::new(self.draft()));
+                    }
                     // No keyboard shortcut for Discard: typing on shouldn't lose the draft.
-                    if ui.button("Discard").clicked() {
+                    let discard = if self.draft.is_some() { "Discard changes" } else { "Discard" };
+                    if ui.button(discard).clicked() {
                         action = ComposerAction::Discard;
                     }
                     if ui.button("Keep editing").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -307,9 +364,16 @@ impl Composer {
                 });
             });
             ui.add_space(6.0);
-            if matches!(action, ComposerAction::Discard) {
+            if matches!(action, ComposerAction::Discard | ComposerAction::SaveDraft(..)) {
                 return action;
             }
+        }
+        // ⌘S saves a draft and closes the window.
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S)) && !self.is_blank() {
+            if self.resizing() {
+                return ComposerAction::None;
+            }
+            return ComposerAction::SaveDraft(self.account_id, Box::new(self.draft()));
         }
         egui::Grid::new(("hdr", self.id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
             ui.label(RichText::new("From").color(col.subtle));
@@ -421,7 +485,7 @@ impl Composer {
             ui.ctx().request_repaint();
         }
         if discard {
-            return ComposerAction::Discard;
+            return if self.draft.is_some() { ComposerAction::DeleteDraft } else { ComposerAction::Discard };
         }
         let shortcut = any_focus && ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
         if (send_clicked || shortcut) && self.can_send().is_ok() {
