@@ -3884,6 +3884,7 @@ impl eframe::App for OwlPostApp {
         if !self.mail_view_tried {
             self.mail_view_tried = true;
             self.mail_view = crate::mail_view::MailView::new(frame, self.colors.bg);
+            crate::web_host::set_main_window(frame);
         }
         self.frame(ctx);
     }

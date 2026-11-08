@@ -39,6 +39,16 @@ pub fn init(ctx: &egui::Context) -> bool {
     imp::init(ctx)
 }
 
+/// Remember the main window, so new web windows can be brought to the
+/// front on Wayland (the compositor wants permission from the window that
+/// has focus). Call once the window exists.
+pub fn set_main_window(window: &(impl raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle)) {
+    #[cfg(target_os = "linux")]
+    activation::remember(window);
+    #[cfg(not(target_os = "linux"))]
+    let _ = window;
+}
+
 /// Is the host running?
 pub fn available() -> bool {
     imp::available()
@@ -354,15 +364,18 @@ mod imp {
             anyhow::bail!("GTK isn't running");
         }
         let (tx, rx) = std::sync::mpsc::channel();
+        // Asked for here, on the main window's thread, before GTK shows it.
+        let token = super::activation::token();
         on_gtk(move || {
-            let _ = tx.send(build(id, spec).map_err(|e| format!("{e:#}")));
+            let _ = tx.send(build(id, spec, token).map_err(|e| format!("{e:#}")));
         });
         rx.recv().map_err(|_| anyhow::anyhow!("the GTK thread stopped"))?.map_err(|e| anyhow::anyhow!(e))
     }
 
-    fn build(id: u64, spec: WindowSpec) -> anyhow::Result<()> {
+    fn build(id: u64, spec: WindowSpec, token: Option<String>) -> anyhow::Result<()> {
         use wry::WebViewBuilderExtUnix;
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
+
         window.set_title(&spec.title);
         window.set_default_size(spec.width as i32, spec.height as i32);
         window.set_position(gtk::WindowPosition::Center);
@@ -381,6 +394,13 @@ mod imp {
         });
         window.show_all();
         window.present();
+        // Bring it to the front with the main window's permission (else KDE
+        // opens it behind the main window).
+        if let Some(t) = token {
+            // Once the compositor has mapped it.
+            let w = window.clone();
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || super::activation::activate_gtk(&w, &t));
+        }
         log::info!("web window {id}: realized={} visible={} mapped={} size={:?}", window.is_realized(), window.is_visible(), window.is_mapped(), window.size());
         WINS.with(|w| w.borrow_mut().insert(id, Win { window, webview }));
         Ok(())
@@ -418,9 +438,14 @@ mod imp {
     }
 
     pub fn show(id: u64) {
-        with(id, |w| {
+        let token = super::activation::token();
+        with(id, move |w| {
             w.window.show_all();
             w.window.present();
+            if let Some(t) = token {
+                let win = w.window.clone();
+                gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || super::activation::activate_gtk(&win, &t));
+            }
         })
     }
 
@@ -440,6 +465,119 @@ mod imp {
 
     pub fn poll() -> Vec<HostEvent> {
         events::take()
+    }
+}
+
+/// Linux on Wayland: an xdg-activation token from the main window, so a new
+/// window may take focus. Asked for over the main window's own connection
+/// (winit's), since the compositor only grants tokens to the client whose
+/// window is focused. X11 needs none.
+#[cfg(target_os = "linux")]
+mod activation {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use std::sync::Mutex;
+    use wayland_client::globals::{registry_queue_init, GlobalListContents};
+    use wayland_client::protocol::{wl_registry, wl_surface::WlSurface};
+    use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+    use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
+
+    /// The main window's wl_display and wl_surface.
+    static MAIN: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+    pub fn remember(window: &(impl HasWindowHandle + HasDisplayHandle)) {
+        let (Ok(w), Ok(d)) = (window.window_handle(), window.display_handle()) else { return };
+        if let (RawWindowHandle::Wayland(w), RawDisplayHandle::Wayland(d)) = (w.as_raw(), d.as_raw()) {
+            if let Ok(mut m) = MAIN.lock() {
+                *m = Some((d.display.as_ptr() as usize, w.surface.as_ptr() as usize));
+            }
+        }
+    }
+
+    struct State {
+        token: Option<String>,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
+        fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<xdg_activation_v1::XdgActivationV1, ()> for State {
+        fn event(_: &mut Self, _: &xdg_activation_v1::XdgActivationV1, _: xdg_activation_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for State {
+        fn event(state: &mut Self, _: &xdg_activation_token_v1::XdgActivationTokenV1, ev: xdg_activation_token_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if let xdg_activation_token_v1::Event::Done { token } = ev {
+                state.token = Some(token);
+            }
+        }
+    }
+
+    extern "C" {
+        fn gdk_wayland_window_get_wl_surface(window: *mut gtk::gdk::ffi::GdkWindow) -> *mut std::ffi::c_void;
+        fn gdk_wayland_display_get_wl_display(display: *mut gtk::gdk::ffi::GdkDisplay) -> *mut std::ffi::c_void;
+    }
+
+    /// On the GTK thread: activate a shown GTK window with `token`, using
+    /// GTK's own Wayland connection. Does nothing under X11.
+    pub fn activate_gtk(window: &gtk::Window, token: &str) {
+        use gtk::glib::translate::ToGlibPtr;
+        use gtk::prelude::*;
+        let Some(gdk_window) = window.window() else { return };
+        let display = gdk_window.display();
+        if !display.type_().name().contains("Wayland") {
+            return;
+        }
+        // SAFETY: both are GTK's live Wayland objects, checked above.
+        let (wl_display, wl_surface) = unsafe {
+            (gdk_wayland_display_get_wl_display(display.to_glib_none().0), gdk_wayland_window_get_wl_surface(gdk_window.to_glib_none().0))
+        };
+        if wl_display.is_null() || wl_surface.is_null() {
+            return;
+        }
+        let r = (|| -> Option<()> {
+            // SAFETY: GTK's display and the window's surface outlive this call.
+            let backend = unsafe { wayland_backend::sys::client::Backend::from_foreign_display(wl_display.cast()) };
+            let conn = Connection::from_backend(backend);
+            let (globals, mut queue) = registry_queue_init::<State>(&conn).ok()?;
+            let qh = queue.handle();
+            let activation: xdg_activation_v1::XdgActivationV1 = globals.bind(&qh, 1..=1, ()).ok()?;
+            let id = unsafe { wayland_backend::sys::client::ObjectId::from_ptr(WlSurface::interface(), wl_surface.cast()) }.ok()?;
+            let surface = WlSurface::from_id(&conn, id).ok()?;
+            activation.activate(token.to_string(), &surface);
+            activation.destroy();
+            queue.roundtrip(&mut State { token: None }).ok()?;
+            Some(())
+        })();
+        log::info!("activated the new window: {}", r.is_some());
+    }
+
+    /// A fresh token, or None (not Wayland, or the compositor said no).
+    pub fn token() -> Option<String> {
+        let (display, surface) = (*MAIN.lock().ok()?)?;
+        // SAFETY: winit's display and surface live as long as the main window,
+        // which outlives every composer; this only adds a queue of our own.
+        let backend = unsafe { wayland_backend::sys::client::Backend::from_foreign_display(display as *mut _) };
+        let conn = Connection::from_backend(backend);
+        let (globals, mut queue) = registry_queue_init::<State>(&conn).ok()?;
+        let qh = queue.handle();
+        let activation: xdg_activation_v1::XdgActivationV1 = globals.bind(&qh, 1..=1, ()).ok()?;
+        // SAFETY: as above; the pointer is winit's wl_surface.
+        let id = unsafe { wayland_backend::sys::client::ObjectId::from_ptr(WlSurface::interface(), surface as *mut _) }.ok()?;
+        let surface = WlSurface::from_id(&conn, id).ok()?;
+        let request = activation.get_activation_token(&qh, ());
+        request.set_app_id("co.timson.OwlPost".into());
+        request.set_surface(&surface);
+        request.commit();
+        let mut state = State { token: None };
+        for _ in 0..4 {
+            if queue.roundtrip(&mut state).is_err() || state.token.is_some() {
+                break;
+            }
+        }
+        request.destroy();
+        activation.destroy();
+        let _ = conn.flush();
+        log::info!("activation token for a new window: {}", if state.token.is_some() { "granted" } else { "none" });
+        state.token
     }
 }
 

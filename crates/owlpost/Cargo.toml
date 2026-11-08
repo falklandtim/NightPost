@@ -39,6 +39,12 @@ wry = "0.57"
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 javascriptcore-rs = "1.1"
+raw-window-handle = "0.6"
+# Ask the compositor (over the main window's own connection) to let a new
+# composer window come to the front (xdg-activation).
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 webkit2gtk = "2.0"
 wry = { version = "0.57", default-features = false, features = ["os-webview"] }
 
