@@ -69,6 +69,13 @@ CREATE TABLE IF NOT EXISTS snoozes (
     until       INTEGER NOT NULL,
     PRIMARY KEY(account_id, thread_key)
 );
+-- When a snoozed thread last woke: it sorts as if it arrived then.
+CREATE TABLE IF NOT EXISTS woken (
+    account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    thread_key  TEXT NOT NULL,
+    at          INTEGER NOT NULL,
+    PRIMARY KEY(account_id, thread_key)
+);
 CREATE TABLE IF NOT EXISTS pins (
     account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     thread_key  TEXT NOT NULL,
@@ -727,8 +734,10 @@ impl Store {
         let now = Utc::now().timestamp();
         let mut sql = String::from(
             "SELECT m.account_id, m.thread_key, m.subject, m.from_name, m.from_email, m.snippet,
-                    m.date, m.unread, m.starred, m.attachments, m.folder_id, m.message_id
-             FROM messages m JOIN folders f ON f.id = m.folder_id WHERE 1=1 ",
+                    m.date, m.unread, m.starred, m.attachments, m.folder_id, m.message_id, w.at
+             FROM messages m JOIN folders f ON f.id = m.folder_id
+             LEFT JOIN woken w ON w.account_id = m.account_id AND w.thread_key = m.thread_key
+             WHERE 1=1 ",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         match view {
@@ -778,7 +787,9 @@ impl Store {
                               AND s.thread_key=m.thread_key AND s.until > ?) ",
         );
         args.push(Box::new(now));
-        sql.push_str(" ORDER BY m.date DESC LIMIT 5000");
+        // A thread back from snooze sorts by when it woke, as if it had
+        // just arrived; its own messages stay newest-first.
+        sql.push_str(" ORDER BY MAX(m.date, COALESCE(w.at, 0)) DESC, m.date DESC LIMIT 5000");
 
         let mut st = self.conn.prepare(&sql)?;
         let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
@@ -831,6 +842,7 @@ impl Store {
                                 has_attachments: atts != "[]",
                                 folder_id: r.get(10)?,
                                 pinned: false,
+                                woken: r.get::<_, Option<i64>>(12)?.map(from_ts),
                             },
                             vec![msgid],
                         ),
@@ -927,6 +939,7 @@ impl Store {
                     has_attachments: msgs.iter().any(|m| !m.attachments.is_empty()),
                     folder_id: last.folder_id,
                     pinned,
+                    woken: None,
                 },
                 from_ts(until),
             ));
@@ -949,8 +962,19 @@ impl Store {
         for (acc, key) in &due {
             self.set_thread_unread(*acc, key, true)?;
             self.unsnooze(*acc, key)?;
+            self.mark_woken(*acc, key)?;
         }
         Ok(due)
+    }
+
+    /// Note that a thread just woke from snooze, so it lists at the top.
+    pub fn mark_woken(&self, account_id: AccountId, thread_key: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO woken (account_id,thread_key,at) VALUES (?1,?2,?3)
+             ON CONFLICT(account_id,thread_key) DO UPDATE SET at=excluded.at",
+            params![account_id, thread_key, Utc::now().timestamp()],
+        )?;
+        Ok(())
     }
 
     /// Snoozes in the Snoozed view, including any that are due but not yet
@@ -1103,6 +1127,10 @@ mod tests {
         let back = s.threads(&MailboxView::Unified(FolderRole::Inbox), "", 100).unwrap();
         assert_eq!(back.len(), inbox.len());
         assert!(back.iter().find(|x| x.thread_key == t.thread_key).unwrap().unread);
+        // It comes back at the top, as if it had just arrived.
+        let woken = back.iter().find(|x| !x.pinned).unwrap();
+        assert_eq!(woken.thread_key, t.thread_key);
+        assert!(woken.woken.is_some() && woken.list_date() > woken.last_date - chrono::Duration::seconds(1));
     }
 
     #[test]

@@ -178,7 +178,7 @@ fn list_layout(rows: &[Row], grouped: bool, hidden_pinned: usize, now: DateTime<
     }
     let mut last: Option<String> = None;
     for (i, r) in rows.iter().enumerate().filter(|(_, r)| !r.t.pinned) {
-        let g = date_group(r.t.last_date, now);
+        let g = date_group(r.t.list_date(), now);
         if last.as_ref() != Some(&g) {
             push(&mut out, ListItem::Header(g.clone()));
             last = Some(g);
@@ -2431,7 +2431,7 @@ impl OwlPostApp {
                         }
                         let date = match snoozed_until {
                             Some(u) => format!("⏰ {}", snooze::describe(u)),
-                            None => style::short_date(t.last_date),
+                            None => style::short_date(t.list_date()),
                         };
                         let date_g = p.layout_no_wrap(date, egui::FontId::proportional(12.0), if snoozed_until.is_some() && !selected { col.snooze } else { sub });
                         let date_w = date_g.size().x;

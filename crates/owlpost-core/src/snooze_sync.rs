@@ -481,6 +481,7 @@ pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
         // The move may have changed its key; mark whatever it is now.
         let ids = local.ids.get(k).cloned().unwrap_or_default();
         let key = store.thread_key_for_ids(account.id, &ids)?.unwrap_or_else(|| k.clone());
+        store.mark_woken(account.id, &key)?;
         engine::set_thread_unread(store, account, &key, true)?;
     }
     Ok(p.wake.len())

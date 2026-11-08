@@ -405,6 +405,16 @@ pub struct ThreadSummary {
     pub folder_id: FolderId,
     /// Pinned conversations are listed above everything else.
     pub pinned: bool,
+    /// When it last came back from snooze, if it has.
+    pub woken: Option<DateTime<Utc>>,
+}
+
+impl ThreadSummary {
+    /// The date the list sorts and shows it by: a thread back from snooze
+    /// counts as arriving when it woke.
+    pub fn list_date(&self) -> DateTime<Utc> {
+        self.woken.map_or(self.last_date, |w| w.max(self.last_date))
+    }
 }
 
 /// What the thread list is currently showing.
