@@ -197,6 +197,27 @@ struct OpenThread {
     snoozed_until: Option<DateTime<Utc>>,
 }
 
+/// A window showing a message's raw source ("Show original").
+struct Original {
+    id: u64,
+    subject: String,
+    text: String,
+}
+
+/// Where dragged conversations can be dropped in the sidebar.
+#[derive(Clone, Debug)]
+enum DropTarget {
+    /// All Accounts → Inbox, Archive, Spam or Trash: works for every account.
+    Role(FolderRole),
+    /// One account's folder.
+    Folder(Folder),
+}
+
+/// What a composer's draft commands refer to.
+fn draft_ref(c: &Composer) -> crate::worker::DraftRef {
+    crate::worker::DraftRef { composer: c.id, initial: c.draft.clone() }
+}
+
 /// A message on its way: sent when `due` passes, unless Undo brings its
 /// composer back first.
 struct PendingSend {
@@ -297,6 +318,12 @@ pub struct OwlPostApp {
     /// Sent messages held back for a few seconds (Undo Send).
     pending_sends: Vec<PendingSend>,
     next_send_id: u64,
+    /// "Show original" windows.
+    originals: Vec<Original>,
+    /// Conversations being dragged towards the sidebar.
+    dragging: Option<Vec<(AccountId, String)>>,
+    /// The sidebar entry under the pointer while dragging (set each frame).
+    drop_target: Option<DropTarget>,
     /// Parent folders whose subfolders are shown (see [`folder_key`]);
     /// the rest start folded.
     open_folders: HashSet<String>,
@@ -455,6 +482,9 @@ impl OwlPostApp {
             hiding: HashMap::new(),
             pending_sends: vec![],
             next_send_id: 1,
+            originals: vec![],
+            dragging: None,
+            drop_target: None,
             selection: Selection::Unified(FolderRole::Inbox),
             search: String::new(),
             focus_search: false,
@@ -585,10 +615,10 @@ impl OwlPostApp {
     // ----- Undo Send ----------------------------------------------------------
 
     /// Send now, or after the Undo Send delay (the composer is kept until then).
-    fn queue_send(&mut self, account: AccountId, out: OutgoingMessage, mut composer: Composer) {
+    fn queue_send(&mut self, account: AccountId, out: OutgoingMessage, composer: Composer) {
         let secs = self.list_settings.undo_send_secs;
         if secs == 0 {
-            self.worker.send(Cmd::Send(account, out, composer.draft.take()));
+            self.worker.send(Cmd::Send(account, out, draft_ref(&composer)));
             return;
         }
         let id = self.next_send_id;
@@ -602,9 +632,10 @@ impl OwlPostApp {
         let now = Instant::now();
         let (due, wait): (Vec<PendingSend>, Vec<PendingSend>) = std::mem::take(&mut self.pending_sends).into_iter().partition(|p| all || p.due <= now);
         self.pending_sends = wait;
-        for mut p in due {
+        for p in due {
             self.undo.retain(|u| !matches!(u, Undo::Send { id } if *id == p.id));
-            self.worker.send(Cmd::Send(p.account, p.out, p.composer.draft.take()));
+            let r = draft_ref(&p.composer);
+            self.worker.send(Cmd::Send(p.account, p.out, r));
         }
     }
 
@@ -623,11 +654,12 @@ impl OwlPostApp {
 
     /// Quitting with messages still waiting: send them before the app goes.
     fn send_pending_now(&mut self) {
-        for mut p in std::mem::take(&mut self.pending_sends) {
+        for p in std::mem::take(&mut self.pending_sends) {
             let Some(acc) = self.accounts.iter().find(|a| a.id == p.account).cloned() else { continue };
+            let saved = crate::worker::latest_draft(&draft_ref(&p.composer));
             match engine::send(&self.store, &acc, &p.out) {
                 Ok(_) => {
-                    if let Some(d) = p.composer.draft.take() {
+                    if let Some(d) = saved {
                         if let Some(da) = self.accounts.iter().find(|a| a.id == d.account_id) {
                             let _ = engine::delete_draft(&self.store, da, &d);
                         }
@@ -636,7 +668,7 @@ impl OwlPostApp {
                 // Keep it rather than lose it: save it as a draft.
                 Err(e) => {
                     log::warn!("sending on quit failed: {e:#}");
-                    let _ = engine::save_draft(&self.store, &acc, &p.out, p.composer.draft.as_deref());
+                    let _ = engine::save_draft(&self.store, &acc, &p.out, saved.as_ref());
                 }
             }
         }
@@ -760,6 +792,16 @@ impl OwlPostApp {
             return;
         }
         let targets = std::mem::take(&mut self.marked);
+        self.apply_to(targets, text, f);
+    }
+
+    /// Run `f` on these conversations; with several, one ⌘Z and one toast.
+    fn apply_to(&mut self, targets: Vec<(AccountId, String)>, text: impl FnOnce(usize) -> String, mut f: impl FnMut(&mut Self, AccountId, &str)) {
+        if let [(a, k)] = targets.as_slice() {
+            f(self, *a, k);
+            return;
+        }
+        self.marked.clear();
         self.open = None;
         self.selected = None;
         let (u0, t0) = (self.undo.len(), self.toasts.len());
@@ -1192,6 +1234,127 @@ impl OwlPostApp {
         });
     }
 
+    /// Dragged conversations released over a sidebar entry.
+    fn drop_on(&mut self, keys: Vec<(AccountId, String)>, target: DropTarget) {
+        match target {
+            DropTarget::Role(role) => {
+                let done = match role {
+                    FolderRole::Archive => "Archived",
+                    FolderRole::Trash => "Moved to Trash",
+                    FolderRole::Spam => "Reported as spam",
+                    _ => "Moved to Inbox",
+                };
+                self.apply_to(keys, |n| format!("{done} {n} conversations"), |s, a, k| s.move_thread(a, k, role));
+            }
+            DropTarget::Folder(f) => {
+                // Folders belong to one account.
+                let (mine, other): (Vec<_>, Vec<_>) = keys.into_iter().partition(|(a, _)| *a == f.account_id);
+                if !other.is_empty() {
+                    self.toast(format!("{} of them {} in another account, so stayed put", other.len(), if other.len() == 1 { "is" } else { "are" }), true);
+                }
+                if mine.is_empty() || self.viewed_folder(f.account_id) == Some(f.id) {
+                    return;
+                }
+                let name = folder_label(&f);
+                match f.role {
+                    FolderRole::Inbox | FolderRole::Archive | FolderRole::Spam | FolderRole::Trash => {
+                        let role = f.role;
+                        self.apply_to(mine, |n| format!("Moved {n} conversations to {name}"), |s, a, k| s.move_thread(a, k, role))
+                    }
+                    _ => self.apply_to(mine, |n| format!("Moved {n} conversations to {name}"), |s, a, k| s.move_to(a, k, &f)),
+                }
+            }
+        }
+    }
+
+    /// The drag in progress: a label under the pointer, and the drop on release.
+    fn drag_overlay(&mut self, ctx: &egui::Context) {
+        let Some(keys) = &self.dragging else { return };
+        let n = keys.len();
+        let (pos, released) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.any_released() || !i.pointer.any_down()));
+        if released {
+            let keys = self.dragging.take().unwrap_or_default();
+            if let Some(t) = self.drop_target.take() {
+                self.drop_on(keys, t);
+            }
+            return;
+        }
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some(pos) = pos {
+            let what = if n == 1 { "1 conversation".to_string() } else { format!("{n} conversations") };
+            let text = match &self.drop_target {
+                Some(DropTarget::Role(r)) => format!("Move {what} to {}", r.label()),
+                Some(DropTarget::Folder(f)) => format!("Move {what} to {}", folder_label(f)),
+                None => format!("Move {what}"),
+            };
+            egui::Area::new(egui::Id::new("drag_mail")).fixed_pos(pos + egui::vec2(14.0, 10.0)).order(egui::Order::Tooltip).interactable(false).show(ctx, |ui| {
+                egui::Frame::new().fill(egui::Color32::from_rgb(40, 44, 52)).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 7)).show(ui, |ui| {
+                    ui.label(RichText::new(format!("✉  {text}")).color(egui::Color32::WHITE));
+                });
+            });
+        }
+        ctx.request_repaint();
+    }
+
+    /// "Show original": fetch the newest message's raw source.
+    fn show_original(&mut self) {
+        let Some(m) = self.open.as_ref().and_then(|o| o.messages.last()).cloned() else { return };
+        self.toast("Fetching the original…", false);
+        self.worker.send(Cmd::ShowOriginal(Box::new(m)));
+    }
+
+    /// The "Show original" windows: the raw message, selectable, to copy or save.
+    fn original_windows(&mut self, ctx: &egui::Context) {
+        let col = self.colors.clone();
+        let mut close = vec![];
+        let mut notice = None;
+        for o in &self.originals {
+            let title = format!("Original — {}", o.subject);
+            let vid = egui::ViewportId::from_hash_of(("original", o.id));
+            let builder = egui::ViewportBuilder::default().with_title(&title).with_inner_size([820.0, 640.0]);
+            ctx.show_viewport_immediate(vid, builder, |ctx, class| {
+                let body = |ui: &mut egui::Ui, notice: &mut Option<String>| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(o.text.clone());
+                            *notice = Some("Copied the original".into());
+                        }
+                        if ui.button("Save as .eml…").clicked() {
+                            let name = format!("{}.eml", owlpost_core::engine::safe_filename(&o.subject));
+                            if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() {
+                                *notice = Some(match std::fs::write(&path, &o.text) {
+                                    Ok(()) => format!("Saved {}", path.display()),
+                                    Err(e) => format!("Couldn't save: {e}"),
+                                });
+                            }
+                        }
+                        ui.label(RichText::new(format!("{} KB", o.text.len() / 1024)).small().color(col.subtle));
+                    });
+                    ui.separator();
+                    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut o.text.as_str()).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).code_editor());
+                    });
+                };
+                if class == egui::ViewportClass::Embedded {
+                    let mut open = true;
+                    egui::Window::new(&title).id(egui::Id::new(("original", o.id))).open(&mut open).default_size([760.0, 560.0]).show(ctx, |ui| body(ui, &mut notice));
+                    if !open {
+                        close.push(o.id);
+                    }
+                    return;
+                }
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(col.bg).inner_margin(egui::Margin::same(12))).show(ctx, |ui| body(ui, &mut notice));
+                if ctx.input(|i| i.viewport().close_requested()) || ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::W)) {
+                    close.push(o.id);
+                }
+            });
+        }
+        self.originals.retain(|o| !close.contains(&o.id));
+        if let Some(n) = notice {
+            self.toast(n, false);
+        }
+    }
+
     /// Open a saved draft in a composer (its attachments are fetched first).
     fn edit_draft(&mut self, m: Message) {
         if self.composers.iter().any(|c| c.draft.as_ref().is_some_and(|d| d.message_id == m.message_id)) {
@@ -1239,6 +1402,26 @@ impl OwlPostApp {
                 Event::Changed => changed = true,
                 Event::Error(e) => self.toast(e, true),
                 Event::Notice(s) => self.toast(s, false),
+                Event::DraftSaved(id, r) => {
+                    if let Some(c) = self.composers.iter_mut().chain(self.pending_sends.iter_mut().map(|p| &mut p.composer)).find(|c| c.id == id) {
+                        c.saving = false;
+                        match r {
+                            Ok(m) => {
+                                c.draft = Some(m);
+                                c.status = Some(format!("Saved {}", chrono::Local::now().format("%H:%M")));
+                            }
+                            Err(_) => c.status = Some("Couldn't save the draft — it will try again as you type".into()),
+                        }
+                    }
+                }
+                Event::Original(subject, r) => match r {
+                    Ok(text) => {
+                        let id = self.next_composer_id;
+                        self.next_composer_id += 1;
+                        self.originals.push(Original { id, subject, text });
+                    }
+                    Err(e) => self.toast(format!("Couldn't show the original: {e}"), true),
+                },
                 Event::DraftReady(m, r) => {
                     self.opening_drafts.remove(&m.message_id);
                     match (r, self.accounts.iter().find(|a| a.id == m.account_id).cloned()) {
@@ -1726,12 +1909,19 @@ impl OwlPostApp {
                     action = Some(id);
                 }
             }
+            if self.open.is_some() {
+                ui.separator();
+                if ui.add(egui::Button::new("Show original").frame(false).min_size(egui::vec2(190.0, 24.0))).on_hover_text("The newest message's raw source").clicked() {
+                    action = Some(4);
+                }
+            }
         });
         match action {
             Some(0) => self.act_star(),
             Some(1) => self.act_unread(),
             Some(2) => self.act_move(FolderRole::Trash),
             Some(3) => self.act_move(FolderRole::Spam),
+            Some(4) => self.show_original(),
             _ => {}
         }
     }
@@ -1775,7 +1965,13 @@ impl OwlPostApp {
                             _ => 0,
                         };
                         let sel = self.selection == Selection::Unified(role) && self.search.is_empty();
-                        if nav_item(ui, &col, role_icon(role), label, count, sel) {
+                        // Dragged mail can land on Inbox, Archive, Spam and Trash.
+                        let droppable = self.dragging.is_some() && matches!(role, FolderRole::Inbox | FolderRole::Archive | FolderRole::Spam | FolderRole::Trash);
+                        let over = droppable && ui.rect_contains_pointer(egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 31.0)));
+                        if over {
+                            self.drop_target = Some(DropTarget::Role(role));
+                        }
+                        if nav_item_r(ui, &col, role_icon(role), label, count, sel, over).clicked() {
                             self.set_selection(Selection::Unified(role));
                         }
                         if role == FolderRole::Starred {
@@ -1834,7 +2030,12 @@ impl OwlPostApp {
                             let count = if matches!(f.role, FolderRole::Inbox | FolderRole::Spam | FolderRole::Other) { f.unread } else { 0 };
                             let sel = self.selection == Selection::Folder(f.id) && self.search.is_empty();
                             let label = if f.role == FolderRole::All { "All Mail".to_string() } else { f.role.label().to_string() };
-                            if nav_item(ui, &col, role_icon(f.role), &label, count, sel) {
+                            let droppable = self.dragging.is_some() && matches!(f.role, FolderRole::Inbox | FolderRole::Archive | FolderRole::Spam | FolderRole::Trash | FolderRole::All);
+                            let over = droppable && ui.rect_contains_pointer(egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 31.0)));
+                            if over {
+                                self.drop_target = Some(DropTarget::Folder(f.clone()));
+                            }
+                            if nav_item_r(ui, &col, role_icon(f.role), &label, count, sel, over).clicked() {
                                 self.set_selection(Selection::Folder(f.id));
                             }
                         }
@@ -1871,7 +2072,11 @@ impl OwlPostApp {
                                         toggle = Some(key.clone());
                                     }
                                 }
-                                if nav_item(ui, &col, Icon::Folder, &f.name, count, sel) {
+                                let over = self.dragging.is_some() && ui.rect_contains_pointer(egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 31.0)));
+                                if over {
+                                    self.drop_target = Some(DropTarget::Folder((*f).clone()));
+                                }
+                                if nav_item_r(ui, &col, Icon::Folder, &f.name, count, sel, over).clicked() {
                                     self.set_selection(Selection::Folder(f.id));
                                 }
                             });
@@ -2118,15 +2323,30 @@ impl OwlPostApp {
                         if self.swipe.is_none() && resp.contains_pointer() && fresh_gesture && wheel_x.abs() > wheel_y.abs() && wheel_x.abs() > 0.5 {
                             self.swipe = Some(Swipe::new(&t, SwipePhase::Trackpad, wheel_x));
                         }
-                        // …or a mouse drag.
-                        if resp.dragged() {
+                        // …or a mouse drag: sideways swipes, up/down picks the
+                        // conversation up to drop on a folder in the sidebar.
+                        if resp.dragged() && self.dragging.is_none() {
                             let dx = resp.drag_delta().x;
+                            let (origin, at) = ui.ctx().input(|inp| (inp.pointer.press_origin(), inp.pointer.interact_pos()));
+                            let moved = match (origin, at) {
+                                (Some(o), Some(p)) => p - o,
+                                _ => egui::Vec2::ZERO,
+                            };
+                            // Dragged out of the list into the sidebar: that's a move too.
+                            let into_sidebar = self.show_sidebar && at.is_some_and(|p| p.x < self.sidebar_right);
+                            let pick_up = |s: &mut Self| {
+                                s.swipe = None;
+                                let key = (t.account_id, t.thread_key.clone());
+                                s.dragging = Some(if s.is_marked(key.0, &key.1) { s.marked.clone() } else { vec![key] });
+                            };
                             match &mut self.swipe {
+                                Some(s) if is_this(s) && into_sidebar => pick_up(self),
                                 Some(s) if is_this(s) => {
                                     s.phase = SwipePhase::Drag;
                                     s.offset += dx;
                                 }
-                                None if dx != 0.0 => self.swipe = Some(Swipe::new(&t, SwipePhase::Drag, dx)),
+                                None if moved.length() >= 6.0 && moved.y.abs() > moved.x.abs() => pick_up(self),
+                                None if moved.length() >= 6.0 => self.swipe = Some(Swipe::new(&t, SwipePhase::Drag, moved.x)),
                                 _ => {}
                             }
                         }
@@ -2790,12 +3010,24 @@ impl OwlPostApp {
     }
 
     fn windows(&mut self, ctx: &egui::Context) {
+        self.original_windows(ctx);
         let col = self.colors.clone();
         // Composers.
         let mut i = 0;
         while i < self.composers.len() {
             match self.composers[i].ui(ctx, &self.accounts, &self.store, &col, &self.sigs) {
-                ComposerAction::None => i += 1,
+                ComposerAction::None => {
+                    // Autosave once typing pauses.
+                    let c = &mut self.composers[i];
+                    if c.wants_autosave() {
+                        let r = draft_ref(c);
+                        let out = c.begin_save();
+                        self.worker.send(Cmd::SaveDraft(c.account_id, out, r, false));
+                    }
+                    // Wake up to save even if nothing else happens.
+                    ctx.request_repaint_after(Duration::from_secs(1));
+                    i += 1;
+                }
                 ComposerAction::Discard => {
                     self.composers.remove(i);
                 }
@@ -2814,14 +3046,13 @@ impl OwlPostApp {
                     self.queue_send(acc, *out, composer);
                 }
                 ComposerAction::SaveDraft(acc, out) => {
-                    let replace = self.composers[i].draft.take();
-                    self.worker.send(Cmd::SaveDraft(acc, *out, replace));
+                    let r = draft_ref(&self.composers[i]);
+                    self.worker.send(Cmd::SaveDraft(acc, *out, r, true));
                     self.composers.remove(i);
                 }
                 ComposerAction::DeleteDraft => {
-                    if let Some(d) = self.composers[i].draft.take() {
-                        self.worker.send(Cmd::DeleteDraft(d));
-                    }
+                    let r = draft_ref(&self.composers[i]);
+                    self.worker.send(Cmd::DeleteDraft(r));
                     self.composers.remove(i);
                 }
             }
@@ -3281,10 +3512,18 @@ fn role_icon(role: FolderRole) -> Icon {
 
 /// A sidebar row: line icon, name, and a quiet count on the right.
 fn nav_item(ui: &mut egui::Ui, col: &Colors, icon: Icon, label: &str, count: i64, selected: bool) -> bool {
+    nav_item_r(ui, col, icon, label, count, selected, false).clicked()
+}
+
+/// A sidebar entry. `drop` highlights it as where dragged mail will land.
+fn nav_item_r(ui: &mut egui::Ui, col: &Colors, icon: Icon, label: &str, count: i64, selected: bool, drop: bool) -> egui::Response {
     let h = 31.0;
     let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
     let p = ui.painter_at(rect);
-    if selected {
+    if drop {
+        p.rect_filled(rect, 8.0, style::blend(col.accent, col.sidebar, 0.25));
+        p.rect_stroke(rect.shrink(0.5), 8.0, egui::Stroke::new(1.5_f32, col.accent), egui::StrokeKind::Inside);
+    } else if selected {
         p.rect_filled(rect, 8.0, col.sidebar_active);
     } else if r.hovered() {
         p.rect_filled(rect, 8.0, style::blend(col.sidebar_active, col.sidebar, 0.5));
@@ -3311,7 +3550,7 @@ fn nav_item(ui: &mut egui::Ui, col: &Colors, icon: Icon, label: &str, count: i64
     } else {
         style::line(&p, pos, label, font, fg, max);
     }
-    r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Returns true when the header was clicked (toggle expand).
@@ -3665,6 +3904,8 @@ impl OwlPostApp {
             self.flush_sends(false);
             ctx.request_repaint_after(Duration::from_millis(250));
         }
+        // Set again by the sidebar this frame if the pointer is over a target.
+        self.drop_target = None;
         self.web_rect = None;
         self.mail_view_events(ctx);
         if self.accounts.is_empty() {
@@ -3694,6 +3935,7 @@ impl OwlPostApp {
         self.thread_list(ctx);
         self.reader(ctx);
         self.windows(ctx);
+        self.drag_overlay(ctx);
         self.place_mail_view(ctx);
         // Keep relative times and snooze wake-ups fresh.
         ctx.request_repaint_after(Duration::from_secs(30));
@@ -4026,21 +4268,31 @@ mod ui_tests {
         h.key_press_modifiers(egui::Modifiers::COMMAND, Key::W);
         h.run_steps(2);
         assert!(h.state().composers.is_empty(), "⌘W closes an empty composer");
-        // One with text asks first, and stays open.
-        h.state_mut().compose_new();
-        h.state_mut().composers[0].body = "Half-written thought".into();
-        h.run_steps(2);
-        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::W);
-        h.run_steps(2);
-        assert_eq!(h.state().composers.len(), 1, "⌘W never silently drops a draft");
-        save(&mut h, "composer-confirm-close");
         // With Preferences open over a composer, ⌘W closes Preferences only.
+        h.state_mut().compose_new();
+        h.run_steps(2);
         h.state_mut().prefs = Some(Prefs::new(Tab::Appearance));
         h.run_steps(2);
         h.key_press_modifiers(egui::Modifiers::COMMAND, Key::W);
         h.run_steps(2);
         assert!(h.state().prefs.is_none());
         assert_eq!(h.state().composers.len(), 1);
+        // One with text closes too, and is kept as a draft.
+        h.state_mut().composers[0].subject = "Half-written thought".into();
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::W);
+        h.run_steps(2);
+        assert!(h.state().composers.is_empty());
+        let mut saved = false;
+        for _ in 0..100 {
+            h.run_steps(1);
+            if !h.state().store.threads(&MailboxView::Unified(FolderRole::Drafts), "subject:Half-written", 5).unwrap().is_empty() {
+                saved = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saved, "⌘W never drops a message: it's saved to Drafts");
     }
 
     #[test]
@@ -4082,16 +4334,146 @@ mod ui_tests {
         h.key_press_modifiers(egui::Modifiers::COMMAND, Key::W);
         h.run_steps(2);
         assert!(h.state().composers.is_empty(), "an unchanged draft closes straight away");
-        // Changed: ⌘W asks, offering Save draft.
+        // Changed: ⌘W saves the change, replacing the old copy.
         let mut c = Composer::from_draft(8, &acc, &m, Default::default(), &h.state().sigs);
         c.body.push_str(" See you at 7.");
         h.state_mut().composers.push(c);
         h.run_steps(2);
         h.key_press_modifiers(egui::Modifiers::COMMAND, Key::W);
         h.run_steps(2);
-        assert_eq!(h.state().composers.len(), 1);
-        assert!(h.query_by_label("Save draft").is_some());
-        save(&mut h, "composer-save-draft");
+        assert!(h.state().composers.is_empty());
+        let drafts = |h: &Harness<'static, OwlPostApp>| {
+            h.state().store.thread_messages(acc.id, &t.thread_key).unwrap().into_iter().filter(|m| m.body_text.starts_with("Sounds lovely")).map(|m| m.body_text).collect::<Vec<_>>()
+        };
+        let mut ok = false;
+        for _ in 0..100 {
+            h.run_steps(1);
+            let d = drafts(&h);
+            if d.len() == 1 && d[0].starts_with("Sounds lovely! See you at 7.") {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ok, "one draft, with the change: {:?}", drafts(&h));
+    }
+
+    #[test]
+    fn drafts_save_themselves() {
+        let mut h = harness("owlpost-light");
+        h.run_steps(2);
+        let acc = h.state().accounts[0].clone();
+        let mut c = Composer::new(70, &acc);
+        c.to = "ann@example.com".into();
+        h.state_mut().composers.push(c);
+        h.run_steps(2);
+        // Typing, then a pause: saved without asking.
+        h.state_mut().composers[0].subject = "Autosave check".into();
+        h.run_steps(1);
+        let found = |h: &Harness<'static, OwlPostApp>| h.state().store.threads(&MailboxView::Unified(FolderRole::Drafts), "subject:Autosave", 5).unwrap().len();
+        assert_eq!(found(&h), 0, "not before the pause");
+        let mut n = 0;
+        for _ in 0..80 {
+            h.run_steps(1);
+            n = found(&h);
+            if n > 0 && h.state().composers[0].draft.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert_eq!(n, 1, "saved after the pause");
+        assert!(h.state().composers[0].status.as_deref().is_some_and(|s| s.starts_with("Saved")));
+        save(&mut h, "composer-autosaved");
+        // More typing replaces it rather than adding another copy.
+        h.state_mut().composers[0].body = "Second version".into();
+        for _ in 0..80 {
+            h.run_steps(1);
+            std::thread::sleep(Duration::from_millis(60));
+            let d = h.state().composers[0].draft.as_ref().map(|d| d.body_text.clone()).unwrap_or_default();
+            if d.starts_with("Second version") {
+                break;
+            }
+        }
+        assert_eq!(found(&h), 1, "still one draft");
+        // Sending removes it.
+        h.state_mut().list_settings.undo_send_secs = 0;
+        let c = h.state_mut().composers.remove(0);
+        let out = c.draft();
+        h.state_mut().queue_send(acc.id, out, c);
+        let mut gone = false;
+        for _ in 0..100 {
+            h.run_steps(1);
+            if found(&h) == 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone, "sent, so no draft left");
+    }
+
+    #[test]
+    fn drag_conversations_onto_folders() {
+        let mut h = harness("owlpost-light");
+        h.run_steps(2);
+        let before = h.state().rows.len();
+        // Two selected, dropped on the All Accounts Archive.
+        h.state_mut().toggle_mark(0);
+        h.state_mut().toggle_mark(1);
+        let keys = h.state().marked.clone();
+        h.state_mut().dragging = Some(keys.clone());
+        h.state_mut().drop_on(keys, DropTarget::Role(FolderRole::Archive));
+        h.run_steps(2);
+        assert_eq!(h.state().rows.len(), before - 2);
+        assert!(h.state().toasts.iter().any(|t| t.text == "Archived 2 conversations"));
+        // One conversation onto a folder of another account stays put.
+        let row = h.state().rows[0].t.clone();
+        let other = h.state().folders.iter().find(|(a, _)| **a != row.account_id).and_then(|(_, fs)| fs.iter().find(|f| f.role == FolderRole::Other).cloned()).unwrap();
+        h.state_mut().drop_on(vec![(row.account_id, row.thread_key.clone())], DropTarget::Folder(other));
+        assert!(h.state().rows.iter().any(|r| r.t.thread_key == row.thread_key));
+        assert!(h.state().toasts.iter().any(|t| t.error && t.text.contains("another account")));
+        // A real drag: press on the first row, move down (picks it up), then
+        // left onto All Accounts → Archive, and let go.
+        let rows_before = h.state().rows.len();
+        let first = h.state().rows[0].t.thread_key.clone();
+        let x = (h.state().sidebar_right + h.state().list_right) / 2.0;
+        let start = egui::pos2(x, 280.0);
+        let pointer = |h: &mut Harness<'static, OwlPostApp>, p: egui::Pos2| {
+            h.event(egui::Event::PointerMoved(p));
+            h.run_steps(1);
+        };
+        let button = |h: &mut Harness<'static, OwlPostApp>, p: egui::Pos2, pressed: bool| {
+            h.event(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+            h.run_steps(1);
+        };
+        pointer(&mut h, start);
+        button(&mut h, start, true);
+        for dy in [4.0, 10.0, 20.0, 30.0] {
+            pointer(&mut h, start + egui::vec2(0.0, dy));
+        }
+        assert!(h.state().dragging.is_some(), "picked up");
+        let archive = egui::pos2(80.0, 301.0);
+        for t in [0.3, 0.6, 1.0] {
+            pointer(&mut h, start + (archive - start) * t);
+        }
+        assert!(matches!(h.state().drop_target, Some(DropTarget::Role(FolderRole::Archive))), "over Archive");
+        save(&mut h, "dragging");
+        button(&mut h, archive, false);
+        h.run_steps(2);
+        assert!(h.state().dragging.is_none());
+        assert_eq!(h.state().rows.len(), rows_before - 1, "dropped on Archive");
+        assert!(!h.state().rows.iter().any(|r| r.t.thread_key == first));
+    }
+
+    #[test]
+    fn show_original_window() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness("owlpost-light");
+        h.run_steps(2);
+        h.state_mut().originals.push(Original { id: 900, subject: "Rates".into(), text: "From: rates@example.com\r\nSubject: Rates\r\n\r\nKia ora".into() });
+        h.run_steps(3);
+        assert!(h.query_by_label("Save as .eml…").is_some());
+        save(&mut h, "show-original");
     }
 
     #[test]

@@ -52,8 +52,6 @@ pub struct Composer {
     show_tail: bool,
     focus_first: bool,
     focus_body: bool,
-    /// The window's close button was pressed on a non-empty draft.
-    confirm_close: bool,
     pub attachments: Vec<Attached>,
     /// How big attached photos are sent.
     pub image_size: ImageSize,
@@ -62,19 +60,31 @@ pub struct Composer {
     /// The saved draft this window is editing: replaced when saved again,
     /// deleted once sent or discarded.
     pub draft: Option<Box<Message>>,
-    /// The fields as the draft was opened, to close without asking when
-    /// nothing changed.
-    pristine: Option<String>,
+    /// Autosave: the fields as last seen, when they last changed, and as
+    /// last saved (or as opened, so an untouched reply saves nothing).
+    last_seen: String,
+    last_change: std::time::Instant,
+    pub saved: String,
+    tracked: bool,
+    /// A save is on its way to the server.
+    pub saving: bool,
+    /// ⌘S: save now rather than after the pause.
+    save_requested: bool,
+    /// "Saving…", "Saved 14:02" or a problem, shown in the footer.
+    pub status: Option<String>,
 }
+
+/// Drafts save themselves this long after you stop typing.
+pub const AUTOSAVE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub enum ComposerAction {
     None,
     Send(AccountId, Box<OutgoingMessage>),
     /// Save to the Drafts folder and close.
     SaveDraft(AccountId, Box<OutgoingMessage>),
-    /// Close, keeping any saved draft as it was.
+    /// Close, keeping any saved draft as it is (nothing changed since).
     Discard,
-    /// Close and delete the saved draft (the Discard button on a draft).
+    /// Close and delete any saved draft (Discard, or closing an empty window).
     DeleteDraft,
 }
 
@@ -100,12 +110,17 @@ impl Composer {
             show_tail: false,
             focus_first: true,
             focus_body: false,
-            confirm_close: false,
             attachments: vec![],
             image_size: ImageSize::Actual,
             bottom_h: 48.0,
             draft: None,
-            pristine: None,
+            last_seen: String::new(),
+            last_change: std::time::Instant::now(),
+            saved: String::new(),
+            tracked: false,
+            saving: false,
+            save_requested: false,
+            status: None,
         }
     }
 
@@ -138,11 +153,43 @@ impl Composer {
         c.draft = Some(Box::new(m.clone()));
         c.focus_first = c.to.trim().is_empty();
         c.focus_body = !c.focus_first;
-        c.pristine = Some(c.snapshot());
+        c.mark_saved();
         c
     }
 
-    /// The editable fields, to tell whether a reopened draft was changed.
+    /// Treat what's in the window now as saved.
+    fn mark_saved(&mut self) {
+        let s = self.snapshot();
+        self.saved = s.clone();
+        self.last_seen = s;
+        self.tracked = true;
+    }
+
+    /// Time to save a draft: something changed and typing has paused (or ⌘S).
+    pub fn wants_autosave(&self) -> bool {
+        self.tracked
+            && !self.saving
+            && !self.is_blank()
+            && self.last_seen != self.saved
+            && (self.save_requested || self.last_change.elapsed() >= AUTOSAVE_AFTER)
+            && !self.resizing()
+    }
+
+    /// Start saving: what to save, with the fields noted as saved.
+    pub fn begin_save(&mut self) -> OutgoingMessage {
+        self.saved = self.last_seen.clone();
+        self.saving = true;
+        self.save_requested = false;
+        self.status = Some("Saving…".into());
+        self.draft()
+    }
+
+    /// Everything in the window has been saved (or there's nothing to save).
+    fn all_saved(&self) -> bool {
+        self.snapshot() == self.saved
+    }
+
+    /// The editable fields, to tell whether anything changed.
     fn snapshot(&self) -> String {
         let files: Vec<&str> = self.attachments.iter().map(|a| a.name.as_str()).collect();
         format!("{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{:?}\u{1}{}\u{1}{:?}", self.account_id, self.to, self.cc, self.bcc, self.subject, files, self.body, self.signature.as_ref().map(|s| s.id))
@@ -296,7 +343,7 @@ impl Composer {
                     .show(ctx, |ui| action = self.contents(ui, accounts, store, col, sigs));
                 self.take_dropped_files(ctx, col);
                 if !open {
-                    action = ComposerAction::Discard;
+                    self.request_close(&mut action);
                 }
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::W)) {
                     self.request_close(&mut action);
@@ -308,11 +355,8 @@ impl Composer {
                 .frame(egui::Frame::new().fill(col.bg).inner_margin(egui::Margin::same(16)))
                 .show(ctx, |ui| action = self.contents(ui, accounts, store, col, sigs));
             self.take_dropped_files(ctx, col);
-            // Drafts aren't saved yet, so ask before throwing away any text.
+            // Closing keeps the message as a draft (saved now if it changed).
             if ctx.input(|i| i.viewport().close_requested()) {
-                if !self.is_blank() && self.pristine.as_deref() != Some(&self.snapshot()) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                }
                 self.request_close(&mut action);
             }
             // ⌘W closes this window, like the close button.
@@ -320,20 +364,22 @@ impl Composer {
                 self.request_close(&mut action);
             }
             if ctx.input(|i| i.key_pressed(Key::Escape)) && self.is_blank() {
-                action = ComposerAction::Discard;
+                action = ComposerAction::DeleteDraft;
             }
             action
         })
     }
 
-    /// Close (⌘W or the close button): straight away when nothing's been
-    /// typed, otherwise ask first.
+    /// Close (⌘W or the close button). Nothing is lost: an empty window
+    /// leaves no draft, and anything typed is kept as one.
     fn request_close(&mut self, action: &mut ComposerAction) {
-        if self.is_blank() || self.pristine.as_deref() == Some(&self.snapshot()) {
-            *action = ComposerAction::Discard;
+        *action = if self.is_blank() {
+            ComposerAction::DeleteDraft
+        } else if self.all_saved() && !self.saving {
+            ComposerAction::Discard
         } else {
-            self.confirm_close = true;
-        }
+            ComposerAction::SaveDraft(self.account_id, Box::new(self.draft()))
+        };
     }
 
     /// Nothing typed or attached yet (the signature and quoted text don't count).
@@ -344,36 +390,19 @@ impl Composer {
     fn contents(&mut self, ui: &mut egui::Ui, accounts: &[Account], store: &Store, col: &Colors, sigs: &SignatureBook) -> ComposerAction {
         let mut action = ComposerAction::None;
         let mut any_focus = false;
-        if self.confirm_close {
-            egui::Frame::new().fill(col.bg_secondary).corner_radius(6).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let what = if self.draft.is_some() { "Save your changes to this draft?" } else { "Save this message as a draft?" };
-                    ui.label(RichText::new(what).strong());
-                    if style::primary_button(ui, col, "Save draft").clicked() {
-                        action = ComposerAction::SaveDraft(self.account_id, Box::new(self.draft()));
-                    }
-                    // No keyboard shortcut for Discard: typing on shouldn't lose the draft.
-                    let discard = if self.draft.is_some() { "Discard changes" } else { "Discard" };
-                    if ui.button(discard).clicked() {
-                        action = ComposerAction::Discard;
-                    }
-                    if ui.button("Keep editing").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                        self.confirm_close = false;
-                    }
-                });
-            });
-            ui.add_space(6.0);
-            if matches!(action, ComposerAction::Discard | ComposerAction::SaveDraft(..)) {
-                return action;
+        // Note changes, for autosave (once the signature is in place).
+        if self.sig_resolved {
+            let snap = self.snapshot();
+            if !self.tracked {
+                self.mark_saved();
+            } else if snap != self.last_seen {
+                self.last_seen = snap;
+                self.last_change = std::time::Instant::now();
             }
         }
-        // ⌘S saves a draft and closes the window.
+        // ⌘S saves the draft now.
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S)) && !self.is_blank() {
-            if self.resizing() {
-                return ComposerAction::None;
-            }
-            return ComposerAction::SaveDraft(self.account_id, Box::new(self.draft()));
+            self.save_requested = true;
         }
         egui::Grid::new(("hdr", self.id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
             ui.label(RichText::new("From").color(col.subtle));
@@ -485,7 +514,7 @@ impl Composer {
             ui.ctx().request_repaint();
         }
         if discard {
-            return if self.draft.is_some() { ComposerAction::DeleteDraft } else { ComposerAction::Discard };
+            return ComposerAction::DeleteDraft;
         }
         let shortcut = any_focus && ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
         if (send_clicked || shortcut) && self.can_send().is_ok() {
@@ -542,6 +571,10 @@ impl Composer {
                     }
                 });
                 ui.label(RichText::new("Signature").color(col.subtle));
+                if let Some(st) = &self.status {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(st).small().color(col.very_subtle));
+                }
                 if chosen != current {
                     self.sig_touched = true;
                     self.set_signature(chosen.and_then(|id| sigs.get(id)));

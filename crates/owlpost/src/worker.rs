@@ -23,14 +23,17 @@ pub enum Cmd {
     Label(AccountId, String, FolderId, bool),
     /// Create a folder/label, then optionally move or label a thread into it.
     CreateFolder(AccountId, String, Option<(Vec<String>, FolderUse)>),
-    /// Send; the draft it was finished from (if any) is then deleted.
-    Send(AccountId, OutgoingMessage, Option<Box<Message>>),
-    /// Save to the Drafts folder, replacing the draft it was opened from.
-    SaveDraft(AccountId, OutgoingMessage, Option<Box<Message>>),
+    /// Send; the composer's saved draft (if any) is then deleted.
+    Send(AccountId, OutgoingMessage, DraftRef),
+    /// Save to the Drafts folder, replacing the composer's previous draft.
+    /// `true`: the window is closing (say so when it's saved).
+    SaveDraft(AccountId, OutgoingMessage, DraftRef, bool),
     /// Fetch a draft's Bcc and attachments so it can be edited.
     OpenDraft(Box<Message>),
-    /// Delete a saved draft (Discard in a composer editing it).
-    DeleteDraft(Box<Message>),
+    /// Delete a composer's saved draft (Discard).
+    DeleteDraft(DraftRef),
+    /// Fetch a message's raw source for "Show original".
+    ShowOriginal(Box<Message>),
     /// Verify credentials, save the password to the keychain, then add.
     AddAccount(Box<Account>, String),
     /// Download attachment `usize` of a message (or use the cached copy),
@@ -53,6 +56,37 @@ pub enum Cmd {
     CheckGoogle,
 }
 
+/// Which draft a composer's commands act on. The worker remembers each
+/// composer's latest saved draft, so saves that finish late are still
+/// replaced or deleted; `initial` is the draft the window was opened from.
+#[derive(Clone, Debug)]
+pub struct DraftRef {
+    pub composer: u64,
+    pub initial: Option<Box<Message>>,
+}
+
+/// Each composer's newest saved draft (by composer id).
+static DRAFTS: std::sync::Mutex<Option<HashMap<u64, Message>>> = std::sync::Mutex::new(None);
+
+/// The draft a composer last saved, or the one it was opened from.
+pub fn latest_draft(r: &DraftRef) -> Option<Message> {
+    DRAFTS.lock().ok().and_then(|m| m.as_ref().and_then(|m| m.get(&r.composer).cloned())).or_else(|| r.initial.as_deref().cloned())
+}
+
+fn remember_draft(composer: u64, m: Option<Message>) {
+    if let Ok(mut g) = DRAFTS.lock() {
+        let map = g.get_or_insert_with(HashMap::new);
+        match m {
+            Some(m) => {
+                map.insert(composer, m);
+            }
+            None => {
+                map.remove(&composer);
+            }
+        }
+    }
+}
+
 impl Cmd {
     /// The conversation a command changes: commands on the same one run in
     /// the order they were sent (so an undo never overtakes its action).
@@ -60,6 +94,8 @@ impl Cmd {
         match self {
             Cmd::SetUnread(a, k, _) | Cmd::SetStarred(a, k, _) | Cmd::Move(a, k, _) | Cmd::MoveTo(a, k, _, _) | Cmd::Label(a, k, _, _) | Cmd::Restore(a, k, _, _) | Cmd::Snooze(a, k, _) | Cmd::Unsnooze(a, k) => Some((*a, k.clone())),
             Cmd::CreateFolder(a, _, Some((ks, _))) => ks.first().map(|k| (*a, k.clone())),
+            // A composer's saves, send and discard run one after another.
+            Cmd::Send(_, _, r) | Cmd::SaveDraft(_, _, r, _) | Cmd::DeleteDraft(r) => Some((0, format!("composer:{}", r.composer))),
             _ => None,
         }
     }
@@ -136,6 +172,10 @@ pub enum Event {
     /// Google sign-in finished: Ok(message) or Err(reason).
     GoogleDone(Result<String, String>),
     GoogleReady(bool),
+    /// A composer's draft was saved (its new copy), or saving failed.
+    DraftSaved(u64, Result<Box<Message>, String>),
+    /// A message's raw source: (subject, text).
+    Original(String, Result<String, String>),
     /// A draft is ready to edit (or couldn't be opened).
     DraftReady(Box<Message>, Result<owlpost_core::engine::DraftParts, String>),
     /// A sender's picture (by lowercase address), or `None`: use the letter.
@@ -598,11 +638,12 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
                 match engine::send(&store, &acc, &out) {
                     Ok(_) => {
                         let _ = ev.send(Event::Sent(format!("Message sent from {}", acc.email)));
-                        if let Some(d) = draft {
+                        if let Some(d) = latest_draft(&draft) {
                             if let Err(e) = account(d.account_id).and_then(|da| engine::delete_draft(&store, &da, &d)) {
                                 let _ = ev.send(Event::Error(format!("Sent, but the draft couldn't be removed: {e:#}")));
                             }
                         }
+                        remember_draft(draft.composer, None);
                         let _ = ev.send(Event::Changed);
                     }
                     Err(e) => {
@@ -610,23 +651,46 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
                     }
                 }
             }
-            Cmd::SaveDraft(a, out, replace) => {
+            Cmd::SaveDraft(a, out, draft, closing) => {
                 let acc = account(a)?;
+                let replace = latest_draft(&draft);
                 // A draft moved to another account: save it there, then
                 // delete the old one from its own account.
                 let same = replace.as_ref().is_some_and(|d| d.account_id == a);
-                let r = engine::save_draft(&store, &acc, &out, if same { replace.as_deref() } else { None });
+                let r = engine::save_draft(&store, &acc, &out, if same { replace.as_ref() } else { None });
                 if let (Ok(_), Some(d), false) = (&r, &replace, same) {
                     let _ = account(d.account_id).and_then(|da| engine::delete_draft(&store, &da, d));
                 }
+                let saved = r.as_ref().map_err(|e| format!("{e:#}")).and_then(|id| {
+                    store.copy_in_role(a, id, FolderRole::Drafts).ok().flatten().ok_or_else(|| "the saved draft didn't sync back".to_string())
+                });
+                if let Ok(m) = &saved {
+                    remember_draft(draft.composer, Some(m.clone()));
+                }
+                let _ = ev.send(Event::DraftSaved(draft.composer, saved.map(Box::new)));
                 let _ = ev.send(Event::Changed);
                 r.map_err(|e| e.context("Couldn't save the draft"))?;
-                let _ = ev.send(Event::Notice(format!("Draft saved to {}", acc.email)));
+                if closing {
+                    let _ = ev.send(Event::Notice(format!("Draft saved to {}", acc.email)));
+                }
             }
-            Cmd::DeleteDraft(m) => {
-                let r = account(m.account_id).and_then(|acc| engine::delete_draft(&store, &acc, &m));
+            Cmd::DeleteDraft(draft) => {
+                let r = match latest_draft(&draft) {
+                    Some(m) => account(m.account_id).and_then(|acc| engine::delete_draft(&store, &acc, &m)),
+                    None => Ok(()),
+                };
+                remember_draft(draft.composer, None);
                 let _ = ev.send(Event::Changed);
                 r.map_err(|e| e.context("Couldn't delete the draft"))?;
+            }
+            Cmd::ShowOriginal(m) => {
+                let r = account(m.account_id).and_then(|acc| {
+                    if acc.demo {
+                        anyhow::bail!("demo messages have no original on a server");
+                    }
+                    engine::fetch_raw(&store, &acc, &m)
+                });
+                let _ = ev.send(Event::Original(m.subject.clone(), r.map(|raw| String::from_utf8_lossy(&raw).into_owned()).map_err(|e| format!("{e:#}"))));
             }
             Cmd::OpenDraft(m) => {
                 let r = account(m.account_id).and_then(|acc| engine::open_draft(&store, &acc, &m)).map_err(|e| format!("Couldn't open the draft: {e:#}"));
