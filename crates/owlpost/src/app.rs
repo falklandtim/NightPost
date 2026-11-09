@@ -2150,6 +2150,90 @@ impl OwlPostApp {
         );
     }
 
+    /// The searchable list in the Move / Label pickers (toolbar and
+    /// right-click): type to filter, ↑ ↓ to choose, Return to pick.
+    /// Returns the folder picked (and, for a label, whether to add it) or a
+    /// name to create.
+    fn folder_picker_ui(&mut self, ui: &mut egui::Ui, kind: FolderUse, a: AccountId, k: &str, opening: bool) -> (Option<(Folder, bool)>, Option<String>) {
+        if opening {
+            self.picker_query.clear();
+            self.picker_index = 0;
+        }
+        let choices = self.folder_choices(a, kind);
+        let applied: Vec<FolderId> = if kind == FolderUse::Label { self.store.thread_folder_ids(a, k).unwrap_or_default() } else { vec![] };
+        let mut pick: Option<(Folder, bool)> = None;
+        let mut create: Option<String> = None;
+        let col = self.colors.clone();
+        ui.set_min_width(260.0);
+        // Arrow keys move the highlight; take them before the text
+        // field does (it would move the cursor).
+        let (down, up) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, Key::ArrowDown), i.consume_key(egui::Modifiers::NONE, Key::ArrowUp)));
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut self.picker_query)
+                .hint_text(if kind == FolderUse::Move { "Move to…" } else { "Label as…" })
+                .desired_width(250.0),
+        );
+        if opening {
+            r.request_focus();
+        }
+        if r.changed() {
+            self.picker_index = 0;
+        }
+        let q = self.picker_query.trim().to_lowercase();
+        // Names starting with what's typed first, then the rest that contain it.
+        let mut matches: Vec<&Folder> = choices.iter().filter(|f| q.is_empty() || folder_label(f).to_lowercase().contains(&q)).collect();
+        matches.sort_by_key(|f| !folder_label(f).to_lowercase().starts_with(&q));
+        let exact = choices.iter().any(|f| folder_label(f).to_lowercase() == q || f.path.to_lowercase() == q);
+        let can_create = !q.is_empty() && !exact;
+        // The rows you can pick: the matches, then "Create …".
+        let rows = matches.len() + can_create as usize;
+        if rows > 0 {
+            if down {
+                self.picker_index = (self.picker_index + 1).min(rows - 1);
+            }
+            if up {
+                self.picker_index = self.picker_index.saturating_sub(1);
+            }
+        }
+        self.picker_index = self.picker_index.min(rows.saturating_sub(1));
+        let hi = self.picker_index;
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+            for (i, f) in matches.iter().enumerate() {
+                let on = applied.contains(&f.id);
+                let icon = match kind {
+                    FolderUse::Label => if on { "☑" } else { "☐" },
+                    FolderUse::Move => f.role.icon(),
+                };
+                let b = ui.add(egui::Button::selectable(i == hi, format!("{icon}  {}", folder_label(f))).min_size(egui::vec2(250.0, 24.0)));
+                if i == hi && (up || down) {
+                    b.scroll_to_me(None);
+                }
+                if b.clicked() {
+                    pick = Some(((*f).clone(), !on));
+                }
+            }
+            if matches.is_empty() && q.is_empty() {
+                ui.label(RichText::new(if kind == FolderUse::Label { "No labels yet — type a name to create one." } else { "No other folders." }).small().color(col.subtle));
+            }
+        });
+        if can_create {
+            ui.separator();
+            let what = if kind == FolderUse::Move { "folder" } else { "label" };
+            if ui.add(egui::Button::selectable(hi == matches.len(), format!("+  Create {what} “{}”", self.picker_query.trim())).min_size(egui::vec2(250.0, 24.0))).clicked() {
+                create = Some(self.picker_query.trim().to_string());
+            }
+        }
+        if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+            if let Some(f) = matches.get(hi) {
+                pick = Some(((*f).clone(), !applied.contains(&f.id)));
+            } else if can_create {
+                create = Some(self.picker_query.trim().to_string());
+            }
+        }
+        (pick, create)
+    }
+
     /// Searchable Move / Label picker under a toolbar button (`v` / `l`).
     fn folder_popup(&mut self, btn: &egui::Response, kind: FolderUse, target: &(AccountId, String)) {
         let (a, k) = (target.0, target.1.clone());
@@ -2163,84 +2247,15 @@ impl OwlPostApp {
             self.picker_query.clear();
             self.picker_index = 0;
         }
-        let choices = self.folder_choices(a, kind);
-        let applied: Vec<FolderId> = if kind == FolderUse::Label { self.store.thread_folder_ids(a, &k).unwrap_or_default() } else { vec![] };
         let mut pick: Option<(Folder, bool)> = None;
         let mut create: Option<String> = None;
-        let col = self.colors.clone();
         let popup_id = egui::Id::new(popup_id);
         egui::Popup::from_response(btn)
             .id(popup_id)
             .open_memory(opening.then_some(egui::SetOpenCommand::Toggle))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                ui.set_min_width(260.0);
-                // Arrow keys move the highlight; take them before the text
-                // field does (it would move the cursor).
-                let (down, up) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, Key::ArrowDown), i.consume_key(egui::Modifiers::NONE, Key::ArrowUp)));
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.picker_query)
-                        .hint_text(if kind == FolderUse::Move { "Move to…" } else { "Label as…" })
-                        .desired_width(250.0),
-                );
-                if opening {
-                    r.request_focus();
-                }
-                if r.changed() {
-                    self.picker_index = 0;
-                }
-                let q = self.picker_query.trim().to_lowercase();
-                // Names starting with what's typed first, then the rest that contain it.
-                let mut matches: Vec<&Folder> = choices.iter().filter(|f| q.is_empty() || folder_label(f).to_lowercase().contains(&q)).collect();
-                matches.sort_by_key(|f| !folder_label(f).to_lowercase().starts_with(&q));
-                let exact = choices.iter().any(|f| folder_label(f).to_lowercase() == q || f.path.to_lowercase() == q);
-                let can_create = !q.is_empty() && !exact;
-                // The rows you can pick: the matches, then "Create …".
-                let rows = matches.len() + can_create as usize;
-                if rows > 0 {
-                    if down {
-                        self.picker_index = (self.picker_index + 1).min(rows - 1);
-                    }
-                    if up {
-                        self.picker_index = self.picker_index.saturating_sub(1);
-                    }
-                }
-                self.picker_index = self.picker_index.min(rows.saturating_sub(1));
-                let hi = self.picker_index;
-                ui.add_space(4.0);
-                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                    for (i, f) in matches.iter().enumerate() {
-                        let on = applied.contains(&f.id);
-                        let icon = match kind {
-                            FolderUse::Label => if on { "☑" } else { "☐" },
-                            FolderUse::Move => f.role.icon(),
-                        };
-                        let b = ui.add(egui::Button::selectable(i == hi, format!("{icon}  {}", folder_label(f))).min_size(egui::vec2(250.0, 24.0)));
-                        if i == hi && (up || down) {
-                            b.scroll_to_me(None);
-                        }
-                        if b.clicked() {
-                            pick = Some(((*f).clone(), !on));
-                        }
-                    }
-                    if matches.is_empty() && q.is_empty() {
-                        ui.label(RichText::new(if kind == FolderUse::Label { "No labels yet — type a name to create one." } else { "No other folders." }).small().color(col.subtle));
-                    }
-                });
-                if can_create {
-                    ui.separator();
-                    let what = if kind == FolderUse::Move { "folder" } else { "label" };
-                    if ui.add(egui::Button::selectable(hi == matches.len(), format!("+  Create {what} “{}”", self.picker_query.trim())).min_size(egui::vec2(250.0, 24.0))).clicked() {
-                        create = Some(self.picker_query.trim().to_string());
-                    }
-                }
-                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    if let Some(f) = matches.get(hi) {
-                        pick = Some(((*f).clone(), !applied.contains(&f.id)));
-                    } else if can_create {
-                        create = Some(self.picker_query.trim().to_string());
-                    }
-                }
+                (pick, create) = self.folder_picker_ui(ui, kind, a, &k, opening);
             });
         if pick.is_some() || create.is_some() {
             egui::Popup::close_id(&btn.ctx, popup_id);
@@ -2703,6 +2718,7 @@ impl OwlPostApp {
                 // Show a sender's mail, or sort it into a tab.
                 let mut sender_menu: Option<(String, Option<Option<u8>>)> = None;
                 let mut thread_menu: Option<(AccountId, String, Option<u8>)> = None;
+                let mut create_menu: Option<(AccountId, String, String, FolderUse)> = None;
                 let mut new_tab: Option<NewTabFor> = None;
                 let all_tabs: Vec<(u8, String)> = owlpost_core::category::ALL
                     .iter()
@@ -2984,7 +3000,7 @@ impl OwlPostApp {
                                 });
                             }
                             let here = self.store.thread_rule(t.account_id, &t.thread_key).ok().flatten();
-                            ui.menu_button("Move this conversation to", |ui| {
+                            ui.menu_button("Put this conversation in", |ui| {
                                 for (c, name) in &all_tabs {
                                     let mark = if here == Some(*c) { "✓" } else { "  " };
                                     if ui.button(format!("{mark}  {name}")).clicked() {
@@ -3001,25 +3017,23 @@ impl OwlPostApp {
                                 }
                             });
                             ui.separator();
-                            ui.menu_button("Move to", |ui| {
-                                for f in self.folder_choices(t.account_id, FolderUse::Move) {
-                                    if ui.button(format!("{}  {}", f.role.icon(), folder_label(&f))).clicked() {
-                                        folder_menu = Some((t.account_id, t.thread_key.clone(), f, FolderUse::Move, true));
-                                    }
+                            // The same type-to-find lists as the toolbar's Move and Label.
+                            let gmail = self.accounts.iter().any(|a| a.id == t.account_id && a.is_gmail());
+                            for kind in [FolderUse::Move, FolderUse::Label] {
+                                if kind == FolderUse::Label && !gmail {
+                                    continue;
                                 }
-                            });
-                            if self.accounts.iter().any(|a| a.id == t.account_id && a.is_gmail()) {
-                                ui.menu_button("Label", |ui| {
-                                    let on = self.store.thread_folder_ids(t.account_id, &t.thread_key).unwrap_or_default();
-                                    let labels = self.folder_choices(t.account_id, FolderUse::Label);
-                                    if labels.is_empty() {
-                                        ui.label("No labels yet");
+                                let title = if kind == FolderUse::Move { "Move to" } else { "Label" };
+                                ui.menu_button(title, |ui| {
+                                    let opening = first_pass(ui, egui::Id::new(("row_picker", title)));
+                                    let (p, c) = self.folder_picker_ui(ui, kind, t.account_id, &t.thread_key, opening);
+                                    if let Some((f, add)) = p {
+                                        folder_menu = Some((t.account_id, t.thread_key.clone(), f, kind, add));
+                                        ui.close();
                                     }
-                                    for f in labels {
-                                        let has = on.contains(&f.id);
-                                        if ui.button(format!("{}  {}", if has { "☑" } else { "☐" }, folder_label(&f))).clicked() {
-                                            folder_menu = Some((t.account_id, t.thread_key.clone(), f, FolderUse::Label, !has));
-                                        }
+                                    if let Some(name) = c {
+                                        create_menu = Some((t.account_id, t.thread_key.clone(), name, kind));
+                                        ui.close();
                                     }
                                 });
                             }
@@ -3051,6 +3065,13 @@ impl OwlPostApp {
                     Some((email, None)) => self.show_sender(&email),
                     Some((email, Some(c))) => self.sort_sender(&email, c),
                     None => {}
+                }
+                if let Some((a, k, name, kind)) = create_menu {
+                    self.worker.send(Cmd::CreateFolder(a, name.clone(), Some((vec![k.clone()], kind))));
+                    if kind == FolderUse::Move {
+                        self.remove_row(a, &k);
+                    }
+                    self.toast(format!("Created “{name}”"), false);
                 }
                 if let Some((a, k, c)) = thread_menu {
                     self.sort_thread(a, &k, c);
@@ -3870,6 +3891,18 @@ fn system_dark(ctx: &egui::Context) -> bool {
 fn theme_palette(themes: &[Theme], id: &str, dark: bool) -> owlpost_core::theme::Palette {
     let id = if id == theme::MOONLIT { if dark { theme::MOONLIT_DARK } else { theme::MOONLIT_LIGHT } } else { id };
     themes.iter().find(|t| t.id == id).unwrap_or(&themes[0]).palette()
+}
+
+/// Is this the first pass a piece of UI (like a submenu) has been shown
+/// since it was last hidden?
+fn first_pass(ui: &egui::Ui, id: egui::Id) -> bool {
+    let pass = ui.ctx().cumulative_pass_nr();
+    let last = ui.ctx().data_mut(|d| {
+        let last = d.get_temp::<u64>(id);
+        d.insert_temp(id, pass);
+        last
+    });
+    !matches!(last, Some(l) if l + 1 >= pass)
 }
 
 /// A small letter-spaced heading in the sidebar ("ALL ACCOUNTS").
@@ -5366,6 +5399,46 @@ mod ui_tests {
         assert_eq!(h.state().picker_index, 0);
         h.key_press(Key::Enter);
         h.run_steps(2);
+        let receipts = h.state().store.folders(acct).unwrap().into_iter().find(|f| f.path == "Receipts").unwrap();
+        let mut moved = false;
+        for _ in 0..100 {
+            h.run_steps(1);
+            if h.state().store.thread_folder_ids(acct, &key).unwrap().contains(&receipts.id) {
+                moved = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(moved, "moved to Receipts");
+    }
+
+    #[test]
+    fn right_click_move_with_keys() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness(theme::MOONLIT_LIGHT);
+        h.run_steps(3);
+        let idx = h.state().rows.iter().position(|r| r.t.subject.contains("Dinner")).unwrap();
+        let (acct, key) = (h.state().rows[idx].t.account_id, h.state().rows[idx].t.thread_key.clone());
+        let at = row_center(&h, idx);
+        h.event(egui::Event::PointerMoved(at));
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: true, modifiers: Default::default() });
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: false, modifiers: Default::default() });
+        h.run_steps(3);
+        save(&mut h, "right-click-menu");
+        h.get_by_label_contains("Move to").hover();
+        h.run_steps(4);
+        assert!(h.ctx.wants_keyboard_input(), "the folder list is ready for typing");
+        h.event(egui::Event::Text("re".into()));
+        h.run_steps(2);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(2);
+        assert_eq!(h.state().picker_index, 1);
+        save(&mut h, "right-click-move");
+        h.key_press(Key::ArrowUp);
+        h.run_steps(2);
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert!(!egui::Popup::is_any_open(&h.ctx), "the menu closes");
         let receipts = h.state().store.folders(acct).unwrap().into_iter().find(|f| f.path == "Receipts").unwrap();
         let mut moved = false;
         for _ in 0..100 {
