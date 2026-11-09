@@ -100,20 +100,6 @@ fn tools() -> Value {
                 "label":{"type":"string","description":"Label / folder name, path or id"},
                 "remove":{"type":"boolean","default":false},
                 "create":{"type":"boolean","default":false,"description":"Create the label if it doesn't exist"}}}), false, false),
-        tool("send_email", "Send a new email. This really sends mail from the user's account.",
-            json!({"type":"object","required":["to","subject","body"],"properties":{
-                "from":{"type":"string","description":"Account email to send from (defaults to the first account)"},
-                "to":{"type":"string","description":"Comma separated recipients"},
-                "cc":{"type":"string"},"bcc":{"type":"string"},
-                "subject":{"type":"string"},"body":{"type":"string","description":"Plain text body"},
-                "attachments":{"type":"array","items":{"type":"string"},"description":"Paths of files on this computer to attach"}
-            }}), false, true),
-        tool("reply", "Reply to the latest message in a conversation. This really sends mail.",
-            json!({"type":"object","required":["thread_id","body"],"properties":{
-                "thread_id":thread,"body":{"type":"string"},
-                "reply_all":{"type":"boolean","default":false},
-                "include_quote":{"type":"boolean","default":true}
-            }}), false, true),
         tool("view_message", "See one email as designed: its text with an [image N] marker where each picture sits, followed by the pictures themselves (inline, remote and data: images; tracking pixels removed, icons skipped, sized to at most 1200 px). Use it for image-heavy mail such as banner-only marketing, receipts, charts or screenshots pasted into the body.",
             json!({"type":"object","required":["thread_id"],"properties":{
                 "thread_id":thread,
@@ -194,7 +180,7 @@ impl Server {
                 "serverInfo": {"name": "owlpost", "title": "OwlPost Mail", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": "OwlPost gives you the user's email across their iCloud, Gmail and other IMAP accounts. \
                     Use list_threads/search to find conversations, read_thread to read them, and snooze_thread to defer them. \
-                    send_email and reply really send mail: confirm the recipients and text with the user before sending."
+                    It can't send email: save_draft puts a message in Drafts for the user to check and send."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tools()})),
@@ -611,33 +597,6 @@ impl Server {
                 Ok(json!({"thread_id": thread_id(acc, &key), "label": label.path, "applied": !remove,
                           "labels": self.labels_of(acc, &key)?}))
             }
-            "send_email" => {
-                let from = s("from");
-                let account = if from.is_empty() {
-                    self.store.accounts()?.into_iter().next().ok_or_else(|| anyhow!("no accounts configured"))?
-                } else {
-                    self.store.account_by_email(&from)?.ok_or_else(|| anyhow!("no account {from}"))?
-                };
-                let out = OutgoingMessage {
-                    to: Contact::parse_list(&s("to")),
-                    cc: Contact::parse_list(&s("cc")),
-                    bcc: Contact::parse_list(&s("bcc")),
-                    subject: s("subject"),
-                    ..Default::default()
-                };
-                let (body, html_signature) = with_signature(&self.store, &s("body"), &account);
-                let attachments = attachment_paths(args)?
-                    .iter()
-                    .map(|p| smtp::OutgoingAttachment::from_path(std::path::Path::new(p)))
-                    .collect::<Result<Vec<_>>>()?;
-                let out = OutgoingMessage { body, html_signature, attachments, ..out };
-                if smtp::encoded_size(&out) > smtp::SIZE_LIMIT {
-                    return Err(anyhow!("attachments are too large to email (limit about 25 MB)"));
-                }
-                let id = engine::send(&self.store, &account, &out)?;
-                let names: Vec<_> = out.attachments.iter().map(|a| a.filename.clone()).collect();
-                Ok(json!({"sent": true, "from": account.email, "message_id": id, "attachments": names}))
-            }
             "save_draft" => {
                 let tid = s("thread_id");
                 let (account, draft) = if tid.trim().is_empty() {
@@ -685,22 +644,6 @@ impl Server {
                 let thread = self.store.copy_in_role(account.id, &id, FolderRole::Drafts)?.map(|m| thread_id(account.id, &m.thread_key));
                 Ok(json!({"saved": true, "account": account.email, "folder": drafts.path, "message_id": id,
                           "thread_id": thread, "to": Contact::join(&out.to), "subject": out.subject}))
-            }
-            "reply" => {
-                let (acc, key) = split_thread_id(&s("thread_id"))?;
-                let account = self.account(acc)?;
-                let msgs = self.store.thread_messages(acc, &key)?;
-                let last = msgs.last().ok_or_else(|| anyhow!("thread not found"))?;
-                let reply_all = args.get("reply_all").and_then(Value::as_bool).unwrap_or(false);
-                let quote = args.get("include_quote").and_then(Value::as_bool).unwrap_or(true);
-                let draft = reply_draft(&account, last, reply_all);
-                let (mut body, html_signature) = with_signature(&self.store, &s("body"), &account);
-                if quote {
-                    body.push_str(&smtp::quote(last));
-                }
-                let out = OutgoingMessage { body, html_signature, ..draft };
-                let id = engine::send(&self.store, &account, &out)?;
-                Ok(json!({"sent": true, "to": Contact::join(&out.to), "cc": Contact::join(&out.cc), "message_id": id}))
             }
             "sync" => {
                 let accounts = match self.account_arg(args)? {
@@ -801,7 +744,11 @@ mod tests {
         assert!(s.handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
         let r = rpc(&mut s, 2, "tools/list", json!({}));
         let names: Vec<&str> = r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"snooze_thread") && names.contains(&"send_email"));
+        assert!(names.contains(&"snooze_thread") && names.contains(&"save_draft"));
+        // Nothing that sends mail: drafts only.
+        assert!(!names.contains(&"send_email") && !names.contains(&"reply"));
+        let r = rpc(&mut s, 3, "tools/call", json!({"name":"send_email","arguments":{"to":"a@b.c","subject":"x","body":"x"}}));
+        assert!(r.to_string().contains("unknown tool"), "{r}");
     }
 
     #[test]
@@ -909,20 +856,6 @@ mod tests {
         assert_eq!(r["result"]["structuredContent"]["count"], 0);
         let r = rpc(&mut s, 7, "tools/call", json!({"name":"move_thread","arguments":{"thread_id":tid,"to":"Nope"}}));
         assert_eq!(r["result"]["isError"], true);
-    }
-
-    #[test]
-    fn demo_reply_lands_in_thread() {
-        let mut s = server();
-        let r = rpc(&mut s, 1, "tools/call", json!({"name":"search","arguments":{"query":"subject:Dinner"}}));
-        let t = &r["result"]["structuredContent"]["threads"][0];
-        let tid = t["thread_id"].as_str().unwrap().to_string();
-        let before = t["messages"].as_i64().unwrap();
-        let r = rpc(&mut s, 2, "tools/call", json!({"name":"reply","arguments":{"thread_id":tid,"body":"Perfect, see you!"}}));
-        assert_eq!(r["result"]["isError"], false, "{r}");
-        assert!(r["result"]["structuredContent"]["to"].as_str().unwrap().contains("maya@chen.family"));
-        let r = rpc(&mut s, 3, "tools/call", json!({"name":"read_thread","arguments":{"thread_id":tid}}));
-        assert_eq!(r["result"]["structuredContent"]["messages"].as_array().unwrap().len() as i64, before + 1);
     }
 
     #[test]
