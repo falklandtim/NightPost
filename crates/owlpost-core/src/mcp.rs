@@ -125,6 +125,12 @@ fn tools() -> Value {
                 "body":{"type":"string","description":"Plain text body; the account's signature is added"},
                 "attachments":{"type":"array","items":{"type":"string"},"description":"Paths of files on this computer to attach"}
             }}), false, false),
+        tool("sync_status", "Is each account connecting? Health (ok, trouble, offline, unknown), when it last synced, push state and the last error in plain words, plus recent sync activity and the log file's path. Check it before telling the user there's no new mail: if an account is offline or last synced long ago, say so. The OwlPost app keeps this up to date while it runs; if it isn't running, call sync.",
+            json!({"type":"object","properties":{
+                "account":{"type":"string","description":"Account email or id; omit for all"},
+                "activity":{"type":"integer","default":20,"maximum":200,"description":"How many recent activity entries to include (0 for none)"},
+                "problems_only":{"type":"boolean","default":false,"description":"Only warnings and errors in the activity"}
+            }}), true, false),
         tool("sync", "Fetch new mail from the IMAP servers now.",
             json!({"type":"object","properties":{"account":{"type":"string","description":"Account email or id; omit for all"}}}), false, false),
     ])
@@ -645,6 +651,46 @@ impl Server {
                 Ok(json!({"saved": true, "account": account.email, "folder": drafts.path, "message_id": id,
                           "thread_id": thread, "to": Contact::join(&out.to), "subject": out.subject}))
             }
+            "sync_status" => {
+                let only = self.account_arg(args)?;
+                let now = chrono::Utc::now();
+                let fmt = |t: chrono::DateTime<chrono::Utc>| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string();
+                let mut accounts = vec![];
+                let mut emails = std::collections::HashMap::new();
+                for a in self.store.accounts()? {
+                    emails.insert(a.id, a.email.clone());
+                    if only.as_ref().is_some_and(|o| o.id != a.id) {
+                        continue;
+                    }
+                    if a.demo {
+                        accounts.push(json!({"email": a.email, "health": "demo", "summary": "Demo account: never syncs"}));
+                        continue;
+                    }
+                    let st = self.store.sync_status(a.id)?;
+                    accounts.push(json!({
+                        "email": a.email,
+                        "health": st.health().as_str(),
+                        "summary": st.summary(now),
+                        "last_synced": st.last_ok.map(fmt),
+                        "last_synced_ago": st.last_ok.map(|t| crate::activity::ago(t, now)),
+                        "failures_in_a_row": st.failures,
+                        "error": st.error.as_deref().filter(|_| st.failures > 0),
+                        "error_explained": st.error.as_deref().filter(|_| st.failures > 0).map(crate::activity::explain),
+                        "needs_sign_in": st.needs_sign_in(),
+                        "push": st.push.map(|p| format!("{p:?}").to_lowercase()),
+                        "push_detail": st.push_detail,
+                    }));
+                }
+                let n = args.get("activity").and_then(Value::as_u64).unwrap_or(20).min(200) as usize;
+                let problems = args.get("problems_only").and_then(Value::as_bool).unwrap_or(false);
+                let activity: Vec<Value> = self
+                    .store
+                    .activity(n, only.as_ref().map(|a| a.id), problems)?
+                    .into_iter()
+                    .map(|e| json!({"at": fmt(e.at), "account": e.account.and_then(|a| emails.get(&a).cloned()), "level": format!("{:?}", e.level).to_lowercase(), "text": e.text}))
+                    .collect();
+                Ok(json!({"accounts": accounts, "activity": activity, "log_file": crate::log_path().display().to_string()}))
+            }
             "sync" => {
                 let accounts = match self.account_arg(args)? {
                     Some(a) => vec![a],
@@ -749,6 +795,22 @@ mod tests {
         assert!(!names.contains(&"send_email") && !names.contains(&"reply"));
         let r = rpc(&mut s, 3, "tools/call", json!({"name":"send_email","arguments":{"to":"a@b.c","subject":"x","body":"x"}}));
         assert!(r.to_string().contains("unknown tool"), "{r}");
+    }
+
+    #[test]
+    fn sync_status_via_tools() {
+        let mut s = server();
+        let a = s.store.accounts().unwrap()[0].clone();
+        // Pretend it's a real account that failed twice.
+        s.store.conn.execute("UPDATE accounts SET demo=0 WHERE id=?1", [a.id]).unwrap();
+        s.store.sync_failed(a.id, "connecting: Connection timed out");
+        s.store.sync_failed(a.id, "connecting: Connection timed out");
+        let r = rpc(&mut s, 1, "tools/call", json!({"name":"sync_status","arguments":{"account":a.email,"problems_only":true}}));
+        let v = &r["result"]["structuredContent"];
+        assert_eq!(v["accounts"][0]["health"], "offline", "{r}");
+        assert_eq!(v["accounts"][0]["error_explained"], "the server didn't answer in time");
+        assert_eq!(v["activity"].as_array().unwrap().len(), 2);
+        assert!(v["log_file"].as_str().unwrap().ends_with("owlpost.log"));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //!
 //! Every function here is blocking; callers run them on a worker thread.
 
+use crate::activity::Level;
 use crate::credentials;
 use crate::models::*;
 use crate::parse;
@@ -67,17 +68,43 @@ pub fn sync_inbox(store: &Store, account: &Account) -> Result<usize> {
     let Some(inbox) = store.folder_by_role(account.id, FolderRole::Inbox)? else {
         return sync_account(store, account, |_| {});
     };
-    let mut session = connect(account)?;
-    let n = sync_folder(store, &mut session, account, &inbox)?;
-    let _ = session.logout();
-    Ok(n)
+    let r = (|| {
+        let mut session = connect(account)?;
+        let n = sync_folder(store, &mut session, account, &inbox)?;
+        let _ = session.logout();
+        Ok(n)
+    })();
+    match &r {
+        Ok(n) => {
+            store.sync_ok(account.id);
+            if *n > 0 {
+                store.note(Some(account.id), Level::Info, format!("Inbox: {n} new"));
+            }
+        }
+        Err(e) => store.sync_failed(account.id, &format!("{e:#}")),
+    }
+    r
 }
 
 /// Full sync of one account: folder list, new messages, flag changes, deletions.
-pub fn sync_account(store: &Store, account: &Account, mut progress: impl FnMut(SyncProgress)) -> Result<usize> {
+pub fn sync_account(store: &Store, account: &Account, progress: impl FnMut(SyncProgress)) -> Result<usize> {
     if account.demo {
         return Ok(0);
     }
+    let r = sync_all_folders(store, account, progress);
+    match &r {
+        Ok((n, folders, failed)) => {
+            store.sync_ok(account.id);
+            let ok = if *failed > 0 { format!(" ({failed} couldn't be synced)") } else { String::new() };
+            store.note(Some(account.id), Level::Info, format!("Checked {folders} folders{ok} · {n} new"));
+        }
+        Err(e) => store.sync_failed(account.id, &format!("{e:#}")),
+    }
+    r.map(|(n, _, _)| n)
+}
+
+/// The work of `sync_account`: (new messages, folders checked, folders that failed).
+fn sync_all_folders(store: &Store, account: &Account, mut progress: impl FnMut(SyncProgress)) -> Result<(usize, usize, usize)> {
     let mut session = connect(account)?;
     let names = session.list(Some(""), Some("*"))?;
     let mut found = Vec::new();
@@ -114,6 +141,7 @@ pub fn sync_account(store: &Store, account: &Account, mut progress: impl FnMut(S
     folders.sort_by_key(|f| if f.role == FolderRole::Inbox { 0 } else { 1 });
     let total = folders.len();
     let mut new_total = 0;
+    let mut failed = 0;
     for (i, f) in folders.iter().enumerate() {
         progress(SyncProgress::Folder { account_id: account.id, name: f.name.clone(), done: i, total });
         match sync_folder(store, &mut session, account, f) {
@@ -123,15 +151,18 @@ pub fn sync_account(store: &Store, account: &Account, mut progress: impl FnMut(S
                     progress(SyncProgress::NewMessages { account_id: account.id, count: n });
                 }
             }
-            Err(e) => log::warn!("sync of {} failed: {e:#}", f.path),
+            Err(e) => {
+                failed += 1;
+                store.note(Some(account.id), Level::Warn, format!("Couldn't sync {}: {e:#}", f.path));
+            }
         }
     }
     let _ = session.logout();
     // Snoozes made, cancelled or due on other machines.
     if let Err(e) = crate::snooze_sync::sync_snoozes(store, account) {
-        log::warn!("snooze sync for {} failed: {e:#}", account.email);
+        store.note(Some(account.id), Level::Warn, format!("Couldn't sync snoozes and tabs: {e:#}"));
     }
-    Ok(new_total)
+    Ok((new_total, total, failed))
 }
 
 /// Each folder's role. The server's SPECIAL-USE flags win: once it marks
@@ -213,10 +244,10 @@ fn sync_folder(store: &Store, session: &mut Session, account: &Account, folder: 
     }
     if folder.role == FolderRole::Inbox {
         if let Err(e) = sort_inbox(store, session, account, folder) {
-            log::warn!("sorting {} into categories failed: {e:#}", folder.path);
+            store.note(Some(account.id), Level::Warn, format!("Couldn't sort {} into tabs: {e:#}", folder.path));
         }
         if let Err(e) = crate::snooze_sync::label_tabs(store, account) {
-            log::warn!("labelling your tabs on Gmail failed: {e:#}");
+            store.note(Some(account.id), Level::Warn, format!("Couldn't label your tabs on Gmail: {e:#}"));
         }
     }
     let max_uid = server.iter().copied().max().unwrap_or(folder.last_uid);

@@ -8,6 +8,7 @@ mod contacts;
 mod html_view;
 mod mail_view;
 mod icons;
+mod logging;
 mod onboarding;
 mod prefs;
 mod style;
@@ -25,6 +26,12 @@ USAGE:
     owlpost themes                List the themes
     owlpost themes inspect <dir>  Show how a Mailspring-style theme package resolves
     owlpost --db <path> …         Use a different database (or set OWLPOST_DB)
+
+LOGS:
+    OwlPost keeps a log of syncing, push and errors (also shown in Sync activity):
+    macOS  ~/Library/Logs/OwlPost/owlpost.log
+    Linux  ~/.local/state/owlpost/owlpost.log
+Set RUST_LOG=info to see it in the terminal too.
 
 Register with Claude Code:
     claude mcp add owlpost -- /path/to/owlpost mcp
@@ -47,10 +54,6 @@ fn main() -> Result<()> {
     let wayland = linux_wayland();
     #[cfg(not(target_os = "linux"))]
     let wayland = false;
-    // Logs go to stderr so they never corrupt the MCP stdio stream.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .target(env_logger::Target::Stderr)
-        .init();
 
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--db") {
@@ -61,6 +64,12 @@ fn main() -> Result<()> {
     }
     let demo = args.iter().any(|a| a == "--demo");
     args.retain(|a| a != "--demo");
+    // Logs go to the log file, and to stderr (never stdout, the MCP stream).
+    logging::init(match args.first().map(String::as_str) {
+        Some("mcp") => "mcp",
+        Some(_) => "cli",
+        None => "app",
+    });
 
     match args.first().map(String::as_str) {
         Some("-h") | Some("--help") | Some("help") => {

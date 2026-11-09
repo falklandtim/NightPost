@@ -324,7 +324,8 @@ impl Worker {
                                     let _ = ev.send(Event::Changed);
                                     ctx.request_repaint();
                                 }
-                                Err(e) => log::warn!("push sync of {} failed: {e:#}", a.email),
+                                Err(_) => {} // recorded in the activity log
+
                             }
                         }
                         if !plan.all && plan.accounts.is_empty() {
@@ -531,7 +532,7 @@ pub fn unused_path(dir: &std::path::Path, name: &str) -> PathBuf {
 }
 
 /// Open a file in its default app, or (`reveal`) show it in Finder / the file manager.
-fn open_file(path: &std::path::Path, reveal: bool) -> anyhow::Result<()> {
+pub(crate) fn open_file(path: &std::path::Path, reveal: bool) -> anyhow::Result<()> {
     use std::process::Command;
     if cfg!(test) {
         // Tests check the download, not that Preview pops up.
@@ -778,7 +779,14 @@ mod push {
 
     pub fn spawn(db: PathBuf, sync_tx: Sender<SyncReq>, ev: Sender<Event>, ctx: eframe::egui::Context) {
         let watches: Watches = Default::default();
-        let notify = move |ev: &Sender<Event>, id: AccountId, st: PushState| {
+        let notify = move |store: &Store, ev: &Sender<Event>, id: AccountId, st: PushState| {
+            use owlpost_core::activity::Push;
+            match &st {
+                PushState::Connecting => store.set_push(id, Push::Connecting, None),
+                PushState::Live => store.set_push(id, Push::Live, None),
+                PushState::Retrying(e) => store.set_push(id, Push::Retrying, Some(e)),
+                PushState::Unavailable(why) => store.set_push(id, Push::Unavailable, Some(why)),
+            }
             let _ = ev.send(Event::Push(id, st));
             ctx.request_repaint();
         };
@@ -794,7 +802,7 @@ mod push {
                 let slept = now.duration_since(last_wall).map(|d| d > CHECK * 3).unwrap_or(false);
                 last_wall = now;
                 if slept {
-                    log::info!("woke from sleep: reconnecting push");
+                    store.note(None, owlpost_core::activity::Level::Info, "Woke from sleep: reconnecting and checking for mail");
                     watches.lock().unwrap().clear();
                     let _ = sync_tx.send(SyncReq::All);
                 }
@@ -807,7 +815,7 @@ mod push {
                 for a in accounts.iter().filter(|a| !a.demo) {
                     if !idle::can_push(a) {
                         if told_no_push.insert(a.id) {
-                            notify(&ev, a.id, PushState::Unavailable("this account connects with STARTTLS rather than TLS".into()));
+                            notify(&store, &ev, a.id, PushState::Unavailable("this account connects with STARTTLS rather than TLS".into()));
                         }
                         continue;
                     }
@@ -827,7 +835,7 @@ mod push {
                         let id = a.id;
                         let _ = std::thread::Builder::new()
                             .name(format!("push-{id}"))
-                            .spawn(move || run(&db, id, generation, &watches, &sync_tx, &|st| notify(&ev, id, st)));
+                            .spawn(move || run(&db, id, generation, &watches, &sync_tx, &|store, st| notify(store, &ev, id, st)));
                     }
                 }
                 std::thread::sleep(CHECK);
@@ -848,7 +856,7 @@ mod push {
         }
     }
 
-    fn run(db: &std::path::Path, id: AccountId, generation: u64, watches: &Watches, sync_tx: &Sender<SyncReq>, notify: &dyn Fn(PushState)) {
+    fn run(db: &std::path::Path, id: AccountId, generation: u64, watches: &Watches, sync_tx: &Sender<SyncReq>, notify: &dyn Fn(&Store, PushState)) {
         let Ok(store) = Store::open(db) else { return };
         let mut failures = 0u32;
         while current(watches, id, generation) {
@@ -861,12 +869,12 @@ mod push {
                     continue;
                 }
             };
-            notify(PushState::Connecting);
+            notify(&store, PushState::Connecting);
             let result = idle::connect(&account).and_then(|mut session| {
                 if !idle::supports_idle(&mut session)? {
                     return Err(anyhow::anyhow!(Unsupported));
                 }
-                notify(PushState::Live);
+                notify(&store, PushState::Live);
                 failures = 0;
                 // Catch up on anything that arrived while disconnected.
                 let _ = sync_tx.send(SyncReq::Inbox(id));
@@ -885,14 +893,14 @@ mod push {
                     if let Some(w) = watches.lock().unwrap().get_mut(&id) {
                         w.unsupported = true;
                     }
-                    notify(PushState::Unavailable("the server doesn't support it".into()));
+                    notify(&store, PushState::Unavailable("the server doesn't support it".into()));
                     return;
                 }
                 Err(e) => {
                     failures += 1;
                     let wait = idle::backoff(failures);
-                    log::warn!("push for {} dropped: {e:#}; retrying in {}s", account.email, wait.as_secs());
-                    notify(PushState::Retrying(format!("{e:#}")));
+                    log::info!("push for {} dropped: {e:#}; retrying in {}s", account.email, wait.as_secs());
+                    notify(&store, PushState::Retrying(format!("{e:#}")));
                     // Sleep in short steps so a replacement or removal ends this thread promptly.
                     let until = Instant::now() + wait;
                     while Instant::now() < until {

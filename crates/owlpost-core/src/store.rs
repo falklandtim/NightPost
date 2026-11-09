@@ -127,10 +127,26 @@ CREATE TABLE IF NOT EXISTS outbox (
     payload     TEXT NOT NULL,
     created     INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sync_status (
+    account_id   INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    last_ok      INTEGER,
+    last_try     INTEGER,
+    failures     INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    push         TEXT,
+    push_detail  TEXT
+);
+CREATE TABLE IF NOT EXISTS activity (
+    id          INTEGER PRIMARY KEY,
+    at          INTEGER NOT NULL,
+    account_id  INTEGER,
+    level       TEXT NOT NULL,
+    text        TEXT NOT NULL
+);
 "#;
 
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
     path: PathBuf,
 }
 

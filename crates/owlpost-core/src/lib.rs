@@ -1,6 +1,7 @@
 //! OwlPost core: models, local store, IMAP/SMTP engine, snooze,
 //! Mailspring-compatible themes and the built-in MCP server.
 
+pub mod activity;
 pub mod category;
 pub mod credentials;
 pub mod demo;
@@ -44,6 +45,21 @@ pub fn data_dir() -> std::path::PathBuf {
     }
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// OwlPost's log file: `~/Library/Logs/OwlPost/owlpost.log` on a Mac,
+/// `~/.local/state/owlpost/owlpost.log` (or under `$XDG_STATE_HOME`) on Linux.
+/// `OWLPOST_LOG_FILE` overrides it.
+pub fn log_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("OWLPOST_LOG_FILE") {
+        return p.into();
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(|| ".".into());
+    if cfg!(target_os = "macos") {
+        return home.join("Library/Logs/OwlPost/owlpost.log");
+    }
+    let state = std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(".local/state"));
+    state.join("owlpost/owlpost.log")
 }
 
 /// A fresh, unique temp database path for tests (timestamps alone collide

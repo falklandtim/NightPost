@@ -16,6 +16,30 @@ use owlpost_core::smtp::OutgoingMessage;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+/// An account's status mark: a small dot (green, or grey before the first
+/// sync), amber for a blip, a larger red one with "!" when it can't connect.
+fn paint_health(p: &egui::Painter, c: egui::Pos2, h: activity::Health, color: egui::Color32, hovered: bool) {
+    let grow = if hovered { 1.0 } else { 0.0 };
+    match h {
+        activity::Health::Offline => {
+            p.circle_filled(c, 6.0 + grow, color);
+            p.text(c + egui::vec2(0.0, 0.5), egui::Align2::CENTER_CENTER, "!", egui::FontId::proportional(10.0), egui::Color32::WHITE);
+        }
+        activity::Health::Trouble => {
+            p.circle_filled(c, 4.5 + grow, color);
+        }
+        activity::Health::Ok => {
+            p.circle_filled(c, 3.0 + grow, color);
+        }
+        activity::Health::Unknown => {
+            p.circle_stroke(c, 3.0 + grow, egui::Stroke::new(1.2, color));
+        }
+    }
+}
+
+/// The Sync activity shortcut, as menus show it.
+const ACTIVITY_KEY: &str = if cfg!(target_os = "macos") { "⌘⇧L" } else { "Ctrl+Shift+L" };
+
 pub const SHORTCUTS: &[(&str, &str)] = &[
     ("c", "Compose new message"),
     ("r", "Reply"),
@@ -39,6 +63,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("⌘ F  /  /", "Search"),
     ("g i  ·  g s  ·  g t  ·  g d  ·  g z", "Go to Inbox, Starred, Sent, Drafts, Snoozed"),
     ("?", "Show the keyboard shortcuts"),
+    ("⌘ Shift L", "Sync activity: is each account connected, and what happened"),
     ("↑ ↓  ·  Return  ·  Esc", "In a menu: choose, pick (or open a submenu), close"),
     ("⌘ Z", "Undo (send, move, archive, trash, label, snooze, pin…)"),
     ("⌘ S", "Save draft (in composer)"),
@@ -47,6 +72,21 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("⌘ ↩", "Send (in composer)"),
     ("Esc", "Close / clear search / clear the selection"),
 ];
+
+/// The Sync activity window: which account it shows (None: all), whether
+/// only problems, and the entries last read.
+struct ActivityView {
+    account: Option<AccountId>,
+    problems: bool,
+    entries: Vec<activity::Entry>,
+    read: Option<Instant>,
+}
+
+impl ActivityView {
+    fn new(account: Option<AccountId>) -> Self {
+        Self { account, problems: false, entries: vec![], read: None }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Selection {
@@ -419,6 +459,12 @@ pub struct OwlPostApp {
     picker_index: usize,
     /// The keyboard shortcuts sheet (?).
     show_keys: bool,
+    /// Each account's sync health (from the database, which the sync
+    /// threads keep up to date) and when it was last read.
+    health: HashMap<AccountId, activity::Status>,
+    health_read: Option<Instant>,
+    /// The Sync activity window.
+    activity: Option<ActivityView>,
     sigs: SignatureBook,
     /// Attachments being downloaded: (message, attachment index).
     downloading: HashSet<(MessageId, usize)>,
@@ -587,6 +633,9 @@ impl OwlPostApp {
             picker_query: String::new(),
             picker_index: 0,
             show_keys: false,
+            health: HashMap::new(),
+            health_read: None,
+            activity: None,
             sigs: SignatureBook::default(),
             downloading: HashSet::new(),
             opening_drafts: HashSet::new(),
@@ -1196,6 +1245,7 @@ impl OwlPostApp {
                     ("g  d".into(), "Drafts"),
                     ("g  z".into(), "Snoozed"),
                     (format!("{cmd},"), "Preferences"),
+                    (format!("{cmd}Shift+L"), "Sync activity"),
                     ("?".into(), "This list"),
                 ],
             ),
@@ -1230,6 +1280,218 @@ impl OwlPostApp {
         });
         if r.should_close() || ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.show_keys = false;
+        }
+    }
+
+    /// Re-read each account's sync health every few seconds (and straight
+    /// after a sync or push change).
+    fn refresh_health(&mut self) {
+        if self.health_read.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+            return;
+        }
+        self.health_read = Some(Instant::now());
+        self.health = self.store.sync_statuses().unwrap_or_default().into_iter().map(|s| (s.account, s)).collect();
+    }
+
+    fn toggle_activity(&mut self, account: Option<AccountId>) {
+        self.activity = match self.activity {
+            Some(_) if account.is_none() => None,
+            _ => Some(ActivityView::new(account)),
+        };
+    }
+
+    /// The colour of an account's status dot.
+    fn health_color(&self, h: activity::Health) -> egui::Color32 {
+        match h {
+            activity::Health::Ok => self.colors.success,
+            activity::Health::Trouble => self.colors.warning,
+            activity::Health::Offline => self.colors.error,
+            activity::Health::Unknown => self.colors.sidebar_text.gamma_multiply(0.35),
+        }
+    }
+
+    fn health_of(&self, a: AccountId) -> activity::Status {
+        self.health.get(&a).cloned().unwrap_or(activity::Status { account: a, ..Default::default() })
+    }
+
+    /// One line for the sidebar footer: the account in the worst state, or
+    /// when everything last synced.
+    fn health_line(&self) -> Option<(String, activity::Health)> {
+        let real: Vec<&Account> = self.accounts.iter().filter(|a| !a.demo).collect();
+        let short = |a: &Account| a.email.clone();
+        for want in [activity::Health::Offline, activity::Health::Trouble] {
+            let bad: Vec<&&Account> = real.iter().filter(|a| self.health_of(a.id).health() == want).collect();
+            if let Some(a) = bad.first() {
+                let more = if bad.len() > 1 { format!(" (+{})", bad.len() - 1) } else { String::new() };
+                let what = if want == activity::Health::Offline { "Can't connect" } else { "Reconnecting" };
+                return Some((format!("{what}: {}{more}", short(a)), want));
+            }
+        }
+        let oldest = real.iter().map(|a| self.health_of(a.id).last_ok).collect::<Option<Vec<_>>>()?.into_iter().min()?;
+        Some((format!("Synced {}", activity::ago(oldest, Utc::now())), activity::Health::Ok))
+    }
+
+    /// Sync activity: each account's connection, then what happened, newest first.
+    fn activity_sheet(&mut self, ctx: &egui::Context) {
+        let Some(view) = self.activity.as_mut() else { return };
+        if view.read.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+            view.entries = self.store.activity(400, view.account, view.problems).unwrap_or_default();
+            view.read = Some(Instant::now());
+        }
+        ctx.request_repaint_after(Duration::from_secs(2));
+        let col = self.colors.clone();
+        let accounts: Vec<Account> = self.accounts.iter().filter(|a| !a.demo).cloned().collect();
+        let email = |id: Option<AccountId>| id.and_then(|id| self.accounts.iter().find(|a| a.id == id)).map(|a| a.email.clone());
+        let now = Utc::now();
+        let today = chrono::Local::now().date_naive();
+        let when = |t: DateTime<Utc>| {
+            let l = t.with_timezone(&chrono::Local);
+            if l.date_naive() == today { l.format("%H:%M:%S").to_string() } else { l.format("%-d %b %H:%M").to_string() }
+        };
+        let mut close = false;
+        let mut sync: Option<AccountId> = None;
+        let mut sign_in = false;
+        let mut copy = false;
+        let mut show_log = false;
+        let mut pick: Option<Option<AccountId>> = None;
+        let mut problems = view.problems;
+        let filter = view.account;
+        let entries = view.entries.clone();
+        let r = egui::Modal::new(egui::Id::new("activity-sheet")).show(ctx, |ui| {
+            ui.set_width(680.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Sync activity").size(17.0).strong().color(col.heading));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Done").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            if accounts.is_empty() {
+                ui.label(RichText::new("Only demo accounts: nothing syncs.").color(col.subtle));
+            }
+            for a in &accounts {
+                let st = self.health_of(a.id);
+                let h = st.health();
+                ui.horizontal(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(14.0, 18.0), Sense::hover());
+                    paint_health(ui.painter(), dot.center(), h, self.health_color(h), false);
+                    ui.label(RichText::new(&a.email).strong().color(col.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Sync now").clicked() {
+                            sync = Some(a.id);
+                        }
+                        if st.needs_sign_in() && ui.button("Sign in again…").on_hover_text("Preferences → Accounts").clicked() {
+                            sign_in = true;
+                        }
+                        let tone = match h {
+                            activity::Health::Offline => col.error,
+                            activity::Health::Trouble => col.warning,
+                            _ => col.subtle,
+                        };
+                        let mut tip = st.summary(now);
+                        if let Some(e) = st.error.as_deref().filter(|_| st.failures > 0) {
+                            tip.push_str(&format!("\n\n{e}"));
+                        }
+                        if let (Some(activity::Push::Retrying), Some(d)) = (st.push, st.push_detail.as_deref()) {
+                            tip.push_str(&format!("\n\nPush: {d}"));
+                        }
+                        ui.add(egui::Label::new(RichText::new(st.summary(now)).color(tone)).truncate()).on_hover_text(tip);
+                    });
+                });
+            }
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                let label = filter.and_then(|f| email(Some(f))).unwrap_or_else(|| "All accounts".into());
+                egui::ComboBox::from_id_salt("activity-account").selected_text(label).width(200.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(filter.is_none(), "All accounts").clicked() {
+                        pick = Some(None);
+                    }
+                    for a in &accounts {
+                        if ui.selectable_label(filter == Some(a.id), &a.email).clicked() {
+                            pick = Some(Some(a.id));
+                        }
+                    }
+                });
+                ui.checkbox(&mut problems, "Problems only");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Show log file").on_hover_text(owlpost_core::log_path().display().to_string()).clicked() {
+                        show_log = true;
+                    }
+                    if ui.button("Copy").on_hover_text("Copy these lines, to paste into a message").clicked() {
+                        copy = true;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, false]).show(ui, |ui| {
+                if entries.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(if problems { "No problems recorded." } else { "Nothing yet: activity appears as OwlPost syncs." }).color(col.subtle));
+                }
+                for e in &entries {
+                    ui.horizontal_top(|ui| {
+                        let cell = |ui: &mut egui::Ui, w: f32, l: egui::Label| {
+                            ui.allocate_ui_with_layout(egui::vec2(w, 16.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                                ui.set_width(w);
+                                ui.add(l)
+                            });
+                        };
+                        cell(ui, 70.0, egui::Label::new(RichText::new(when(e.at)).monospace().small().color(col.very_subtle)));
+                        if filter.is_none() {
+                            let who = email(e.account).unwrap_or_default();
+                            cell(ui, 150.0, egui::Label::new(RichText::new(who).small().color(col.subtle)).truncate());
+                        }
+                        let tone = match e.level {
+                            activity::Level::Error => col.error,
+                            activity::Level::Warn => col.warning,
+                            activity::Level::Info => col.text,
+                        };
+                        ui.add(egui::Label::new(RichText::new(&e.text).color(tone)).wrap());
+                    });
+                }
+            });
+        });
+        if r.should_close() || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            close = true;
+        }
+        let view = self.activity.as_mut().expect("open");
+        if problems != view.problems {
+            view.problems = problems;
+            view.read = None;
+        }
+        if let Some(a) = pick {
+            view.account = a;
+            view.read = None;
+        }
+        if copy {
+            let text: String = entries
+                .iter()
+                .rev()
+                .map(|e| format!("{}  {}  {}\n", e.at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S"), email(e.account).unwrap_or_else(|| "-".into()), e.text))
+                .collect();
+            ctx.copy_text(text);
+            self.toast(format!("Copied {} lines", entries.len()), false);
+        }
+        if show_log {
+            let path = owlpost_core::log_path();
+            if let Err(e) = crate::worker::open_file(&path, true) {
+                self.toast(format!("Couldn't show the log file ({}): {e:#}", path.display()), true);
+            }
+        }
+        if let Some(a) = sync {
+            self.syncing = true;
+            self.worker.send(Cmd::SyncAccount(a));
+            self.toast("Syncing…", false);
+        }
+        if sign_in {
+            self.prefs = Some(Prefs::new(Tab::Accounts));
+            close = true;
+        }
+        if close {
+            self.activity = None;
         }
     }
 
@@ -1734,10 +1996,17 @@ impl OwlPostApp {
                 Event::Status(s) => self.status = s,
                 Event::SyncFinished { new, errors } => {
                     self.syncing = false;
+                    // Background failures show on the account's dot (and in
+                    // Sync activity); a sync you asked for also says why.
+                    let asked = self.syncing;
+                    self.syncing = false;
                     self.status = if new > 0 { format!("{new} new message{}", if new == 1 { "" } else { "s" }) } else { String::new() };
-                    for e in errors {
-                        self.toast(e, true);
+                    if asked {
+                        for e in errors {
+                            self.toast(e, true);
+                        }
                     }
+                    self.health_read = None;
                     changed = true;
                 }
                 Event::Changed => changed = true,
@@ -1803,6 +2072,7 @@ impl OwlPostApp {
                 }
                 Event::Push(id, st) => {
                     self.push.insert(id, st);
+                    self.health_read = None;
                 }
                 Event::AttachmentDone(id, i) => {
                     self.downloading.remove(&(id, i));
@@ -1870,6 +2140,13 @@ impl OwlPostApp {
         // ⌘F: find (the search box), from anywhere.
         if self.setup.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
             self.focus_search = true;
+        }
+        // ⌘⇧L: Sync activity.
+        if self.setup.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::L)) {
+            self.toggle_activity(None);
+        }
+        if self.activity.is_some() {
+            return;
         }
         // A sheet over the window: ? closes the shortcuts list; nothing
         // else reaches the list behind it.
@@ -2310,6 +2587,9 @@ impl OwlPostApp {
             if ui.add(egui::Button::new("Keyboard shortcuts").shortcut_text("?").frame(false).min_size(egui::vec2(190.0, 24.0))).clicked() {
                 action = Some(5);
             }
+            if ui.add(egui::Button::new("Sync activity").shortcut_text(ACTIVITY_KEY).frame(false).min_size(egui::vec2(190.0, 24.0))).clicked() {
+                action = Some(6);
+            }
             if self.open.is_some() {
                 if ui.add(egui::Button::new("Show original").frame(false).min_size(egui::vec2(190.0, 24.0))).on_hover_text("The newest message's raw source").clicked() {
                     action = Some(4);
@@ -2323,6 +2603,7 @@ impl OwlPostApp {
             Some(3) => self.act_move(FolderRole::Spam),
             Some(4) => self.show_original(),
             Some(5) => self.show_keys = true,
+            Some(6) => self.toggle_activity(None),
             _ => {}
         }
     }
@@ -2347,8 +2628,24 @@ impl OwlPostApp {
                             if icons::bare(ui, Icon::Gear, "Preferences (⌘,)", col.sidebar_text, col.sidebar).clicked() {
                                 self.prefs = Some(Prefs::new(Tab::Appearance));
                             }
-                            if !self.status.is_empty() {
-                                ui.add(egui::Label::new(RichText::new(&self.status).small().color(col.sidebar_text.gamma_multiply(0.8))).truncate());
+                            // Sync progress while syncing; otherwise how the accounts are doing.
+                            let line = if !self.status.is_empty() {
+                                Some((self.status.clone(), col.sidebar_text.gamma_multiply(0.8)))
+                            } else {
+                                self.health_line().map(|(t, h)| {
+                                    let c = match h {
+                                        activity::Health::Offline => col.error,
+                                        activity::Health::Trouble => col.warning,
+                                        _ => col.sidebar_text.gamma_multiply(0.65),
+                                    };
+                                    (t, c)
+                                })
+                            };
+                            if let Some((text, c)) = line {
+                                let r = ui.add(egui::Label::new(RichText::new(text).small().color(c)).truncate().sense(Sense::click()));
+                                if r.on_hover_text(format!("Sync activity ({ACTIVITY_KEY})")).clicked() {
+                                    self.toggle_activity(None);
+                                }
                             }
                         });
                     });
@@ -2400,20 +2697,44 @@ impl OwlPostApp {
                             }
                             let mut job = egui::text::LayoutJob::default();
                             job.append(&a.email.to_uppercase(), 0.0, egui::TextFormat { font_id: egui::FontId::proportional(11.0), color: sub, extra_letter_spacing: 1.1, ..Default::default() });
-                            job.wrap = egui::text::TextWrapping::truncate_at_width(ui.available_width());
-                            ui.add(egui::Label::new(job).sense(Sense::click()))
+                            let room = ui.available_width() - if a.demo { 0.0 } else { 44.0 };
+                            job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+                            let label = ui.scope(|ui| {
+                                ui.set_max_width(room);
+                                ui.add(egui::Label::new(job).truncate().sense(Sense::click()))
+                            })
+                            .inner;
+                            // Is it connecting? Green, amber (a blip), red (can't), grey (not yet).
+                            // (Next to the name: the panel's right edge belongs to the scroll bar.)
+                            let dot = (!a.demo).then(|| {
+                                let st = self.health_of(a.id);
+                                let (rect, r) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::click());
+                                let h = st.health();
+                                paint_health(ui.painter(), rect.center(), h, self.health_color(h), r.hovered());
+                                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{} status: {}", a.email, h.as_str())));
+                                r.on_hover_text(format!("{}\n\nClick for Sync activity", st.summary(Utc::now())))
+                            });
+                            (label, dot)
                         });
+                        let (label, dot) = header.inner;
+                        if dot.is_some_and(|d| d.clicked()) {
+                            self.activity = Some(ActivityView::new(Some(a.id)));
+                        }
                         ui.add_space(6.0);
                         if !a.demo {
-                            header.inner.context_menu(|ui| {
+                            label.context_menu(|ui| {
                                 if ui.button("⟳ Sync now").clicked() {
                                     self.syncing = true;
                                     self.worker.send(Cmd::SyncAccount(a.id));
                                     ui.close();
                                 }
+                                if ui.button("Sync activity").clicked() {
+                                    self.activity = Some(ActivityView::new(Some(a.id)));
+                                    ui.close();
+                                }
                             });
                         }
-                        if header.inner.clicked() {
+                        if label.clicked() {
                             if collapsed {
                                 self.collapsed_accounts.retain(|x| *x != a.id);
                             } else {
@@ -3366,7 +3687,7 @@ impl OwlPostApp {
     fn place_mail_view(&mut self, ctx: &egui::Context) {
         // The macOS view is a native overlay, so it hides under menus and
         // windows; Linux draws the page inside egui, which layers correctly.
-        let covered = cfg!(target_os = "macos") && (self.prefs.is_some() || self.setup.is_some() || self.new_tab.is_some() || self.show_keys || egui::Popup::is_any_open(ctx));
+        let covered = cfg!(target_os = "macos") && (self.prefs.is_some() || self.setup.is_some() || self.new_tab.is_some() || self.show_keys || self.activity.is_some() || egui::Popup::is_any_open(ctx));
         let (Some(view), Some(rect), Some(open)) = (self.mail_view.as_mut(), self.web_rect, self.open.as_ref()) else {
             if let Some(v) = self.mail_view.as_mut() {
                 v.hide();
@@ -4518,6 +4839,7 @@ impl OwlPostApp {
             self.place_mail_view(ctx);
             return;
         }
+        self.refresh_health();
         menu_keys(ctx);
         self.handle_keys(ctx);
         self.toolbar(ctx);
@@ -4527,6 +4849,7 @@ impl OwlPostApp {
         self.windows(ctx);
         self.new_tab_dialog(ctx);
         self.keys_sheet(ctx);
+        self.activity_sheet(ctx);
         self.drag_overlay(ctx);
         self.place_mail_view(ctx);
         // Keep relative times and snooze wake-ups fresh.
@@ -5430,6 +5753,51 @@ mod ui_tests {
         assert!(h.query_by_label("Sign in with Google").is_some());
         assert!(h.query_by_label("…or connect with an app password:").is_some());
         save(&mut h, "setup-gmail-google");
+    }
+
+    #[test]
+    fn sync_health_and_activity() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness(theme::MOONLIT_LIGHT);
+        h.run_steps(3);
+        // Treat the demo accounts as real ones (in the window only, so the
+        // worker never connects anywhere): one fine, one that can't connect.
+        let ids: Vec<AccountId> = h.state().accounts.iter().map(|a| a.id).collect();
+        {
+            let st = h.state_mut();
+            for a in st.accounts.iter_mut() {
+                a.demo = false;
+            }
+            st.store.sync_ok(ids[0]);
+            st.store.set_push(ids[0], activity::Push::Live, None);
+            st.store.note(Some(ids[0]), activity::Level::Info, "Checked 12 folders · 3 new");
+            st.store.sync_failed(ids[1], "connecting to imap.mail.me.com:993: failed to lookup address information: nodename nor servname provided");
+            st.store.sync_failed(ids[1], "connecting to imap.mail.me.com:993: failed to lookup address information: nodename nor servname provided");
+            st.health_read = None;
+        }
+        h.run_steps(3);
+        let line = h.state().health_line().unwrap();
+        assert_eq!(line.1, activity::Health::Offline);
+        assert!(line.0.starts_with("Can't connect: "), "{}", line.0);
+        h.get_by_label_contains("status: offline");
+        h.get_by_label_contains("status: ok");
+        save(&mut h, "sync-health-sidebar");
+        // Clicking the red mark opens Sync activity for that account.
+        h.get_by_label_contains("status: offline").click();
+        h.run_steps(3);
+        assert_eq!(h.state().activity.as_ref().map(|v| v.account), Some(Some(ids[1])));
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().activity.is_none());
+        // ⌘⇧L opens Sync activity; Esc closes it.
+        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::L);
+        h.run_steps(4);
+        assert!(h.state().activity.is_some());
+        h.get_by_label_contains("Can't connect: can't find the server");
+        save(&mut h, "sync-activity");
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().activity.is_none());
     }
 
     #[test]
