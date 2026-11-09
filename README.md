@@ -1,14 +1,14 @@
 # OwlPost 🌱
 
 A fast, native email client written in Rust, inspired by [Mailspring](https://github.com/foundry376/mailspring).
-It has one binary with no Electron, a local SQLite cache, a built-in MCP server, and it can use Mailspring themes.
+It has one binary with no Electron, a local SQLite cache and a built-in MCP server.
 
 ## Features
 
 - **Gmail, iCloud and any IMAP/SMTP account.** Presets for Gmail, iCloud, Outlook, Yahoo and Fastmail; passwords are kept in the macOS Keychain (or the Windows/Linux equivalent).
 - **Unified Inbox** plus per-account folders, conversation threading (References/In-Reply-To), and Gmail-style search (`from:`, `to:`, `subject:`, `is:unread`, `is:starred`, `is:pinned`, `has:attachment`).
 - **Snooze**: *Later today, Tonight, Tomorrow, This weekend, Next week, Next month*, **Pick a date & time** (a calendar with an hour and minute, plus 9:00, 13:00 and 18:00 shortcuts), or type a time like `3h`, `friday` or `2026-12-01 09:00`. Snoozed threads leave every mailbox and come back to the inbox unread when they wake. Snoozes are kept on the mail server, so every Mac running OwlPost agrees and your phone's mail app doesn't show snoozed mail in the inbox (see [Snooze sync](#snooze-sync)).
-- **Inbox tabs** (like Canary): **Primary**, **Promotions** and **Social**, each with its unread count. OwlPost sorts each email from its headers (marketing mail with one-click unsubscribe or a marketing platform's headers goes to Promotions, social networks to Social, replies and everything else to Primary); Gmail accounts use Gmail's own tabs. Right-click a conversation for **Always put their mail in ▸** to sort a sender yourself (it wins over the automatic sorting, covers mail already here, and ⌘Z undoes it) and **All mail from …** to list everything from that address. Add your own tabs (say **Invoices**) from the same menu with **New tab…**: fill them with sender rules, or put one conversation in with **Move this conversation to ▸** (it beats the sender's rule, and replies stay with it). Right-click your tab to remove it; its mail goes back to the automatic tabs. On Gmail a conversation in one of your tabs also gets a label of the same name, so it's grouped on the phone too. Tabs and rules are kept on the server with the snooze list, so every OwlPost agrees.
+- **Inbox tabs** (like Canary): **All** (the whole Inbox, where it opens), **Primary**, **Promotions** and **Social**, each with its unread count. OwlPost sorts each email from its headers (marketing mail with one-click unsubscribe or a marketing platform's headers goes to Promotions, social networks to Social, replies and everything else to Primary); Gmail accounts use Gmail's own tabs. Right-click a conversation for **Always put their mail in ▸** to sort a sender yourself (it wins over the automatic sorting, covers mail already here, and ⌘Z undoes it) and **All mail from …** to list everything from that address. Add your own tabs (say **Invoices**) from the same menu with **New tab…**: fill them with sender rules, or put one conversation in with **Move this conversation to ▸** (it beats the sender's rule, and replies stay with it). Right-click your tab to remove it; its mail goes back to the automatic tabs. On Gmail a conversation in one of your tabs also gets a label of the same name, so it's grouped on the phone too. Tabs and rules are kept on the server with the snooze list, so every OwlPost agrees.
 - **Pin to top** (like Canary): press `p`, click the pin in the toolbar, or right-click a conversation. Pinned conversations stay above everything else in every list they appear in. Pins are stored locally.
 - **Swipe actions**: swipe a conversation sideways with two fingers on a trackpad, or drag it with the mouse. By default swiping right archives and swiping left trashes. Each direction can be set to archive, trash, snooze, pin or mark read/unread in Preferences → Message list.
 - **Select several conversations**: ⌘-click adds or removes one, Shift-click selects a range, Shift ↑ ↓ extends the selection and ⌘A selects the whole list. Archive, Trash, Spam, Move, Label, Snooze, Pin, Star and read/unread then apply to all of them, from the toolbar, the keyboard or the summary in the reading pane, and one ⌘Z undoes the lot. Move and Label need the conversations to be in one account, since folders belong to an account. Esc clears the selection.
@@ -31,8 +31,8 @@ It has one binary with no Electron, a local SQLite cache, a built-in MCP server,
 - **Signatures**: Preferences → Signatures lets you create named signatures and choose a default for each account. Each signature has a **Plain text / HTML** toggle. HTML signatures appear as readable text while you write, and the message is sent with both a text and an HTML version, with your real HTML in the HTML version (the MCP `send_email` and `reply` tools do the same). HTML signatures are drawn in the composer and in Preferences, with bold and italic text, links, and images loaded from the web. Pasting a whole page copied from another app (such as Canary) is fine: on Save, OwlPost keeps only the signature and removes page styles, such as Canary's dark-mode colour inversion, which would otherwise restyle the whole email. Images load even when the host labels them with the wrong file type, as Dropbox share links do. The composer has a signature picker that swaps the signature in place, and changing the From account switches to that account's default.
 - Archive, trash, spam, star, mark unread, reply, reply all and forward. To, Cc and Bcc suggest addresses as you type: people you've written to come first, then people who've written to you, then your Mac's Contacts. Use ↑ ↓ and Enter or Tab to pick one, or click it.
 - A unified toolbar with capsule button groups (it sits in the title bar on macOS). There's also a filter menu with All, Unread, Starred, Pinned and With attachments, and Mark all as read.
-- Keyboard shortcuts: `⌘W` closes a composer or Preferences, plus `c` `r` `a` `f` `e` `#` `!` `b` `p` `s` `u` `j/k` `/` `g i` (full list in Preferences → Shortcuts).
-- **Mailspring themes** (see below).
+- Keyboard shortcuts: `⌘F` or `/` searches, `v` and `l` open Move and Label (type a folder's name, `↑` `↓` to choose, Return to pick), plus `c` `r` `a` `f` `e` `#` `!` `b` `p` `s` `u` `j/k` `g i` and `⌘W`. Press `?` for the full list (also in Preferences → Shortcuts).
+- **Themes**: Moonlit Light and Moonlit Dark, or match the system (Preferences → Appearance).
 - **Built-in MCP server** (see below).
 - Demo mode with sample accounts, so you can try it without a mail server.
 
@@ -106,18 +106,9 @@ Tools: `list_accounts`, `list_folders`, `list_threads`, `search`, `read_thread`,
 - `get_attachment` downloads an attachment (using the same cache as the app) and returns its path. Pictures come back to look at, and small text files (CSV, JSON, ICS…) come back inline. Other files, such as PDFs, are opened from the path.
 - `save_draft` writes a draft (or, with `thread_id`, a reply draft) to the Drafts folder instead of sending it. You finish it with **Edit draft** in OwlPost or in any other mail app.
 
-## Themes (Mailspring-compatible)
+## Themes
 
-A Mailspring theme is a folder with a `package.json` (`"theme": "ui"`) and `styles/*.less` files.
-OwlPost reads those files and evaluates the LESS variables, including `lighten`, `darken`, `fade`, `mix`, `tint`, `spin`, `contrast`, `rgba`, `hsl`, plus CSS `var()` and `color-mix()`, using LESS's lazy evaluation where the last definition wins. It then maps the results (`@accent-primary`, `@list-focused-bg`, `@panel-background-color`, …) onto the native UI.
-
-- Themes installed in Mailspring are found automatically (`~/Library/Application Support/Mailspring/packages`).
-- `owlpost themes install <dir>` copies a theme folder in, or use Preferences → Appearance.
-- `owlpost themes inspect <dir>` prints how each colour role resolves.
-
-The built-in Light theme declares the same variable names and derivations as Mailspring's base `ui-variables.less`, so a theme's overrides spread through OwlPost the same way they do in Mailspring. This has been tested against Mailspring's own Dark, Darkside, Taiga, Ubuntu and Less Is More themes.
-
-**Limitation:** CSS rules that target Mailspring's HTML (e.g. `.thread-list .item { … }`) can't apply to a native UI. When a theme relies on one of those for a text colour, OwlPost picks the most readable colour from the theme's own palette.
+OwlPost has one theme, Moonlit, in Light and Dark; **Match system** switches between them with your Mac's (or desktop's) appearance. Its colours are written as Mailspring-style LESS variables (`crates/owlpost-core/themes/`), and `owlpost themes inspect <dir>` prints how each colour role of such a package resolves.
 
 ## Layout
 

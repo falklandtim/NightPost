@@ -949,7 +949,7 @@ mod tests {
     }
 
     fn colors() -> Colors {
-        Colors::new(owlpost_core::theme::discover().into_iter().find(|t| t.id == "owlpost-light").unwrap().palette())
+        Colors::new(owlpost_core::theme::discover().into_iter().find(|t| t.id == owlpost_core::theme::MOONLIT_LIGHT).unwrap().palette())
     }
 
     /// Write a dark page for an email (OWLPOST_DUMP_IN → OWLPOST_DUMP_OUT), to look at.

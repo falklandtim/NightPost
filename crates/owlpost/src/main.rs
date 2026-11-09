@@ -22,9 +22,8 @@ const HELP: &str = "OwlPost — native email client
 USAGE:
     owlpost [--demo]              Launch the app (--demo adds sample accounts)
     owlpost mcp [--demo]          Run the built-in MCP server on stdio
-    owlpost themes                List available themes (incl. Mailspring themes)
-    owlpost themes install <dir>  Install a Mailspring theme package
-    owlpost themes inspect <dir>  Show how a theme package resolves
+    owlpost themes                List the themes
+    owlpost themes inspect <dir>  Show how a Mailspring-style theme package resolves
     owlpost --db <path> …         Use a different database (or set OWLPOST_DB)
 
 Register with Claude Code:
@@ -76,12 +75,6 @@ fn main() -> Result<()> {
             mcp::Server::new(store).run_stdio()
         }
         Some("themes") => {
-            if args.get(1).map(String::as_str) == Some("install") {
-                let dir = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: owlpost themes install <dir>"))?;
-                let t = theme::install(std::path::Path::new(dir))?;
-                println!("Installed {} ({}) — pick it in Preferences → Appearance", t.display_name, t.id);
-                return Ok(());
-            }
             if args.get(1).map(String::as_str) == Some("inspect") {
                 let dir = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: owlpost themes inspect <dir>"))?;
                 let t = theme::Theme::load_package(std::path::Path::new(dir), theme::ThemeSource::User)?;

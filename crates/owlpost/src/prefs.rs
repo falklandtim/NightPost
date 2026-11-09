@@ -1,8 +1,8 @@
-//! Preferences: themes (incl. Mailspring theme import), accounts, MCP, shortcuts.
+//! Preferences: appearance, accounts, MCP, shortcuts.
 
 use crate::style::{self, Colors};
 use eframe::egui::{self, RichText};
-use owlpost_core::theme::{Theme, ThemeSource};
+use owlpost_core::theme::Theme;
 use crate::composer::SignatureBook;
 use crate::worker::PushState;
 use owlpost_core::{Account, AccountId, Auth, Signature};
@@ -107,7 +107,6 @@ pub enum Tab {
 
 pub struct Prefs {
     pub tab: Tab,
-    pub install_path: String,
     pub editing: Option<Account>,
     pub message: Option<(bool, String)>,
     /// The signature open in the editor (an edited copy).
@@ -134,8 +133,6 @@ pub struct Prefs {
 pub enum PrefsAction {
     None,
     SetTheme(String),
-    InstallTheme(String),
-    ReloadThemes,
     AddAccount,
     RemoveAccount(AccountId),
     SaveAccount(Account),
@@ -160,7 +157,7 @@ pub enum PrefsAction {
 
 impl Prefs {
     pub fn new(tab: Tab) -> Self {
-        Self { tab, install_path: String::new(), editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false, html_email: true, load_images: true, dark_emails: true, faces: true }
+        Self { tab, editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false, html_email: true, load_images: true, dark_emails: true, faces: true }
     }
 
     #[allow(clippy::too_many_arguments)] // one window, one call site
@@ -236,11 +233,8 @@ impl Prefs {
             act = PrefsAction::SetFaces(faces);
         }
         ui.add_space(14.0);
-        ui.label(RichText::new("Theme").strong().size(16.0));
-        ui.label(
-            RichText::new("OwlPost reads Mailspring theme packages: their ui-variables.less colours are applied to the native interface.")
-                .color(col.subtle),
-        );
+        ui.label(RichText::new("Appearance").strong().size(16.0));
+        ui.label(RichText::new("The Moonlit theme, light or dark.").color(col.subtle));
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
@@ -250,36 +244,6 @@ impl Prefs {
                 }
             }
         });
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(RichText::new("Install a Mailspring theme").strong());
-        ui.label(
-            RichText::new(
-                "Point at an unpacked theme folder (the one containing package.json), e.g. a clone of a theme from GitHub. \
-                 Themes already installed in Mailspring are picked up automatically.",
-            )
-            .small()
-            .color(col.subtle),
-        );
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.install_path).hint_text("/path/to/mailspring-theme").desired_width(380.0));
-            if ui.button("Install").clicked() && !self.install_path.trim().is_empty() {
-                act = PrefsAction::InstallTheme(self.install_path.trim().to_string());
-            }
-            if ui.button("⟳ Rescan").clicked() {
-                act = PrefsAction::ReloadThemes;
-            }
-        });
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!(
-                "Theme folders: {}  ·  {}",
-                owlpost_core::theme::user_themes_dir().display(),
-                owlpost_core::theme::mailspring_packages_dir().map(|p| p.display().to_string()).unwrap_or_default()
-            ))
-            .small()
-            .color(col.very_subtle),
-        );
         act
     }
 
@@ -501,6 +465,8 @@ impl Prefs {
 }
 
 fn theme_tile(ui: &mut egui::Ui, col: &Colors, t: &Theme, selected: bool) -> bool {
+    // "Match system" shows light and dark side by side.
+    let system = t.id == owlpost_core::theme::MOONLIT;
     let p = t.palette();
     let size = egui::vec2(150.0, 118.0);
     let (rect, r) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -536,16 +502,21 @@ fn theme_tile(ui: &mut egui::Ui, col: &Colors, t: &Theme, selected: bool) -> boo
     } else {
         egui::Stroke::new(1.0_f32, col.border)
     };
+    if system {
+        let dark = owlpost_core::theme::discover().into_iter().find(|d| d.id == owlpost_core::theme::MOONLIT_DARK).map(|d| d.palette());
+        if let Some(d) = dark {
+            let half = egui::Rect::from_min_max(egui::pos2(preview.center().x, preview.min.y), preview.max);
+            painter.rect_filled(half, egui::CornerRadius { ne: 6, se: 6, nw: 0, sw: 0 }, style::c(d.background_off));
+            painter.rect_filled(egui::Rect::from_min_size(half.min + egui::vec2(12.0, 8.0), egui::vec2(36.0, 4.0)), 1.0, style::c(d.heading));
+            painter.rect_filled(egui::Rect::from_min_size(half.min + egui::vec2(12.0, 20.0), egui::vec2(46.0, 2.0)), 1.0, style::c(d.text_subtle));
+            painter.rect_filled(egui::Rect::from_min_size(half.min + egui::vec2(12.0, 60.0), egui::vec2(20.0, 8.0)), 2.0, style::c(d.accent));
+        }
+    }
     painter.rect_stroke(preview, 6.0, stroke, egui::StrokeKind::Outside);
     style::line(&painter, egui::pos2(rect.min.x, preview.max.y + 6.0), &t.display_name, egui::FontId::proportional(13.5), col.text, size.x);
-    let src = match t.source {
-        ThemeSource::BuiltIn => "Built-in",
-        ThemeSource::User => "Installed",
-        ThemeSource::Mailspring => "From Mailspring",
-    };
-    style::line(&painter, egui::pos2(rect.min.x, preview.max.y + 24.0), src, egui::FontId::proportional(11.0), col.subtle, size.x);
+    let sub = t.description.split(':').next().unwrap_or_default();
+    style::line(&painter, egui::pos2(rect.min.x, preview.max.y + 24.0), sub, egui::FontId::proportional(11.0), col.subtle, size.x);
     let r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let r = if t.description.is_empty() { r } else { r.on_hover_text(&t.description) };
     r.clicked()
 }
 

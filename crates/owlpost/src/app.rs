@@ -28,16 +28,17 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("s", "Star / unstar"),
     ("u", "Mark unread"),
     ("p", "Pin to top / unpin"),
-    ("v", "Move to folder…"),
-    ("l", "Label… (Gmail)"),
+    ("v", "Move to folder… (type, ↑ ↓, Return)"),
+    ("l", "Label… (Gmail; type, ↑ ↓, Return)"),
     ("j  /  ↓", "Next conversation"),
     ("k  /  ↑", "Previous conversation"),
     ("⌘ click", "Add to / remove from the selection"),
     ("Shift click", "Select a range"),
     ("Shift ↓  /  Shift ↑", "Extend the selection"),
     ("⌘ A", "Select every conversation in the list"),
-    ("/", "Search"),
-    ("g i", "Go to Inbox"),
+    ("⌘ F  /  /", "Search"),
+    ("g i  ·  g s  ·  g t  ·  g d  ·  g z", "Go to Inbox, Starred, Sent, Drafts, Snoozed"),
+    ("?", "Show the keyboard shortcuts"),
     ("⌘ Z", "Undo (send, move, archive, trash, label, snooze, pin…)"),
     ("⌘ S", "Save draft (in composer)"),
     ("⌘ ,", "Preferences"),
@@ -247,6 +248,9 @@ impl Default for SnoozePick {
     }
 }
 
+/// The All tab: the whole Inbox, whatever its category.
+const ALL_TAB: u8 = u8::MAX;
+
 /// The "New tab" dialog: the name so far, and what goes in the tab once made.
 struct NewTab {
     name: String,
@@ -390,7 +394,7 @@ pub struct OwlPostApp {
     html_email: bool,
     /// Load remote images straight away (trackers are stripped regardless).
     load_images: bool,
-    /// The Inbox tab showing (an `owlpost_core::category` value).
+    /// The Inbox tab showing (an `owlpost_core::category` value, or [`ALL_TAB`]).
     category: u8,
     /// The Inbox tabs showing: category, name and unread conversations.
     tabs: Vec<(u8, String, i64)>,
@@ -410,6 +414,10 @@ pub struct OwlPostApp {
     list_default_width: f32,
     /// Text typed into the Move / Label picker.
     picker_query: String,
+    /// The highlighted row in the Move / Label picker (arrow keys move it).
+    picker_index: usize,
+    /// The keyboard shortcuts sheet (?).
+    show_keys: bool,
     sigs: SignatureBook,
     /// Attachments being downloaded: (message, attachment index).
     downloading: HashSet<(MessageId, usize)>,
@@ -497,7 +505,13 @@ impl OwlPostApp {
         }
         install_image_loaders(ctx);
         let themes = theme::discover();
-        let theme_id = saved_theme.filter(|id| themes.iter().any(|t| &t.id == id)).unwrap_or_else(|| theme::MOONLIT.into());
+        // Themes that were dropped: their dark ones become Moonlit Dark,
+        // anything else follows the system.
+        let theme_id = match saved_theme.as_deref() {
+            Some(id) if themes.iter().any(|t| t.id == id) => id.to_string(),
+            Some("owlpost-dark" | "owlpost-darkside") => theme::MOONLIT_DARK.into(),
+            _ => theme::MOONLIT.into(),
+        };
         let colors = Colors::new(theme_palette(&themes, &theme_id, system_dark(ctx)));
         colors.apply(ctx);
         let worker = Worker::spawn(store.path().to_path_buf(), ctx.clone());
@@ -560,7 +574,7 @@ impl OwlPostApp {
             html_email: true,
             load_images: true,
             dark_emails: true,
-            category: owlpost_core::category::PRIMARY,
+            category: ALL_TAB,
             tabs: Vec::new(),
             new_tab: None,
             web_rect: None,
@@ -570,6 +584,8 @@ impl OwlPostApp {
             last_wheel_x: None,
             list_default_width: 400.0,
             picker_query: String::new(),
+            picker_index: 0,
+            show_keys: false,
             sigs: SignatureBook::default(),
             downloading: HashSet::new(),
             opening_drafts: HashSet::new(),
@@ -922,18 +938,22 @@ impl OwlPostApp {
         let keep = self.selected.and_then(|i| self.rows.get(i)).map(|r| (r.t.account_id, r.t.thread_key.clone()));
         let mut query = format!("{} {}", self.search, self.filter.token());
         if self.tabs_shown() {
-            let mut list: Vec<(u8, String)> = owlpost_core::category::ALL.iter().map(|c| (*c, owlpost_core::category::label(*c).to_string())).collect();
+            let mut list: Vec<(u8, String)> = vec![(ALL_TAB, "All".to_string())];
+            list.extend(owlpost_core::category::ALL.iter().map(|c| (*c, owlpost_core::category::label(*c).to_string())));
             list.extend(self.store.tabs().unwrap_or_default());
             // The tab was removed (perhaps on another machine).
             if !list.iter().any(|(c, _)| *c == self.category) {
-                self.category = owlpost_core::category::PRIMARY;
+                self.category = ALL_TAB;
             }
-            query.push_str(&format!(" category:{}", self.category));
+            if self.category != ALL_TAB {
+                query.push_str(&format!(" category:{}", self.category));
+            }
             if let Some(v) = self.view() {
                 self.tabs = list
                     .into_iter()
                     .map(|(c, name)| {
-                        let unread = self.store.threads(&v, &format!("is:unread category:{c}"), 500).map(|t| t.len() as i64).unwrap_or(0);
+                        let q = if c == ALL_TAB { "is:unread".to_string() } else { format!("is:unread category:{c}") };
+                        let unread = self.store.threads(&v, &q, 500).map(|t| t.len() as i64).unwrap_or(0);
                         (c, name, unread)
                     })
                     .collect();
@@ -1129,6 +1149,87 @@ impl OwlPostApp {
         let name = tab.name.clone();
         self.save_tab_change(owlpost_core::snooze_sync::TabChange::Tab(tab.clone()), None);
         self.did(format!("Removed the “{name}” tab"), Undo::TabRemoved { tab });
+    }
+
+    /// The keyboard shortcuts sheet (? or More ▸ Keyboard shortcuts).
+    fn keys_sheet(&mut self, ctx: &egui::Context) {
+        if !self.show_keys {
+            return;
+        }
+        let col = self.colors.clone();
+        let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
+        let groups: [(&str, Vec<(String, &str)>); 4] = [
+            ("Write", vec![("c".into(), "New message"), ("r".into(), "Reply"), ("a".into(), "Reply all"), ("f".into(), "Forward")]),
+            (
+                "Act on a conversation",
+                vec![
+                    ("e".into(), "Done (archive)"),
+                    ("b".into(), "Snooze"),
+                    ("v".into(), "Move to folder"),
+                    ("l".into(), "Label (Gmail)"),
+                    ("p".into(), "Pin to top"),
+                    ("s".into(), "Star"),
+                    ("u".into(), "Mark read / unread"),
+                    ("# or Delete".into(), "Move to Trash"),
+                    ("!".into(), "Report spam"),
+                    (format!("{cmd}Z"), "Undo"),
+                ],
+            ),
+            (
+                "Get around",
+                vec![
+                    ("j  k".into(), "Next / previous"),
+                    ("↓  ↑".into(), "Next / previous"),
+                    ("Shift ↓  ↑".into(), "Select several"),
+                    (format!("{cmd}A"), "Select all"),
+                    (format!("{cmd}F  or  /"), "Search"),
+                    ("Esc".into(), "Clear the search"),
+                ],
+            ),
+            (
+                "Go to",
+                vec![
+                    ("g  i".into(), "Inbox"),
+                    ("g  s".into(), "Starred"),
+                    ("g  t".into(), "Sent"),
+                    ("g  d".into(), "Drafts"),
+                    ("g  z".into(), "Snoozed"),
+                    (format!("{cmd},"), "Preferences"),
+                    ("?".into(), "This list"),
+                ],
+            ),
+        ];
+        let r = egui::Modal::new(egui::Id::new("keys-sheet")).show(ctx, |ui| {
+            ui.set_width(600.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Keyboard shortcuts").size(17.0).strong().color(col.heading));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Done").clicked() {
+                        self.show_keys = false;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.columns(2, |cols| {
+                for (i, (title, keys)) in groups.iter().enumerate() {
+                    let ui = &mut cols[if i < 2 { 0 } else { 1 }];
+                    ui.label(RichText::new(*title).strong().color(col.text));
+                    ui.add_space(2.0);
+                    egui::Grid::new(("keys", i)).num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+                        for (k, what) in keys {
+                            ui.label(RichText::new(k).monospace().color(col.accent));
+                            ui.label(RichText::new(*what).color(col.subtle));
+                            ui.end_row();
+                        }
+                    });
+                    ui.add_space(10.0);
+                }
+                cols[1].label(RichText::new("In the Move and Label lists, type to find a folder, use the arrow keys to choose and Return to pick.").small().color(col.subtle));
+            });
+        });
+        if r.should_close() || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.show_keys = false;
+        }
     }
 
     /// The "New tab" dialog.
@@ -1765,8 +1866,20 @@ impl OwlPostApp {
                 }
             });
         }
+        // ⌘F: find (the search box), from anywhere.
+        if self.setup.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
+            self.focus_search = true;
+        }
+        // A sheet over the window: ? closes the shortcuts list; nothing
+        // else reaches the list behind it.
+        if self.show_keys {
+            if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "?"))) {
+                self.show_keys = false;
+            }
+            return;
+        }
         // Single-key shortcuts only when nothing is being typed into.
-        if ctx.wants_keyboard_input() || self.setup.is_some() {
+        if ctx.wants_keyboard_input() || self.setup.is_some() || self.new_tab.is_some() {
             return;
         }
         // ⌘Z: undo the last action (text fields keep ⌘Z for their own undo).
@@ -1829,6 +1942,7 @@ impl OwlPostApp {
             "j" => self.move_selection(1),
             "k" => self.move_selection(-1),
             "/" => self.focus_search = true,
+            "?" => self.show_keys = !self.show_keys,
             "g" => self.pending_g = Some(Instant::now()),
             _ => {}
         }
@@ -2047,6 +2161,7 @@ impl OwlPostApp {
         let opening = btn.clicked() || forced;
         if opening {
             self.picker_query.clear();
+            self.picker_index = 0;
         }
         let choices = self.folder_choices(a, kind);
         let applied: Vec<FolderId> = if kind == FolderUse::Label { self.store.thread_folder_ids(a, &k).unwrap_or_default() } else { vec![] };
@@ -2060,6 +2175,9 @@ impl OwlPostApp {
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 ui.set_min_width(260.0);
+                // Arrow keys move the highlight; take them before the text
+                // field does (it would move the cursor).
+                let (down, up) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, Key::ArrowDown), i.consume_key(egui::Modifiers::NONE, Key::ArrowUp)));
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.picker_query)
                         .hint_text(if kind == FolderUse::Move { "Move to…" } else { "Label as…" })
@@ -2068,17 +2186,40 @@ impl OwlPostApp {
                 if opening {
                     r.request_focus();
                 }
+                if r.changed() {
+                    self.picker_index = 0;
+                }
                 let q = self.picker_query.trim().to_lowercase();
-                let matches: Vec<&Folder> = choices.iter().filter(|f| q.is_empty() || folder_label(f).to_lowercase().contains(&q)).collect();
+                // Names starting with what's typed first, then the rest that contain it.
+                let mut matches: Vec<&Folder> = choices.iter().filter(|f| q.is_empty() || folder_label(f).to_lowercase().contains(&q)).collect();
+                matches.sort_by_key(|f| !folder_label(f).to_lowercase().starts_with(&q));
+                let exact = choices.iter().any(|f| folder_label(f).to_lowercase() == q || f.path.to_lowercase() == q);
+                let can_create = !q.is_empty() && !exact;
+                // The rows you can pick: the matches, then "Create …".
+                let rows = matches.len() + can_create as usize;
+                if rows > 0 {
+                    if down {
+                        self.picker_index = (self.picker_index + 1).min(rows - 1);
+                    }
+                    if up {
+                        self.picker_index = self.picker_index.saturating_sub(1);
+                    }
+                }
+                self.picker_index = self.picker_index.min(rows.saturating_sub(1));
+                let hi = self.picker_index;
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                    for f in &matches {
+                    for (i, f) in matches.iter().enumerate() {
                         let on = applied.contains(&f.id);
                         let icon = match kind {
                             FolderUse::Label => if on { "☑" } else { "☐" },
                             FolderUse::Move => f.role.icon(),
                         };
-                        if ui.add(egui::Button::new(format!("{icon}  {}", folder_label(f))).frame(false).min_size(egui::vec2(250.0, 24.0))).clicked() {
+                        let b = ui.add(egui::Button::selectable(i == hi, format!("{icon}  {}", folder_label(f))).min_size(egui::vec2(250.0, 24.0)));
+                        if i == hi && (up || down) {
+                            b.scroll_to_me(None);
+                        }
+                        if b.clicked() {
                             pick = Some(((*f).clone(), !on));
                         }
                     }
@@ -2086,18 +2227,17 @@ impl OwlPostApp {
                         ui.label(RichText::new(if kind == FolderUse::Label { "No labels yet — type a name to create one." } else { "No other folders." }).small().color(col.subtle));
                     }
                 });
-                let exact = choices.iter().any(|f| folder_label(f).to_lowercase() == q || f.path.to_lowercase() == q);
-                if !q.is_empty() && !exact {
+                if can_create {
                     ui.separator();
                     let what = if kind == FolderUse::Move { "folder" } else { "label" };
-                    if ui.add(egui::Button::new(format!("+  Create {what} “{}”", self.picker_query.trim())).frame(false)).clicked() {
+                    if ui.add(egui::Button::selectable(hi == matches.len(), format!("+  Create {what} “{}”", self.picker_query.trim())).min_size(egui::vec2(250.0, 24.0))).clicked() {
                         create = Some(self.picker_query.trim().to_string());
                     }
                 }
                 if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    if let Some(f) = matches.first() {
+                    if let Some(f) = matches.get(hi) {
                         pick = Some(((*f).clone(), !applied.contains(&f.id)));
-                    } else if !q.is_empty() {
+                    } else if can_create {
                         create = Some(self.picker_query.trim().to_string());
                     }
                 }
@@ -2148,8 +2288,11 @@ impl OwlPostApp {
                     action = Some(id);
                 }
             }
+            ui.separator();
+            if ui.add(egui::Button::new("Keyboard shortcuts").shortcut_text("?").frame(false).min_size(egui::vec2(190.0, 24.0))).clicked() {
+                action = Some(5);
+            }
             if self.open.is_some() {
-                ui.separator();
                 if ui.add(egui::Button::new("Show original").frame(false).min_size(egui::vec2(190.0, 24.0))).on_hover_text("The newest message's raw source").clicked() {
                     action = Some(4);
                 }
@@ -2161,6 +2304,7 @@ impl OwlPostApp {
             Some(2) => self.act_move(FolderRole::Trash),
             Some(3) => self.act_move(FolderRole::Spam),
             Some(4) => self.show_original(),
+            Some(5) => self.show_keys = true,
             _ => {}
         }
     }
@@ -2428,15 +2572,16 @@ impl OwlPostApp {
             }
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                for f in ListFilter::ALL {
+                // No filter is "All"; clicking the chosen chip again clears it.
+                for f in ListFilter::ALL.into_iter().filter(|f| *f != ListFilter::All) {
                     // "With attachments" is a paperclip, so the chips fit on one line.
                     let r = if f == ListFilter::Attachments {
                         filter_chip(ui, col, "", f == self.filter).on_hover_text("With attachments")
                     } else {
                         filter_chip(ui, col, f.label(), f == self.filter)
                     };
-                    if r.clicked() && f != self.filter {
-                        chosen = Some(f);
+                    if r.clicked() {
+                        chosen = Some(if f == self.filter { ListFilter::All } else { f });
                     }
                 }
             });
@@ -2499,7 +2644,7 @@ impl OwlPostApp {
                             _ if self.filter == ListFilter::Pinned => ("📌", "Nothing pinned. Press p on a conversation to keep it at the top."),
                             _ if self.filter != ListFilter::All => ("🔍", "No conversations match this filter."),
                             (Selection::Snoozed, _) => ("⏰", "Nothing snoozed. Press b on a conversation to snooze it."),
-                            _ if self.tabs_shown() && self.category != owlpost_core::category::PRIMARY => ("📭", "Nothing here right now."),
+                            _ if self.tabs_shown() && self.category != ALL_TAB => ("📭", "Nothing here right now."),
                             (Selection::Unified(FolderRole::Inbox), _) => ("🌱", "Inbox zero. Nice work!"),
                             _ => ("📭", "No conversations here."),
                         };
@@ -3197,7 +3342,7 @@ impl OwlPostApp {
     fn place_mail_view(&mut self, ctx: &egui::Context) {
         // The macOS view is a native overlay, so it hides under menus and
         // windows; Linux draws the page inside egui, which layers correctly.
-        let covered = cfg!(target_os = "macos") && (self.prefs.is_some() || self.setup.is_some() || self.new_tab.is_some() || egui::Popup::is_any_open(ctx));
+        let covered = cfg!(target_os = "macos") && (self.prefs.is_some() || self.setup.is_some() || self.new_tab.is_some() || self.show_keys || egui::Popup::is_any_open(ctx));
         let (Some(view), Some(rect), Some(open)) = (self.mail_view.as_mut(), self.web_rect, self.open.as_ref()) else {
             if let Some(v) = self.mail_view.as_mut() {
                 v.hide();
@@ -3430,32 +3575,6 @@ impl OwlPostApp {
                 PrefsAction::None => {}
                 PrefsAction::Close => self.prefs = None,
                 PrefsAction::SetTheme(id) => self.set_theme(ctx, &id),
-                PrefsAction::ReloadThemes => {
-                    self.themes = theme::discover();
-                    let msg = format!("Found {} themes", self.themes.len());
-                    if let Some(p) = &mut self.prefs {
-                        p.message = Some((true, msg));
-                    }
-                }
-                PrefsAction::InstallTheme(path) => {
-                    let result = theme::install(std::path::Path::new(&path));
-                    self.themes = theme::discover();
-                    match result {
-                        Ok(t) => {
-                            let id = t.id.clone();
-                            self.set_theme(ctx, &id);
-                            if let Some(p) = &mut self.prefs {
-                                p.message = Some((true, format!("Installed “{}”", t.display_name)));
-                                p.install_path.clear();
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(p) = &mut self.prefs {
-                                p.message = Some((false, format!("{e:#}")));
-                            }
-                        }
-                    }
-                }
                 PrefsAction::AddAccount => self.setup = Some(AccountSetup::default()),
                 PrefsAction::RemoveAccount(id) => {
                     if let Some(a) = self.accounts.iter().find(|a| a.id == id) {
@@ -4304,6 +4423,7 @@ impl OwlPostApp {
         self.reader(ctx);
         self.windows(ctx);
         self.new_tab_dialog(ctx);
+        self.keys_sheet(ctx);
         self.drag_overlay(ctx);
         self.place_mail_view(ctx);
         // Keep relative times and snooze wake-ups fresh.
@@ -4325,10 +4445,14 @@ mod ui_tests {
     #[test]
     fn inbox_tabs_and_sender_rules() {
         use owlpost_core::category::{PRIMARY, PROMOTIONS, SOCIAL};
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run();
         assert!(h.state().tabs_shown());
         let subjects = |h: &Harness<'static, OwlPostApp>| h.state().rows.iter().map(|r| r.t.subject.clone()).collect::<Vec<_>>();
+        assert_eq!(h.state().category, ALL_TAB, "the Inbox opens on All");
+        assert!(subjects(&h).iter().any(|s| s.contains("November roast")), "All has everything");
+        h.state_mut().category = PRIMARY;
+        h.state_mut().reload();
         assert!(!subjects(&h).iter().any(|s| s.contains("November roast")), "the newsletter isn't in Primary");
         h.state_mut().category = PROMOTIONS;
         h.state_mut().reload();
@@ -4354,7 +4478,7 @@ mod ui_tests {
     #[test]
     fn own_tabs() {
         use owlpost_core::category::{PRIMARY, PROMOTIONS};
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run();
         let subjects = |h: &Harness<'static, OwlPostApp>| h.state().rows.iter().map(|r| r.t.subject.clone()).collect::<Vec<_>>();
         // Right-click → Always put their mail in → New tab… → "Invoices".
@@ -4388,7 +4512,7 @@ mod ui_tests {
         assert!(!subjects(&h).contains(&subject));
         // Removing the tab sends its mail back where it came from; undo brings it back.
         h.state_mut().remove_tab(inv);
-        assert_eq!(h.state().category, PRIMARY);
+        assert_eq!(h.state().category, ALL_TAB);
         assert!(!h.state().tabs.iter().any(|(c, ..)| *c == inv));
         h.state_mut().category = PROMOTIONS;
         h.state_mut().reload();
@@ -4443,7 +4567,7 @@ mod ui_tests {
 
     #[test]
     fn renders_every_builtin_theme_and_snoozes() {
-        for theme in ["owlpost-light", "owlpost-dark", "owlpost-darkside", theme::MOONLIT_LIGHT, theme::MOONLIT_DARK] {
+        for theme in [theme::MOONLIT_LIGHT, theme::MOONLIT_DARK] {
             let mut h = harness(theme);
             let c = h.state().colors.clone();
         c.apply(&h.ctx);
@@ -4458,7 +4582,7 @@ mod ui_tests {
             h.state_mut().select(0);
             h.run_steps(3);
             save(&mut h, theme);
-            if theme == "owlpost-light" {
+            if theme == theme::MOONLIT_LIGHT {
                 let before = h.state().rows.len();
                 h.state_mut().act_snooze(Utc::now() + chrono::Duration::hours(4));
                 h.run_steps(2);
@@ -4481,26 +4605,6 @@ mod ui_tests {
         }
     }
 
-    /// Render real Mailspring theme packages when pointed at a folder of them:
-    /// `OWLPOST_TEST_THEMES=/path/to/packages cargo test -p owlpost`
-    #[test]
-    fn renders_external_mailspring_themes() {
-        let Ok(dir) = std::env::var("OWLPOST_TEST_THEMES") else { return };
-        let mut dirs: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-        dirs.sort();
-        for d in dirs {
-            let Ok(t) = theme::Theme::load_package(&d, theme::ThemeSource::Mailspring) else { continue };
-            let mut h = harness("owlpost-light");
-            h.state_mut().themes.push(t.clone());
-            let ctx = h.ctx.clone();
-            h.state_mut().set_theme(&ctx, &t.id);
-            h.run_steps(2);
-            h.state_mut().select(1);
-            h.run_steps(3);
-            save(&mut h, &format!("mailspring-{}", t.id));
-        }
-    }
-
     fn row_center(h: &Harness<'static, OwlPostApp>, i: usize) -> egui::Pos2 {
         let s = h.state();
         let layout = list_layout(&s.rows, s.selection != Selection::Snoozed, s.hidden_pinned, Utc::now());
@@ -4510,7 +4614,7 @@ mod ui_tests {
 
     #[test]
     fn swipe_quick_actions_and_composer_window() {
-        let mut h = harness_with("owlpost-light", |a| a.list_default_width = 500.0);
+        let mut h = harness_with(theme::MOONLIT_LIGHT, |a| a.list_default_width = 500.0);
         h.run_steps(4);
         let before = h.state().rows.len();
         let first = h.state().rows[0].t.thread_key.clone();
@@ -4573,7 +4677,7 @@ mod ui_tests {
         assert!(h.state().open.is_none(), "quick actions don't open the conversation");
 
         // No quick actions when the list is narrow.
-        let mut n = harness("owlpost-light");
+        let mut n = harness(theme::MOONLIT_LIGHT);
         n.run_steps(3);
         n.hover_at(row_center(&n, 0));
         n.run_steps(2);
@@ -4589,7 +4693,7 @@ mod ui_tests {
 
     #[test]
     fn move_and_label() {
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(3);
         let idx = h.state().rows.iter().position(|r| r.t.subject.contains("IMAP IDLE")).unwrap();
         h.state_mut().select(idx);
@@ -4634,7 +4738,7 @@ mod ui_tests {
 
     #[test]
     fn signatures_tab_and_composer_picker() {
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         let work = h.state().store.save_signature(&Signature { id: 0, title: "Work".into(), body: "Alex Rivera\nNorthwind · Product".into(), html: false }).unwrap();
         let gmail = h.state().accounts.iter().find(|a| a.is_gmail()).unwrap().id;
@@ -4699,7 +4803,7 @@ mod ui_tests {
 
     #[test]
     fn command_w_closes_windows() {
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         // Preferences.
         h.state_mut().prefs = Some(Prefs::new(Tab::Appearance));
@@ -4743,7 +4847,7 @@ mod ui_tests {
     #[test]
     fn drafts_reopen_and_save() {
         use egui_kittest::kittest::Queryable;
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         let gmail = h.state().accounts.iter().find(|a| a.is_gmail()).cloned().unwrap();
         let sig = h.state().store.save_signature(&Signature { id: 0, title: "Work".into(), body: "Alex Rivera\nNorthwind".into(), html: false }).unwrap();
@@ -4805,7 +4909,7 @@ mod ui_tests {
 
     #[test]
     fn drafts_save_themselves() {
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         let acc = h.state().accounts[0].clone();
         let mut c = Composer::new(70, &acc);
@@ -4859,7 +4963,7 @@ mod ui_tests {
 
     #[test]
     fn drag_conversations_onto_folders() {
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         let before = h.state().rows.len();
         // Two selected, dropped on the All Accounts Archive.
@@ -4913,7 +5017,7 @@ mod ui_tests {
     #[test]
     fn show_original_window() {
         use egui_kittest::kittest::Queryable;
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         h.state_mut().originals.push(Original { id: 900, subject: "Rates".into(), text: "From: rates@example.com\r\nSubject: Rates\r\n\r\nKia ora".into() });
         h.run_steps(3);
@@ -4923,7 +5027,7 @@ mod ui_tests {
 
     #[test]
     fn multi_select_and_batch_actions() {
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         let before = h.state().rows.len();
         // ⌘-click two conversations (the first one opens, the second joins it).
@@ -4971,7 +5075,7 @@ mod ui_tests {
 
     #[test]
     fn undo_send_holds_the_message() {
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         let acc = h.state().accounts[0].clone();
         let sent = |h: &Harness<'static, OwlPostApp>| h.state().store.threads(&MailboxView::Unified(FolderRole::Sent), "subject:Lunch", 50).unwrap().len();
@@ -5015,7 +5119,7 @@ mod ui_tests {
     #[test]
     fn sidebar_folders_fold() {
         use egui_kittest::kittest::Queryable;
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         let gmail = h.state().accounts.iter().find(|a| a.is_gmail()).unwrap().id;
         for path in ["Projects", "Projects/Website", "Projects/Website/2026", "timson.co"] {
@@ -5049,7 +5153,7 @@ mod ui_tests {
     #[test]
     fn snooze_calendar_picks_a_time() {
         use egui_kittest::kittest::Queryable;
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         h.state_mut().select(0);
         h.run_steps(2);
@@ -5075,7 +5179,7 @@ mod ui_tests {
     #[test]
     fn attachments_and_image_sizes() {
         use crate::attachments::ImageSize;
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         h.state_mut().compose_new();
         h.run_steps(2);
@@ -5131,7 +5235,7 @@ mod ui_tests {
         let cache = std::env::temp_dir().join(format!("sp-ui-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache);
         std::env::set_var("OWLPOST_CACHE", &cache);
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(3);
         let idx = h.state().rows.iter().position(|r| r.t.subject.contains("receipt")).unwrap();
         h.state_mut().select(idx);
@@ -5172,7 +5276,7 @@ mod ui_tests {
     #[test]
     fn push_status_lines() {
         use crate::worker::PushState;
-        let palette = theme::discover().into_iter().find(|t| t.id == "owlpost-light").unwrap().palette();
+        let palette = theme::discover().into_iter().find(|t| t.id == theme::MOONLIT_LIGHT).unwrap().palette();
         let col = Colors::new(palette);
         let states = [
             Some(PushState::Live),
@@ -5197,7 +5301,7 @@ mod ui_tests {
     #[test]
     fn google_sign_in_screens() {
         use egui_kittest::kittest::Queryable;
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
         assert!(!h.state().google_ready, "tests never read the real keychain");
         h.state_mut().prefs = Some(Prefs::new(Tab::Accounts));
@@ -5226,8 +5330,58 @@ mod ui_tests {
     }
 
     #[test]
+    fn keyboard_find_and_move_picker() {
+        let mut h = harness(theme::MOONLIT_LIGHT);
+        h.run_steps(3);
+        // ⌘F puts the cursor in the search box.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::F);
+        h.run_steps(3);
+        assert!(h.ctx.wants_keyboard_input(), "search has the keyboard");
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(!h.ctx.wants_keyboard_input());
+        // ? shows the shortcuts.
+        h.event(egui::Event::Text("?".into()));
+        h.run_steps(3);
+        assert!(h.state().show_keys);
+        save(&mut h, "keyboard-shortcuts");
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().show_keys);
+        // v, type "re", ↓ ↑, Return: moved to Receipts.
+        let idx = h.state().rows.iter().position(|r| r.t.subject.contains("Dinner")).unwrap();
+        let (acct, key) = (h.state().rows[idx].t.account_id, h.state().rows[idx].t.thread_key.clone());
+        h.state_mut().select(idx);
+        h.run_steps(2);
+        h.event(egui::Event::Text("v".into()));
+        h.run_steps(3);
+        h.event(egui::Event::Text("re".into()));
+        h.run_steps(2);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(2);
+        assert_eq!(h.state().picker_index, 1);
+        save(&mut h, "move-picker");
+        h.key_press(Key::ArrowUp);
+        h.run_steps(2);
+        assert_eq!(h.state().picker_index, 0);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        let receipts = h.state().store.folders(acct).unwrap().into_iter().find(|f| f.path == "Receipts").unwrap();
+        let mut moved = false;
+        for _ in 0..100 {
+            h.run_steps(1);
+            if h.state().store.thread_folder_ids(acct, &key).unwrap().contains(&receipts.id) {
+                moved = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(moved, "moved to Receipts");
+    }
+
+    #[test]
     fn command_z_undoes() {
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(3);
         let in_list = |h: &Harness<'static, OwlPostApp>, k: &str| h.state().rows.iter().any(|r| r.t.thread_key == k);
         let wait_for = |h: &mut Harness<'static, OwlPostApp>, k: &str, present: bool| {
@@ -5296,7 +5450,7 @@ mod ui_tests {
 
     #[test]
     fn pinned_section_hides_and_shows() {
-        let mut h = harness("owlpost-light");
+        let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(3);
         let (a, k) = (h.state().rows[2].t.account_id, h.state().rows[2].t.thread_key.clone());
         h.state_mut().toggle_pin(a, &k);
@@ -5357,7 +5511,7 @@ mod ui_tests {
             .with_size(egui::vec2(1100.0, 720.0))
             .build_state(|ctx, app: &mut OwlPostApp| app.frame(ctx), {
                 let ctx = egui::Context::default();
-                OwlPostApp::with_context(&ctx, Some("owlpost-light".into()), store, false)
+                OwlPostApp::with_context(&ctx, Some(theme::MOONLIT_LIGHT.into()), store, false)
             });
         let c = h.state().colors.clone();
         c.apply(&h.ctx);

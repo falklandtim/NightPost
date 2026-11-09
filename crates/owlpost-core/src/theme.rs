@@ -690,8 +690,6 @@ impl Palette {
 // ---------------------------------------------------------------------------
 
 const LIGHT_LESS: &str = include_str!("../themes/owlpost-light/styles/ui-variables.less");
-const DARK_LESS: &str = include_str!("../themes/owlpost-dark/styles/ui-variables.less");
-const DARKSIDE_LESS: &str = include_str!("../themes/owlpost-darkside/styles/ui-variables.less");
 const MOONLIT_DARK_LESS: &str = include_str!("../themes/owlpost-moonlit-dark/styles/ui-variables.less");
 const MOONLIT_LIGHT_LESS: &str = include_str!("../themes/owlpost-moonlit-light/styles/ui-variables.less");
 
@@ -825,71 +823,14 @@ fn collect_less(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// OwlPost's own themes directory.
-pub fn user_themes_dir() -> PathBuf {
-    let dir = crate::data_dir().join("themes");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
-/// Where Mailspring keeps installed packages (themes included).
-pub fn mailspring_packages_dir() -> Option<PathBuf> {
-    let base = directories::BaseDirs::new()?;
-    Some(base.config_dir().join("Mailspring").join("packages"))
-}
-
-/// Every theme available: built-ins, OwlPost themes, Mailspring themes.
+/// The themes: Moonlit, light or dark, or following the system.
 pub fn discover() -> Vec<Theme> {
-    let mut themes = vec![
-        Theme::builtin(MOONLIT, "Moonlit", "Light or dark, following your system", MOONLIT_LIGHT_LESS),
-        Theme::builtin(MOONLIT_LIGHT, "Moonlit Light", "Cool off-white with a navy accent", MOONLIT_LIGHT_LESS),
-        Theme::builtin(MOONLIT_DARK, "Moonlit Dark", "Deep navy with a soft periwinkle accent", MOONLIT_DARK_LESS),
-        Theme::builtin("owlpost-light", "Light", "The default OwlPost theme", ""),
-        Theme::builtin("owlpost-dark", "Dark", "Easy on the eyes at night", DARK_LESS),
-        Theme::builtin("owlpost-darkside", "Darkside", "Light messages, dark sidebar", DARKSIDE_LESS),
-    ];
-    let mut scan = |dir: PathBuf, source: ThemeSource| {
-        let Ok(rd) = std::fs::read_dir(&dir) else { return };
-        let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-        dirs.sort();
-        for d in dirs {
-            match Theme::load_package(&d, source.clone()) {
-                Ok(t) if !themes.iter().any(|x| x.id == t.id) => themes.push(t),
-                Ok(_) => {}
-                Err(e) => log::debug!("skipping {}: {e:#}", d.display()),
-            }
-        }
-    };
-    scan(user_themes_dir(), ThemeSource::User);
-    if let Some(ms) = mailspring_packages_dir() {
-        scan(ms, ThemeSource::Mailspring);
-    }
-    themes
-}
-
-/// Copy a theme package directory into OwlPost's themes folder.
-pub fn install(from: &Path) -> Result<Theme> {
-    let probe = Theme::load_package(from, ThemeSource::User)?;
-    let dest = user_themes_dir().join(&probe.id);
-    copy_dir(from, &dest)?;
-    Theme::load_package(&dest, ThemeSource::User)
-}
-
-fn copy_dir(from: &Path, to: &Path) -> Result<()> {
-    std::fs::create_dir_all(to)?;
-    for e in std::fs::read_dir(from)?.flatten() {
-        let p = e.path();
-        let name = e.file_name();
-        if name == "node_modules" || name == ".git" {
-            continue;
-        }
-        if p.is_dir() {
-            copy_dir(&p, &to.join(&name))?;
-        } else {
-            std::fs::copy(&p, to.join(&name))?;
-        }
-    }
-    Ok(())
+    let system = if cfg!(target_os = "macos") { "Follows your Mac" } else { "Follows your system" };
+    vec![
+        Theme::builtin(MOONLIT_LIGHT, "Light", "Moonlit Light: cool off-white with a navy accent", MOONLIT_LIGHT_LESS),
+        Theme::builtin(MOONLIT_DARK, "Dark", "Moonlit Dark: deep navy with a soft periwinkle accent", MOONLIT_DARK_LESS),
+        Theme::builtin(MOONLIT, "Match system", system, MOONLIT_LIGHT_LESS),
+    ]
 }
 
 #[cfg(test)]
@@ -977,8 +918,6 @@ mod tests {
                 assert_ne!(hex, "#ff00ff", "{} has unresolved {role}", t.id);
             }
         }
-        let dark = discover().into_iter().find(|t| t.id == "owlpost-dark").unwrap();
-        assert!(dark.palette().dark);
         let moon = |id: &str| discover().into_iter().find(|t| t.id == id).unwrap().palette();
         assert!(moon(MOONLIT_DARK).dark && !moon(MOONLIT_LIGHT).dark && !moon(MOONLIT).dark);
         // The mockup's colours survive the contrast fixes.
