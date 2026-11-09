@@ -39,6 +39,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("⌘ F  /  /", "Search"),
     ("g i  ·  g s  ·  g t  ·  g d  ·  g z", "Go to Inbox, Starred, Sent, Drafts, Snoozed"),
     ("?", "Show the keyboard shortcuts"),
+    ("↑ ↓  ·  Return  ·  Esc", "In a menu: choose, pick (or open a submenu), close"),
     ("⌘ Z", "Undo (send, move, archive, trash, label, snooze, pin…)"),
     ("⌘ S", "Save draft (in composer)"),
     ("⌘ ,", "Preferences"),
@@ -1224,7 +1225,7 @@ impl OwlPostApp {
                     });
                     ui.add_space(10.0);
                 }
-                cols[1].label(RichText::new("In the Move and Label lists, type to find a folder, use the arrow keys to choose and Return to pick.").small().color(col.subtle));
+                cols[1].label(RichText::new("In any menu, use the arrow keys to choose and Return to pick. In the Move and Label lists, type to find a folder first.").small().color(col.subtle));
             });
         });
         if r.should_close() || ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -1947,6 +1948,8 @@ impl OwlPostApp {
             _ => {}
         }
         let shift = ctx.input(|i| i.modifiers.shift);
+        // With a menu open, the arrows belong to it (see `menu_keys`).
+        let key = |k: Key| key(k) && !egui::Popup::is_any_open(ctx);
         if key(Key::ArrowDown) {
             if shift { self.extend_marks(1) } else { self.move_selection(1) }
         }
@@ -3893,6 +3896,72 @@ fn theme_palette(themes: &[Theme], id: &str, dark: bool) -> owlpost_core::theme:
     themes.iter().find(|t| t.id == id).unwrap_or(&themes[0]).palette()
 }
 
+/// ↑ ↓ through the items of an open menu (right-click menus, the toolbar's
+/// ⋯ menu, drop-downs), Return to choose one or open a submenu, Esc to close.
+/// egui's own arrow-key focus jumps to whatever is nearest on screen, which
+/// can be the list behind the menu, so it's replaced here: the items are the
+/// clickable widgets on the newest menu layer, top to bottom, wrapping round.
+/// Text fields (the Move / Label search) keep the arrows to themselves.
+fn menu_keys(ctx: &egui::Context) {
+    let pending = egui::Id::new("menu_keys_enter");
+    if !egui::Popup::is_any_open(ctx) {
+        ctx.data_mut(|d| d.remove_temp::<(usize, u64)>(pending));
+        return;
+    }
+    let focused = ctx.memory(|m| m.focused());
+    let order: Vec<egui::LayerId> = ctx.memory(|m| m.layer_ids().filter(|l| l.order == egui::Order::Foreground).collect());
+    // Each open menu (newest last) with its items, top to bottom.
+    let (menus, typing) = ctx.viewport(|v| {
+        let widgets = &v.prev_pass.widgets;
+        let typing = focused.and_then(|id| widgets.get(id)).is_some_and(|w| w.sense.senses_drag() && w.sense.is_focusable());
+        let menus: Vec<Vec<(egui::Id, egui::Rect)>> = order
+            .iter()
+            .map(|l| {
+                // The menu's own background is clickable too; skip it.
+                let items: Vec<&egui::WidgetRect> = widgets.get_layer(*l).filter(|w| w.id != l.id && w.enabled && w.sense.senses_click() && !w.sense.senses_drag()).collect();
+                let bg = |w: &egui::WidgetRect| items.len() > 1 && items.iter().all(|o| w.rect.contains_rect(o.rect));
+                let mut items: Vec<(egui::Id, egui::Rect)> = items.iter().filter(|w| !bg(w)).map(|w| (w.id, w.rect)).collect();
+                items.sort_by(|a, b| (a.1.top(), a.1.left()).partial_cmp(&(b.1.top(), b.1.left())).unwrap_or(std::cmp::Ordering::Equal));
+                items
+            })
+            .filter(|items| !items.is_empty())
+            .collect();
+        (menus, typing)
+    });
+    // Return on an item clicks it (egui does that for the focused widget).
+    // Unless it opened a submenu, the menu's job is done: close it, as a
+    // mouse click would.
+    let pass = ctx.cumulative_pass_nr();
+    if let Some((before, at)) = ctx.data(|d| d.get_temp::<(usize, u64)>(pending)) {
+        if pass >= at + 2 {
+            ctx.data_mut(|d| d.remove_temp::<(usize, u64)>(pending));
+            if menus.len() <= before {
+                egui::Popup::close_all(ctx);
+                return;
+            }
+        }
+    }
+    let in_menu = focused.is_some_and(|f| menus.iter().any(|m| m.iter().any(|(id, _)| *id == f)));
+    if in_menu && !typing && ctx.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Space)) {
+        ctx.data_mut(|d| d.insert_temp(pending, (menus.len(), pass)));
+    }
+    let (down, up) = ctx.input(|i| (i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowUp)));
+    if typing || (!down && !up) {
+        return;
+    }
+    let Some(items) = menus.last() else { return };
+    // Stop egui's own move, then make ours.
+    ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+    let n = items.len();
+    let next = match focused.and_then(|f| items.iter().position(|(id, _)| *id == f)) {
+        Some(i) if down => (i + 1) % n,
+        Some(i) => (i + n - 1) % n,
+        None if down => 0,
+        None => n - 1,
+    };
+    ctx.memory_mut(|m| m.request_focus(items[next].0));
+}
+
 /// Is this the first pass a piece of UI (like a submenu) has been shown
 /// since it was last hidden?
 fn first_pass(ui: &egui::Ui, id: egui::Id) -> bool {
@@ -4449,6 +4518,7 @@ impl OwlPostApp {
             self.place_mail_view(ctx);
             return;
         }
+        menu_keys(ctx);
         self.handle_keys(ctx);
         self.toolbar(ctx);
         self.sidebar(ctx);
@@ -5450,6 +5520,51 @@ mod ui_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(moved, "moved to Receipts");
+    }
+
+    #[test]
+    fn arrow_keys_in_context_menus() {
+        let mut h = harness(theme::MOONLIT_LIGHT);
+        h.run_steps(3);
+        let right_click = |h: &mut Harness<'static, OwlPostApp>, idx: usize| {
+            let at = row_center(h, idx);
+            h.event(egui::Event::PointerMoved(at));
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: true, modifiers: Default::default() });
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: false, modifiers: Default::default() });
+            h.run_steps(3);
+        };
+        let idx = h.state().rows.iter().position(|r| r.t.subject.contains("Dinner")).unwrap();
+        let (acct, key) = (h.state().rows[idx].t.account_id, h.state().rows[idx].t.thread_key.clone());
+        let selected = h.state().selected;
+        assert!(h.state().rows[idx].t.unread);
+        // ↓ ↓ Return: the second item, Mark as read. The list behind doesn't move.
+        right_click(&mut h, idx);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(2);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(2);
+        save(&mut h, "context-menu-keys");
+        assert_eq!(h.state().selected, selected, "the arrows don't move the list");
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert!(!h.state().store.threads(&MailboxView::Everything, "subject:Dinner is:unread", 5).unwrap().iter().any(|t| t.account_id == acct && t.thread_key == key));
+        assert!(!egui::Popup::is_any_open(&h.ctx));
+        // ↑ from the top wraps to the last item, Move to; Return opens it, ready to type.
+        let idx = h.state().rows.iter().position(|r| r.t.thread_key == key).unwrap();
+        right_click(&mut h, idx);
+        h.key_press(Key::ArrowUp);
+        h.run_steps(2);
+        h.key_press(Key::Enter);
+        h.run_steps(4);
+        h.event(egui::Event::Text("rec".into()));
+        h.run_steps(2);
+        assert_eq!(h.state().picker_query, "rec");
+        // Esc closes it all.
+        h.key_press(Key::Escape);
+        h.run_steps(3);
+        h.key_press(Key::Escape);
+        h.run_steps(3);
+        assert!(!egui::Popup::is_any_open(&h.ctx), "Esc closes the menu");
     }
 
     #[test]
