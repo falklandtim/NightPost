@@ -215,6 +215,9 @@ fn sync_folder(store: &Store, session: &mut Session, account: &Account, folder: 
         if let Err(e) = sort_inbox(store, session, account, folder) {
             log::warn!("sorting {} into categories failed: {e:#}", folder.path);
         }
+        if let Err(e) = crate::snooze_sync::label_tabs(store, account) {
+            log::warn!("labelling your tabs on Gmail failed: {e:#}");
+        }
     }
     let max_uid = server.iter().copied().max().unwrap_or(folder.last_uid);
     store.set_folder_sync_state(folder.id, validity, max_uid.max(folder.last_uid))?;

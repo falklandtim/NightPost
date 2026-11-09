@@ -16,8 +16,9 @@ pub enum Cmd {
     SyncAccount(AccountId),
     SetUnread(AccountId, String, bool),
     SetStarred(AccountId, String, bool),
-    /// Always sort mail from this address into a category (None: automatic).
-    SortSender(String, Option<u8>),
+    /// Save a change to the inbox tabs to every server; with a conversation
+    /// that moved (and the tab it left), fix its Gmail labels.
+    TabChange(owlpost_core::snooze_sync::TabChange, Option<(AccountId, String, u8)>),
     Move(AccountId, String, FolderRole),
     /// Move a thread into a folder, optionally only out of the one being viewed.
     MoveTo(AccountId, String, FolderId, Option<FolderId>),
@@ -585,7 +586,17 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
             }
             Cmd::SetUnread(a, key, unread) => engine::set_thread_unread(&store, &account(a)?, &key, unread)?,
             Cmd::SetStarred(a, key, starred) => engine::set_thread_starred(&store, &account(a)?, &key, starred)?,
-            Cmd::SortSender(email, category) => owlpost_core::snooze_sync::set_sender_rule(&store, &email, category)?,
+            Cmd::TabChange(change, moved) => {
+                let r = owlpost_core::snooze_sync::save_tab_change(&store, &change);
+                if let Some((a, key, was)) = moved {
+                    let acc = account(a)?;
+                    if !acc.demo {
+                        owlpost_core::snooze_sync::unlabel_tab(&store, &acc, &key, was)?;
+                        owlpost_core::snooze_sync::label_tabs(&store, &acc)?;
+                    }
+                }
+                r?
+            }
             Cmd::Snooze(a, key, until) => {
                 // On failure the snooze is undone, so the conversation reappears.
                 let r = owlpost_core::snooze_sync::snooze_thread(&store, &account(a)?, &key, until);

@@ -14,8 +14,9 @@
 //! Cancelled snoozes stay as tombstones for [`TOMBSTONE_DAYS`] so a machine
 //! that was offline doesn't bring them back.
 //!
-//! The same state carries the sender rules for inbox categories
-//! ([`SenderRule`]), merged the same way: the newer change to an address wins.
+//! The same state carries the inbox tabs: your own tabs ([`Tab`]), sender
+//! rules ([`SenderRule`]) and conversation rules ([`ThreadRule`]), merged
+//! the same way: the newer change to a tab, address or conversation wins.
 //!
 //! Whichever OwlPost is running when a snooze is due moves the conversation
 //! back to the Inbox and marks it unread. If another got there first, the
@@ -73,7 +74,11 @@ impl Entry {
 pub struct SenderRule {
     /// Lower-case email address.
     pub email: String,
+    /// A built-in category (when `tab` is None).
     pub category: u8,
+    /// One of your own tabs, by [`Tab::id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<String>,
     /// When it last changed (Unix seconds); the newer change wins.
     pub updated: i64,
     #[serde(default)]
@@ -95,6 +100,74 @@ pub fn merge_rules(docs: impl IntoIterator<Item = SenderRule>, now: i64) -> Vec<
     out
 }
 
+/// "Put this conversation in this category" (a tombstone when `removed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadRule {
+    /// Message-IDs in the conversation; any one identifies it.
+    pub ids: Vec<String>,
+    pub category: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<String>,
+    pub updated: i64,
+    #[serde(default)]
+    pub removed: bool,
+}
+
+/// One of your own inbox tabs (Invoices).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tab {
+    /// The same on every machine (each numbers its tabs its own way).
+    pub id: String,
+    pub name: String,
+    /// When it was made; tabs show in this order.
+    pub created: i64,
+    pub updated: i64,
+    #[serde(default)]
+    pub removed: bool,
+}
+
+/// Merge conversation rules: per conversation the newest change wins (and
+/// the Message-IDs are pooled); old tombstones go.
+pub fn merge_thread_rules(docs: impl IntoIterator<Item = ThreadRule>, now: i64) -> Vec<ThreadRule> {
+    let mut docs: Vec<ThreadRule> = docs.into_iter().collect();
+    docs.sort_by_key(|r| std::cmp::Reverse(r.updated));
+    let mut out: Vec<ThreadRule> = Vec::new();
+    for r in docs {
+        match out.iter_mut().find(|o| o.ids.iter().any(|i| r.ids.contains(i))) {
+            // Newest first, so the one already here wins; pool the IDs.
+            Some(o) => {
+                for id in r.ids {
+                    if !o.ids.contains(&id) {
+                        o.ids.push(id);
+                    }
+                }
+            }
+            None => out.push(r),
+        }
+    }
+    out.retain(|r| !(r.removed && r.updated < now - TOMBSTONE_DAYS * 86_400));
+    for r in &mut out {
+        r.ids.sort();
+    }
+    out.sort_by(|a, b| (a.updated, &a.ids).cmp(&(b.updated, &b.ids)));
+    out
+}
+
+/// Merge tabs: per tab the newest change wins; old tombstones go.
+pub fn merge_tabs(docs: impl IntoIterator<Item = Tab>, now: i64) -> Vec<Tab> {
+    let mut out: Vec<Tab> = Vec::new();
+    for t in docs {
+        match out.iter_mut().find(|o| o.id == t.id) {
+            Some(o) if t.updated > o.updated => *o = t,
+            Some(_) => {}
+            None => out.push(t),
+        }
+    }
+    out.retain(|t| !(t.removed && t.updated < now - TOMBSTONE_DAYS * 86_400));
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
@@ -104,6 +177,12 @@ pub struct State {
     /// Inbox category rules by sender.
     #[serde(default)]
     pub senders: Vec<SenderRule>,
+    /// Your own tabs.
+    #[serde(default)]
+    pub tabs: Vec<Tab>,
+    /// Conversations put in a tab by hand.
+    #[serde(default)]
+    pub threads: Vec<ThreadRule>,
 }
 
 impl State {
@@ -111,10 +190,12 @@ impl State {
     /// (and their Message-IDs are pooled). Old tombstones are dropped.
     pub fn merge(docs: impl IntoIterator<Item = State>, now: i64) -> State {
         let mut out: Vec<Entry> = Vec::new();
-        let mut senders: Vec<SenderRule> = Vec::new();
+        let (mut senders, mut tabs, mut threads) = (Vec::new(), Vec::new(), Vec::new());
         let docs: Vec<State> = docs.into_iter().collect();
         for d in &docs {
             senders.extend(d.senders.iter().cloned());
+            tabs.extend(d.tabs.iter().cloned());
+            threads.extend(d.threads.iter().cloned());
         }
         for e in docs.into_iter().flat_map(|d| d.entries) {
             match out.iter_mut().find(|o| o.same_conversation(&e.ids)) {
@@ -133,7 +214,7 @@ impl State {
         }
         out.retain(|e| !(e.removed && e.updated < now - TOMBSTONE_DAYS * 86_400));
         out.sort_by_key(|e| (e.removed, e.until));
-        State { version: 1, entries: out, senders: merge_rules(senders, now) }
+        State { version: 1, entries: out, senders: merge_rules(senders, now), tabs: merge_tabs(tabs, now), threads: merge_thread_rules(threads, now) }
     }
 
     /// Snooze (`Some(until)`) or cancel (`None`) a conversation.
@@ -466,15 +547,23 @@ pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
         local.parked = store.thread_keys_in_folder(f.id)?.into_iter().collect();
     }
     let (old, mut state) = read_state(account)?;
-    // Sender rules: pool this machine's with the server's, keep the result
-    // here, and write it back if the server was missing anything.
+    // Tabs and their rules: pool this machine's with the server's, keep the
+    // result here, and write it back if the server was missing anything.
     let now = Utc::now().timestamp();
+    let tabs = merge_tabs(state.tabs.iter().cloned().chain(store.all_tabs()?), now);
+    for t in &tabs {
+        store.put_tab(t)?;
+    }
     let rules = merge_rules(state.senders.iter().cloned().chain(store.sender_rules()?), now);
     for r in &rules {
         store.put_sender_rule(r)?;
     }
-    let rules_changed = rules != state.senders;
-    state.senders = rules;
+    let threads = merge_thread_rules(state.threads.iter().cloned().chain(store.thread_rules()?), now);
+    for r in &threads {
+        store.put_thread_rule(r)?;
+    }
+    let rules_changed = rules != state.senders || tabs != state.tabs || threads != merge_thread_rules(state.threads.clone(), now);
+    (state.senders, state.tabs, state.threads) = (rules, tabs, threads);
     // Never snoozed anywhere: nothing else to do.
     if local.snoozes.is_empty() && local.parked.is_empty() && state.entries.iter().all(|e| e.removed) {
         if rules_changed {
@@ -540,16 +629,100 @@ pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
     Ok(p.wake.len())
 }
 
-/// Always put mail from `email` in `category` (`None`: back to OwlPost's
-/// guess), here and on every account's server copy of the state.
-pub fn set_sender_rule(store: &Store, email: &str, category: Option<u8>) -> Result<()> {
-    let rule = SenderRule { email: email.trim().to_lowercase(), category: category.unwrap_or(0), updated: Utc::now().timestamp(), removed: category.is_none() };
-    store.put_sender_rule(&rule)?;
+/// How a category is written in the state: a built-in one by number,
+/// one of your tabs by its id. None (back to automatic) is a tombstone.
+fn target(store: &Store, category: Option<u8>) -> Result<(u8, Option<String>, bool)> {
+    match category {
+        None => Ok((0, None, true)),
+        Some(c) if crate::category::is_tab(c) => Ok((0, Some(store.tab_key(c)?.ok_or_else(|| anyhow!("that tab doesn't exist"))?), false)),
+        Some(c) => Ok((c, None, false)),
+    }
+}
+
+/// A time for a change that replaces one made at `prev`: now, but always
+/// later than `prev`, so an undo straight after wins everywhere.
+fn stamp(prev: Option<i64>) -> i64 {
+    let now = Utc::now().timestamp();
+    prev.map_or(now, |p| now.max(p + 1))
+}
+
+/// A rule putting mail from `email` in `category` (None: back to OwlPost's guess).
+pub fn sender_rule(store: &Store, email: &str, category: Option<u8>) -> Result<SenderRule> {
+    let (category, tab, removed) = target(store, category)?;
+    let email = email.trim().to_lowercase();
+    let prev = store.sender_rules()?.into_iter().find(|r| r.email == email).map(|r| r.updated);
+    Ok(SenderRule { email, category, tab, updated: stamp(prev), removed })
+}
+
+/// A rule putting one conversation in `category` (None: sort it like the rest).
+pub fn thread_rule(store: &Store, account_id: AccountId, key: &str, category: Option<u8>) -> Result<ThreadRule> {
+    let (category, tab, removed) = target(store, category)?;
+    let ids: Vec<String> = store.thread_messages(account_id, key)?.into_iter().map(|m| m.message_id).filter(|i| !i.is_empty()).collect();
+    if ids.is_empty() {
+        return Err(anyhow!("that conversation has no Message-IDs to remember it by"));
+    }
+    let prev = store.thread_rules()?.into_iter().filter(|r| r.ids.iter().any(|i| ids.contains(i))).map(|r| r.updated).max();
+    Ok(ThreadRule { ids, category, tab, updated: stamp(prev), removed })
+}
+
+/// A new tab called `name` (or the one already called that).
+pub fn new_tab(store: &Store, name: &str) -> Result<Tab> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("give the tab a name"));
+    }
+    if name.chars().count() > 30 {
+        return Err(anyhow!("keep the tab name under 30 characters"));
+    }
+    if crate::category::parse(name).is_some() {
+        return Err(anyhow!("there's already a {} tab", crate::category::label(crate::category::parse(name).unwrap_or(0))));
+    }
+    if let Some(t) = store.all_tabs()?.into_iter().find(|t| !t.removed && t.name.eq_ignore_ascii_case(name)) {
+        return Ok(t);
+    }
+    let now = Utc::now().timestamp();
+    Ok(Tab { id: format!("{:08x}{:08x}", rand_u32(), rand_u32()), name: name.to_string(), created: now, updated: now, removed: false })
+}
+
+/// The tombstone that removes tab number `num`.
+pub fn removed_tab(store: &Store, num: u8) -> Result<Tab> {
+    let key = store.tab_key(num)?.ok_or_else(|| anyhow!("that tab doesn't exist"))?;
+    let mut t = store.all_tabs()?.into_iter().find(|t| t.id == key).ok_or_else(|| anyhow!("that tab doesn't exist"))?;
+    (t.updated, t.removed) = (stamp(Some(t.updated)), true);
+    Ok(t)
+}
+
+/// A removed tab brought back.
+pub fn restored_tab(tab: &Tab) -> Tab {
+    Tab { updated: stamp(Some(tab.updated)), removed: false, ..tab.clone() }
+}
+
+/// A change to the inbox tabs, to keep here and on every server.
+#[derive(Debug, Clone)]
+pub enum TabChange {
+    Tab(Tab),
+    Sender(SenderRule),
+    Thread(ThreadRule),
+}
+
+/// Keep a change here (at once) and in every account's server copy of the
+/// state.
+pub fn save_tab_change(store: &Store, change: &TabChange) -> Result<()> {
+    match change {
+        TabChange::Tab(t) => store.put_tab(t)?,
+        TabChange::Sender(r) => store.put_sender_rule(r)?,
+        TabChange::Thread(r) => store.put_thread_rule(r)?,
+    }
     let mut err = None;
     for a in store.accounts()?.into_iter().filter(|a| !a.demo) {
         // A failure is caught up by the next sync (this machine's copy is newer).
-        if let Err(e) = update_state(store, &a, |st| st.senders.push(rule.clone())) {
-            log::warn!("couldn't save the sender rule to {}: {e:#}", a.email);
+        let r = update_state(store, &a, |st| match change {
+            TabChange::Tab(t) => st.tabs.push(t.clone()),
+            TabChange::Sender(r) => st.senders.push(r.clone()),
+            TabChange::Thread(r) => st.threads.push(r.clone()),
+        });
+        if let Err(e) = r {
+            log::warn!("couldn't save the tab change to {}: {e:#}", a.email);
             err = Some(e);
         }
     }
@@ -557,6 +730,49 @@ pub fn set_sender_rule(store: &Store, email: &str, category: Option<u8>) -> Resu
         Some(e) => Err(e.context("Saved here; the other machines will get it at the next sync")),
         None => Ok(()),
     }
+}
+
+/// Always put mail from `email` in `category` (`None`: back to OwlPost's
+/// guess), here and on every account's server copy of the state.
+pub fn set_sender_rule(store: &Store, email: &str, category: Option<u8>) -> Result<()> {
+    save_tab_change(store, &TabChange::Sender(sender_rule(store, email, category)?))
+}
+
+/// On Gmail, give every Inbox conversation in one of your tabs a label of
+/// the same name, so it's grouped on the phone too.
+pub fn label_tabs(store: &Store, account: &Account) -> Result<()> {
+    if !account.is_gmail() {
+        return Ok(());
+    }
+    let Some(inbox) = store.folder_by_role(account.id, FolderRole::Inbox)? else { return Ok(()) };
+    for (num, name) in store.tabs()? {
+        let threads = store.threads(&MailboxView::Folder(inbox.id), &format!("category:{num}"), 5000)?;
+        if threads.is_empty() {
+            continue;
+        }
+        let id = engine::create_folder(store, account, &name)?;
+        let Some(label) = store.folder(id)? else { continue };
+        for t in threads {
+            if !store.thread_folder_ids(account.id, &t.thread_key)?.contains(&label.id) {
+                engine::set_label(store, account, &t.thread_key, &label, true)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// On Gmail, take a conversation moved out of tab `was` out of its label.
+pub fn unlabel_tab(store: &Store, account: &Account, key: &str, was: u8) -> Result<()> {
+    if !account.is_gmail() || !crate::category::is_tab(was) {
+        return Ok(());
+    }
+    let name = store.category_name(was);
+    if let Some(label) = store.folders(account.id)?.into_iter().find(|f| f.path.eq_ignore_ascii_case(&name)) {
+        if store.thread_folder_ids(account.id, key)?.contains(&label.id) {
+            engine::set_label(store, account, key, &label, false)?;
+        }
+    }
+    Ok(())
 }
 
 /// Wake every snooze that's due, on every account. Returns how many woke.
@@ -586,8 +802,8 @@ mod tests {
 
     #[test]
     fn newer_change_wins_and_ids_pool() {
-        let a = State { version: 1, entries: vec![entry(&["a"], NOW + 100, NOW - 50, false)], senders: vec![] };
-        let b = State { version: 1, entries: vec![entry(&["a", "b"], 0, NOW - 10, true), entry(&["c"], NOW + 5, NOW - 5, false)], senders: vec![] };
+        let a = State { version: 1, entries: vec![entry(&["a"], NOW + 100, NOW - 50, false)], senders: vec![], tabs: vec![], threads: vec![] };
+        let b = State { version: 1, entries: vec![entry(&["a", "b"], 0, NOW - 10, true), entry(&["c"], NOW + 5, NOW - 5, false)], senders: vec![], tabs: vec![], threads: vec![] };
         let m = State::merge([a.clone(), b.clone()], NOW);
         assert_eq!(m.entries.len(), 2);
         let first = m.entries.iter().find(|e| e.ids.contains(&"a".into())).unwrap();
@@ -599,27 +815,46 @@ mod tests {
 
     #[test]
     fn sender_rules_merge_newest_wins() {
-        let r = |e: &str, c: u8, at: i64, removed: bool| SenderRule { email: e.into(), category: c, updated: at, removed };
-        let a = State { version: 1, entries: vec![], senders: vec![r("shop@x.com", 1, NOW - 50, false), r("old@x.com", 0, NOW - 40 * 86_400, true)] };
-        let b = State { version: 1, entries: vec![], senders: vec![r("shop@x.com", 0, NOW - 10, true), r("li@linkedin.com", 2, NOW - 5, false)] };
+        let r = |e: &str, c: u8, at: i64, removed: bool| SenderRule { email: e.into(), category: c, tab: None, updated: at, removed };
+        let a = State { version: 1, entries: vec![], senders: vec![r("shop@x.com", 1, NOW - 50, false), r("old@x.com", 0, NOW - 40 * 86_400, true)], ..Default::default() };
+        let b = State { version: 1, entries: vec![], senders: vec![r("shop@x.com", 0, NOW - 10, true), r("li@linkedin.com", 2, NOW - 5, false)], ..Default::default() };
         let m = State::merge([a, b.clone()], NOW);
         assert_eq!(m.senders, vec![r("li@linkedin.com", 2, NOW - 5, false), r("shop@x.com", 0, NOW - 10, true)]);
         // A state without rules (an older OwlPost's) still reads.
-        let raw = State { version: 1, entries: vec![], senders: vec![] }.to_message(DateTime::from_timestamp(NOW, 0).unwrap());
+        let raw = State { version: 1, entries: vec![], senders: vec![], tabs: vec![], threads: vec![] }.to_message(DateTime::from_timestamp(NOW, 0).unwrap());
         assert_eq!(State::from_message(&raw).unwrap().senders, vec![]);
         let back = State::from_message(&b.to_message(DateTime::from_timestamp(NOW, 0).unwrap())).unwrap();
         assert_eq!(back.senders, b.senders);
     }
 
     #[test]
+    fn tabs_and_thread_rules_merge() {
+        let tab = |id: &str, name: &str, at: i64, removed: bool| Tab { id: id.into(), name: name.into(), created: NOW - 100, updated: at, removed };
+        let rule = |i: &[&str], tab: &str, at: i64| ThreadRule { ids: ids(i), category: 0, tab: Some(tab.into()), updated: at, removed: false };
+        let a = State { tabs: vec![tab("t1", "Invoices", NOW - 50, false)], threads: vec![rule(&["m1"], "t1", NOW - 50)], ..Default::default() };
+        let b = State {
+            tabs: vec![tab("t1", "Invoices", NOW - 10, true), tab("t2", "Kids", NOW - 5, false)],
+            threads: vec![rule(&["m2", "m1"], "t2", NOW - 20), rule(&["m9"], "t1", NOW - 30)],
+            ..Default::default()
+        };
+        let m = State::merge([a.clone(), b.clone()], NOW);
+        assert_eq!(m.tabs, vec![tab("t1", "Invoices", NOW - 10, true), tab("t2", "Kids", NOW - 5, false)]);
+        // The newer rule for the conversation wins and its IDs are pooled.
+        assert_eq!(m.threads, vec![rule(&["m9"], "t1", NOW - 30), rule(&["m1", "m2"], "t2", NOW - 20)]);
+        assert_eq!(State::merge([b, a], NOW), m);
+        // Merging again changes nothing (so sync doesn't rewrite the state).
+        assert_eq!(State::merge([m.clone()], NOW), m);
+    }
+
+    #[test]
     fn old_tombstones_are_dropped() {
-        let s = State { version: 1, entries: vec![entry(&["a"], 0, NOW - 31 * 86_400, true), entry(&["b"], 0, NOW - 86_400, true)], senders: vec![] };
+        let s = State { version: 1, entries: vec![entry(&["a"], 0, NOW - 31 * 86_400, true), entry(&["b"], 0, NOW - 86_400, true)], senders: vec![], tabs: vec![], threads: vec![] };
         assert_eq!(State::merge([s], NOW).entries, vec![entry(&["b"], 0, NOW - 86_400, true)]);
     }
 
     #[test]
     fn state_round_trips_through_an_email() {
-        let s = State { version: 1, entries: vec![entry(&["abc@example.com", "dé@x"], NOW, NOW, false)], senders: vec![] };
+        let s = State { version: 1, entries: vec![entry(&["abc@example.com", "dé@x"], NOW, NOW, false)], senders: vec![], tabs: vec![], threads: vec![] };
         let raw = s.to_message(DateTime::from_timestamp(NOW, 0).unwrap());
         assert_eq!(State::from_message(&raw), Some(s));
         assert!(String::from_utf8(raw).unwrap().contains(STATE_FROM));
@@ -636,7 +871,7 @@ mod tests {
 
     #[test]
     fn picks_up_a_snooze_from_another_machine() {
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 60, false)], senders: vec![] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 60, false)], senders: vec![], tabs: vec![], threads: vec![] };
         let p = plan(st, &local(&[], &["t1"], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.snooze, vec![("t1".into(), NOW + 3600)]);
         assert!(p.write.is_none() && p.wake.is_empty() && p.release.is_empty());
@@ -644,7 +879,7 @@ mod tests {
 
     #[test]
     fn wakes_due_snoozes_once() {
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW - 1, NOW - 600, false)], senders: vec![] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW - 1, NOW - 600, false)], senders: vec![], tabs: vec![], threads: vec![] };
         let p = plan(st, &local(&[("t1", NOW - 1)], &["t1"], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.wake, vec!["t1".to_string()]);
         let w = p.write.expect("tombstone written");
@@ -657,7 +892,7 @@ mod tests {
 
     #[test]
     fn cancelled_elsewhere_is_dropped_here() {
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 5, true)], senders: vec![] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 5, true)], senders: vec![], tabs: vec![], threads: vec![] };
         let p = plan(st, &local(&[("t1", NOW + 3600)], &["t1"], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.unsnooze, vec!["t1".to_string()]);
         assert_eq!(p.release, vec!["t1".to_string()]);
@@ -675,12 +910,12 @@ mod tests {
     #[test]
     fn taken_out_of_the_folder_elsewhere_means_unsnoozed() {
         // Snoozed an hour ago, but no longer in the Snoozed folder.
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 3600, false)], senders: vec![] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 3600, false)], senders: vec![], tabs: vec![], threads: vec![] };
         let p = plan(st.clone(), &local(&[("t1", NOW + 3600)], &[], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.unsnooze, vec!["t1".to_string()]);
         assert!(p.write.unwrap().entries[0].removed);
         // Just snoozed (the move may still be on its way): leave it.
-        let fresh = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 30, false)], senders: vec![] };
+        let fresh = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 30, false)], senders: vec![], tabs: vec![], threads: vec![] };
         let p = plan(fresh, &local(&[("t1", NOW + 3600)], &[], &[("t1", &["m1"])]), NOW);
         assert!(p.unsnooze.is_empty() && p.write.is_none());
     }
@@ -700,7 +935,7 @@ mod tests {
 
     #[test]
     fn unknown_mail_is_kept_until_long_overdue() {
-        let st = State { version: 1, entries: vec![entry(&["x"], NOW + 60, NOW - 9000, false), entry(&["y"], NOW - 2 * 86_400, NOW - 9000, false)], senders: vec![] };
+        let st = State { version: 1, entries: vec![entry(&["x"], NOW + 60, NOW - 9000, false), entry(&["y"], NOW - 2 * 86_400, NOW - 9000, false)], senders: vec![], tabs: vec![], threads: vec![] };
         let p = plan(st, &Local::default(), NOW);
         let w = p.write.unwrap();
         assert!(!w.entries.iter().find(|e| e.ids == ids(&["x"])).unwrap().removed);

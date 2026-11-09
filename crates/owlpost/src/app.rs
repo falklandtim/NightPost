@@ -247,6 +247,19 @@ impl Default for SnoozePick {
     }
 }
 
+/// The "New tab" dialog: the name so far, and what goes in the tab once made.
+struct NewTab {
+    name: String,
+    then: NewTabFor,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+enum NewTabFor {
+    Sender(String),
+    Thread(AccountId, String),
+}
+
 struct Toast {
     text: String,
     error: bool,
@@ -270,6 +283,10 @@ enum Undo {
     Star { a: AccountId, k: String, was: bool },
     /// A sender rule changed: what it was before (None: automatic).
     SenderRule { email: String, was: Option<u8> },
+    /// A conversation put in a tab by hand: where it was put before (None: no rule).
+    ThreadRule { a: AccountId, k: String, was: Option<u8> },
+    /// A tab removed (its tombstone); undoing brings it back.
+    TabRemoved { tab: owlpost_core::snooze_sync::Tab },
     /// One action on several selected conversations, undone together.
     Batch { items: Vec<Undo>, what: String },
     /// A message waiting to send (Undo Send).
@@ -286,7 +303,8 @@ impl Undo {
             Undo::Unread { items } if items.len() > 1 => "mark as read".into(),
             Undo::Unread { items } => if items.first().is_some_and(|i| i.2) { "mark as read".into() } else { "mark as unread".into() },
             Undo::Star { .. } => "star".into(),
-            Undo::SenderRule { .. } => "sorting".into(),
+            Undo::SenderRule { .. } | Undo::ThreadRule { .. } => "sorting".into(),
+            Undo::TabRemoved { tab } => format!("removing the “{}” tab", tab.name),
             Undo::Batch { what, .. } => what.clone(),
             Undo::Send { .. } => "send".into(),
         }
@@ -374,8 +392,10 @@ pub struct OwlPostApp {
     load_images: bool,
     /// The Inbox tab showing (an `owlpost_core::category` value).
     category: u8,
-    /// Unread conversations in each Inbox tab.
-    tab_unread: [i64; 3],
+    /// The Inbox tabs showing: category, name and unread conversations.
+    tabs: Vec<(u8, String, i64)>,
+    /// The "New tab" dialog, while it's open.
+    new_tab: Option<NewTab>,
     /// Recolour HTML emails to match a dark theme.
     dark_emails: bool,
     /// Where the web view goes this frame (the reading pane below the subject).
@@ -541,7 +561,8 @@ impl OwlPostApp {
             load_images: true,
             dark_emails: true,
             category: owlpost_core::category::PRIMARY,
-            tab_unread: [0; 3],
+            tabs: Vec::new(),
+            new_tab: None,
             web_rect: None,
             remote_images: HashSet::new(),
             pending_input: vec![],
@@ -636,6 +657,8 @@ impl OwlPostApp {
                 self.worker.send(Cmd::SetStarred(*a, k.clone(), *was));
             }
             Undo::SenderRule { email, was } => self.put_sender_rule(email, *was),
+            Undo::ThreadRule { a, k, was } => self.put_thread_rule(*a, k, *was),
+            Undo::TabRemoved { tab } => self.save_tab_change(owlpost_core::snooze_sync::TabChange::Tab(owlpost_core::snooze_sync::restored_tab(tab)), None),
         }
     }
 
@@ -899,12 +922,21 @@ impl OwlPostApp {
         let keep = self.selected.and_then(|i| self.rows.get(i)).map(|r| (r.t.account_id, r.t.thread_key.clone()));
         let mut query = format!("{} {}", self.search, self.filter.token());
         if self.tabs_shown() {
-            query.push_str(&format!(" category:{}", owlpost_core::category::name(self.category)));
+            let mut list: Vec<(u8, String)> = owlpost_core::category::ALL.iter().map(|c| (*c, owlpost_core::category::label(*c).to_string())).collect();
+            list.extend(self.store.tabs().unwrap_or_default());
+            // The tab was removed (perhaps on another machine).
+            if !list.iter().any(|(c, _)| *c == self.category) {
+                self.category = owlpost_core::category::PRIMARY;
+            }
+            query.push_str(&format!(" category:{}", self.category));
             if let Some(v) = self.view() {
-                for c in owlpost_core::category::ALL {
-                    let q = format!("is:unread category:{}", owlpost_core::category::name(c));
-                    self.tab_unread[c as usize] = self.store.threads(&v, &q, 500).map(|t| t.len() as i64).unwrap_or(0);
-                }
+                self.tabs = list
+                    .into_iter()
+                    .map(|(c, name)| {
+                        let unread = self.store.threads(&v, &format!("is:unread category:{c}"), 500).map(|t| t.len() as i64).unwrap_or(0);
+                        (c, name, unread)
+                    })
+                    .collect();
             }
         }
         self.rows = match self.view() {
@@ -1007,18 +1039,35 @@ impl OwlPostApp {
             }
     }
 
+    /// A tab's name: Promotions, or one of yours (Invoices).
+    fn category_label(&self, c: u8) -> String {
+        if owlpost_core::category::is_tab(c) {
+            self.store.category_name(c)
+        } else {
+            owlpost_core::category::label(c).to_string()
+        }
+    }
+
+    /// Keep a tab change here at once and on the servers in the background
+    /// (`label`: a conversation that moved, and the tab it left, for Gmail's labels).
+    fn save_tab_change(&mut self, change: owlpost_core::snooze_sync::TabChange, label: Option<(AccountId, String, u8)>) {
+        use owlpost_core::snooze_sync::TabChange;
+        let _ = match &change {
+            TabChange::Tab(t) => self.store.put_tab(t),
+            TabChange::Sender(r) => self.store.put_sender_rule(r),
+            TabChange::Thread(r) => self.store.put_thread_rule(r),
+        };
+        self.worker.send(Cmd::TabChange(change, label));
+        self.reload();
+    }
+
     /// Always sort this sender's mail into `category` (None: automatic),
     /// here at once and on the server in the background.
     fn put_sender_rule(&mut self, email: &str, category: Option<u8>) {
-        let rule = owlpost_core::snooze_sync::SenderRule {
-            email: email.to_lowercase(),
-            category: category.unwrap_or(0),
-            updated: Utc::now().timestamp(),
-            removed: category.is_none(),
-        };
-        let _ = self.store.put_sender_rule(&rule);
-        self.worker.send(Cmd::SortSender(email.to_lowercase(), category));
-        self.reload();
+        match owlpost_core::snooze_sync::sender_rule(&self.store, email, category) {
+            Ok(r) => self.save_tab_change(owlpost_core::snooze_sync::TabChange::Sender(r), None),
+            Err(e) => self.toast(format!("{e:#}"), true),
+        }
     }
 
     /// Sort a sender (undoable), from the list's context menu.
@@ -1029,10 +1078,114 @@ impl OwlPostApp {
         }
         self.put_sender_rule(email, category);
         let text = match category {
-            Some(c) => format!("Mail from {email} goes to {}", owlpost_core::category::label(c)),
+            Some(c) => format!("Mail from {email} goes to {}", self.category_label(c)),
             None => format!("Mail from {email} is sorted automatically"),
         };
         self.did(text, Undo::SenderRule { email: email.to_string(), was });
+    }
+
+    /// Put one conversation in `category` (None: sort it like the rest).
+    fn put_thread_rule(&mut self, a: AccountId, k: &str, category: Option<u8>) {
+        let before = self.store.thread_category(a, k).unwrap_or(0);
+        match owlpost_core::snooze_sync::thread_rule(&self.store, a, k, category) {
+            Ok(r) => self.save_tab_change(owlpost_core::snooze_sync::TabChange::Thread(r), Some((a, k.to_string(), before))),
+            Err(e) => self.toast(format!("{e:#}"), true),
+        }
+    }
+
+    /// Put a conversation in a tab (undoable), from the list's context menu.
+    fn sort_thread(&mut self, a: AccountId, k: &str, category: Option<u8>) {
+        let was = self.store.thread_rule(a, k).ok().flatten();
+        if was == category {
+            return;
+        }
+        self.put_thread_rule(a, k, category);
+        let text = match category {
+            Some(c) => format!("Moved to {}", self.category_label(c)),
+            None => format!("Sorted like the rest ({})", self.category_label(self.store.thread_category(a, k).unwrap_or(0))),
+        };
+        self.did(text, Undo::ThreadRule { a, k: k.to_string(), was });
+    }
+
+    /// Make a tab and put a sender's mail or a conversation in it.
+    fn create_tab(&mut self, name: &str, then: &NewTabFor) -> Result<(), String> {
+        let tab = owlpost_core::snooze_sync::new_tab(&self.store, name).map_err(|e| format!("{e:#}"))?;
+        let existed = self.store.all_tabs().unwrap_or_default().iter().any(|t| t.id == tab.id);
+        if !existed {
+            self.save_tab_change(owlpost_core::snooze_sync::TabChange::Tab(tab.clone()), None);
+        }
+        let Some(c) = self.store.category_by_name(&tab.name) else { return Err("Couldn't make the tab".into()) };
+        match then {
+            NewTabFor::Sender(email) => self.sort_sender(email, Some(c)),
+            NewTabFor::Thread(a, k) => self.sort_thread(*a, k, Some(c)),
+        }
+        Ok(())
+    }
+
+    /// Remove one of your tabs (undoable). Its mail goes back to being
+    /// sorted automatically; its rules stay, in case it comes back.
+    fn remove_tab(&mut self, c: u8) {
+        let Ok(tab) = owlpost_core::snooze_sync::removed_tab(&self.store, c) else { return };
+        let name = tab.name.clone();
+        self.save_tab_change(owlpost_core::snooze_sync::TabChange::Tab(tab.clone()), None);
+        self.did(format!("Removed the “{name}” tab"), Undo::TabRemoved { tab });
+    }
+
+    /// The "New tab" dialog.
+    fn new_tab_dialog(&mut self, ctx: &egui::Context) {
+        let Some(nt) = self.new_tab.as_mut() else { return };
+        let col = self.colors.clone();
+        let mut done: Option<bool> = None;
+        egui::Modal::new(egui::Id::new("new-tab")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(RichText::new("New tab").size(17.0).strong().color(col.heading));
+            ui.add_space(4.0);
+            let what = match &nt.then {
+                NewTabFor::Sender(email) => format!("Mail from {email} will go in it."),
+                NewTabFor::Thread(..) => "This conversation will go in it.".to_string(),
+            };
+            ui.label(RichText::new(what).color(col.subtle));
+            ui.add_space(8.0);
+            let r = ui.add(egui::TextEdit::singleline(&mut nt.name).hint_text("Invoices").desired_width(f32::INFINITY));
+            if !r.has_focus() && nt.error.is_none() && nt.name.is_empty() {
+                r.request_focus();
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                done = Some(true);
+            }
+            if let Some(e) = &nt.error {
+                ui.label(RichText::new(e).color(col.error));
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!nt.name.trim().is_empty(), egui::Button::new("Make tab")).clicked() {
+                        done = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        done = Some(false);
+                    }
+                });
+            });
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                done = Some(false);
+            }
+        });
+        match done {
+            Some(true) => {
+                let (name, then) = (nt.name.clone(), nt.then.clone());
+                match self.create_tab(&name, &then) {
+                    Ok(()) => self.new_tab = None,
+                    Err(e) => {
+                        if let Some(nt) = self.new_tab.as_mut() {
+                            nt.error = Some(e);
+                        }
+                    }
+                }
+            }
+            Some(false) => self.new_tab = None,
+            None => {}
+        }
     }
 
     /// List everything from one address (a search, so Esc or clearing it goes back).
@@ -2222,6 +2375,7 @@ impl OwlPostApp {
     fn list_header(&mut self, ui: &mut egui::Ui, col: &Colors) {
         let mut chosen = None;
         let mut tab = None;
+        let mut remove = None;
         egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 14, top: 20, bottom: 12 }).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -2254,11 +2408,19 @@ impl OwlPostApp {
             ui.label(RichText::new(sub).size(13.0).color(col.subtle));
             ui.add_space(10.0);
             if self.tabs_shown() {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 18.0;
-                    for c in owlpost_core::category::ALL {
-                        if category_tab(ui, col, owlpost_core::category::label(c), self.tab_unread[c as usize], c == self.category).clicked() && c != self.category {
-                            tab = Some(c);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(18.0, 4.0);
+                    for (c, name, unread) in &self.tabs {
+                        let r = category_tab(ui, col, name, *unread, *c == self.category);
+                        if r.clicked() && *c != self.category {
+                            tab = Some(*c);
+                        }
+                        if owlpost_core::category::is_tab(*c) {
+                            r.context_menu(|ui| {
+                                if ui.button(format!("Remove the “{name}” tab")).on_hover_text("Its mail goes back to being sorted automatically").clicked() {
+                                    remove = Some(*c);
+                                }
+                            });
                         }
                     }
                 });
@@ -2279,6 +2441,9 @@ impl OwlPostApp {
                 }
             });
         });
+        if let Some(c) = remove {
+            self.remove_tab(c);
+        }
         if let Some(c) = tab {
             self.category = c;
             self.selected = None;
@@ -2392,6 +2557,13 @@ impl OwlPostApp {
                 let mut menu: Option<(AccountId, String, u8)> = None;
                 // Show a sender's mail, or sort it into a tab.
                 let mut sender_menu: Option<(String, Option<Option<u8>>)> = None;
+                let mut thread_menu: Option<(AccountId, String, Option<u8>)> = None;
+                let mut new_tab: Option<NewTabFor> = None;
+                let all_tabs: Vec<(u8, String)> = owlpost_core::category::ALL
+                    .iter()
+                    .map(|c| (*c, owlpost_core::category::label(*c).to_string()))
+                    .chain(self.store.tabs().unwrap_or_default())
+                    .collect();
                 let mut folder_menu: Option<(AccountId, String, Folder, FolderUse, bool)> = None;
                 let mut toggle_pinned = false;
                 let multi = self.accounts.len() > 1;
@@ -2650,11 +2822,14 @@ impl OwlPostApp {
                                 }
                                 let rule = self.store.sender_rule(&email).ok().flatten();
                                 ui.menu_button("Always put their mail in", |ui| {
-                                    for c in owlpost_core::category::ALL {
-                                        let mark = if rule == Some(c) { "✓" } else { "  " };
-                                        if ui.button(format!("{mark}  {}", owlpost_core::category::label(c))).clicked() {
-                                            sender_menu = Some((email.clone(), Some(Some(c))));
+                                    for (c, name) in &all_tabs {
+                                        let mark = if rule == Some(*c) { "✓" } else { "  " };
+                                        if ui.button(format!("{mark}  {name}")).clicked() {
+                                            sender_menu = Some((email.clone(), Some(Some(*c))));
                                         }
+                                    }
+                                    if ui.button("     New tab…").clicked() {
+                                        new_tab = Some(NewTabFor::Sender(email.clone()));
                                     }
                                     ui.separator();
                                     let mark = if rule.is_none() { "✓" } else { "  " };
@@ -2662,8 +2837,25 @@ impl OwlPostApp {
                                         sender_menu = Some((email.clone(), Some(None)));
                                     }
                                 });
-                                ui.separator();
                             }
+                            let here = self.store.thread_rule(t.account_id, &t.thread_key).ok().flatten();
+                            ui.menu_button("Move this conversation to", |ui| {
+                                for (c, name) in &all_tabs {
+                                    let mark = if here == Some(*c) { "✓" } else { "  " };
+                                    if ui.button(format!("{mark}  {name}")).clicked() {
+                                        thread_menu = Some((t.account_id, t.thread_key.clone(), Some(*c)));
+                                    }
+                                }
+                                if ui.button("     New tab…").clicked() {
+                                    new_tab = Some(NewTabFor::Thread(t.account_id, t.thread_key.clone()));
+                                }
+                                ui.separator();
+                                let mark = if here.is_none() { "✓" } else { "  " };
+                                if ui.button(format!("{mark}  Sort like the rest")).on_hover_text("By the sender's rule, or automatically").clicked() {
+                                    thread_menu = Some((t.account_id, t.thread_key.clone(), None));
+                                }
+                            });
+                            ui.separator();
                             ui.menu_button("Move to", |ui| {
                                 for f in self.folder_choices(t.account_id, FolderUse::Move) {
                                     if ui.button(format!("{}  {}", f.role.icon(), folder_label(&f))).clicked() {
@@ -2714,6 +2906,12 @@ impl OwlPostApp {
                     Some((email, None)) => self.show_sender(&email),
                     Some((email, Some(c))) => self.sort_sender(&email, c),
                     None => {}
+                }
+                if let Some((a, k, c)) = thread_menu {
+                    self.sort_thread(a, &k, c);
+                }
+                if let Some(then) = new_tab {
+                    self.new_tab = Some(NewTab { name: String::new(), then, error: None });
                 }
                 match menu {
                     Some((a, k, 0)) => self.toggle_pin(a, &k),
@@ -2999,7 +3197,7 @@ impl OwlPostApp {
     fn place_mail_view(&mut self, ctx: &egui::Context) {
         // The macOS view is a native overlay, so it hides under menus and
         // windows; Linux draws the page inside egui, which layers correctly.
-        let covered = cfg!(target_os = "macos") && (self.prefs.is_some() || self.setup.is_some() || egui::Popup::is_any_open(ctx));
+        let covered = cfg!(target_os = "macos") && (self.prefs.is_some() || self.setup.is_some() || self.new_tab.is_some() || egui::Popup::is_any_open(ctx));
         let (Some(view), Some(rect), Some(open)) = (self.mail_view.as_mut(), self.web_rect, self.open.as_ref()) else {
             if let Some(v) = self.mail_view.as_mut() {
                 v.hide();
@@ -4105,6 +4303,7 @@ impl OwlPostApp {
         self.thread_list(ctx);
         self.reader(ctx);
         self.windows(ctx);
+        self.new_tab_dialog(ctx);
         self.drag_overlay(ctx);
         self.place_mail_view(ctx);
         // Keep relative times and snooze wake-ups fresh.
@@ -4150,6 +4349,53 @@ mod ui_tests {
         h.state_mut().show_sender("hello@kowhai.demo");
         assert!(!h.state().tabs_shown());
         assert_eq!(subjects(&h).len(), 1);
+    }
+
+    #[test]
+    fn own_tabs() {
+        use owlpost_core::category::{PRIMARY, PROMOTIONS};
+        let mut h = harness("owlpost-light");
+        h.run();
+        let subjects = |h: &Harness<'static, OwlPostApp>| h.state().rows.iter().map(|r| r.t.subject.clone()).collect::<Vec<_>>();
+        // Right-click → Always put their mail in → New tab… → "Invoices".
+        h.state_mut().new_tab = Some(NewTab { name: String::new(), then: NewTabFor::Sender("hello@kowhai.demo".into()), error: None });
+        h.run();
+        save(&mut h, "new-tab-dialog");
+        h.state_mut().create_tab("Invoices", &NewTabFor::Sender("hello@kowhai.demo".into())).unwrap();
+        h.state_mut().new_tab = None;
+        let inv = h.state().store.category_by_name("invoices").unwrap();
+        assert!(owlpost_core::category::is_tab(inv));
+        assert!(h.state().tabs.iter().any(|(c, n, _)| *c == inv && n == "Invoices"));
+        assert!(h.state_mut().create_tab("promotions", &NewTabFor::Sender("x@y.z".into())).is_err(), "built-in names are taken");
+        h.state_mut().category = inv;
+        h.state_mut().reload();
+        h.run();
+        assert_eq!(subjects(&h).len(), 1);
+        assert!(subjects(&h)[0].contains("November roast"));
+        // One conversation by hand.
+        h.state_mut().category = PRIMARY;
+        h.state_mut().reload();
+        let (a, k, subject) = h.state().rows.iter().map(|r| (r.t.account_id, r.t.thread_key.clone(), r.t.subject.clone())).next().unwrap();
+        h.state_mut().sort_thread(a, &k, Some(inv));
+        assert!(!subjects(&h).contains(&subject));
+        h.state_mut().category = inv;
+        h.state_mut().reload();
+        h.run();
+        assert!(subjects(&h).contains(&subject));
+        save(&mut h, "tabs-invoices");
+        h.state_mut().undo_last();
+        h.state_mut().reload();
+        assert!(!subjects(&h).contains(&subject));
+        // Removing the tab sends its mail back where it came from; undo brings it back.
+        h.state_mut().remove_tab(inv);
+        assert_eq!(h.state().category, PRIMARY);
+        assert!(!h.state().tabs.iter().any(|(c, ..)| *c == inv));
+        h.state_mut().category = PROMOTIONS;
+        h.state_mut().reload();
+        assert!(subjects(&h).iter().any(|s| s.contains("November roast")));
+        h.state_mut().undo_last();
+        assert!(h.state().tabs.iter().any(|(c, ..)| *c == inv));
+        assert!(!subjects(&h).iter().any(|s| s.contains("November roast")));
     }
 
     fn harness(theme: &str) -> Harness<'static, OwlPostApp> {

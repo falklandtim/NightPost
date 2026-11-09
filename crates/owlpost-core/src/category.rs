@@ -6,14 +6,25 @@
 //! anything with a reply in it is Primary. Sender rules ("always put mail
 //! from this address in Promotions") override the guess; they're kept on
 //! the server with the snooze list, so every OwlPost agrees.
+//!
+//! You can add your own tabs (Invoices), filled only by rules: for a
+//! sender, or for one conversation (which beats a sender rule).
 
 use mail_parser::{Address, Message};
 
 pub const PRIMARY: u8 = 0;
 pub const PROMOTIONS: u8 = 1;
 pub const SOCIAL: u8 = 2;
-/// Every category, in tab order.
+/// Every built-in category, in tab order.
 pub const ALL: [u8; 3] = [PRIMARY, PROMOTIONS, SOCIAL];
+/// Your own tabs (Invoices…) are numbered from here, per machine; see
+/// `Store::tabs`.
+pub const FIRST_TAB: u8 = 16;
+
+/// Is this one of your own tabs rather than a built-in category?
+pub fn is_tab(c: u8) -> bool {
+    c >= FIRST_TAB
+}
 
 /// The name used in queries and the MCP tools.
 pub fn name(c: u8) -> &'static str {

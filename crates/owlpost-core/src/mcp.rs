@@ -78,10 +78,17 @@ fn tools() -> Value {
             json!({"type":"object","required":["thread_id"],"properties":{"thread_id":thread,"read":{"type":"boolean","default":true}}}), false, false),
         tool("star_thread", "Star or unstar a conversation (IMAP \\Flagged).",
             json!({"type":"object","required":["thread_id"],"properties":{"thread_id":thread,"starred":{"type":"boolean","default":true}}}), false, false),
-        tool("sort_sender", "Always put mail from an address in an inbox tab: primary, promotions or social (category \"auto\" removes the rule and goes back to OwlPost's own sorting). Applies to mail already here and future mail, and syncs to every OwlPost.",
+        tool("list_tabs", "List the inbox tabs: Primary, Promotions, Social and the user's own (like Invoices), with unread counts.",
+            json!({"type":"object","properties":{}}), true, false),
+        tool("sort_sender", "Always put mail from an address in an inbox tab: primary, promotions, social or one of the user's own tabs by name (category \"auto\" removes the rule and goes back to OwlPost's own sorting). Applies to mail already here and future mail, and syncs to every OwlPost.",
             json!({"type":"object","required":["email","category"],"properties":{
                 "email":{"type":"string","description":"The sender's address"},
-                "category":{"type":"string","enum":["primary","promotions","social","auto"]}}}), false, false),
+                "category":{"type":"string","description":"primary, promotions, social, a tab name from list_tabs, or auto"},
+                "create":{"type":"boolean","default":false,"description":"Make a new tab with this name if there isn't one"}}}), false, false),
+        tool("sort_thread", "Put one conversation in an inbox tab (it beats any sender rule; later replies stay with it), or \"auto\" to sort it like the rest. On Gmail a conversation in one of the user's own tabs also gets a label of that name. Syncs to every OwlPost.",
+            json!({"type":"object","required":["thread_id","category"],"properties":{"thread_id":thread,
+                "category":{"type":"string","description":"primary, promotions, social, a tab name from list_tabs, or auto"},
+                "create":{"type":"boolean","default":false,"description":"Make a new tab with this name if there isn't one"}}}), false, false),
         tool("pin_thread", "Pin a conversation to the top of the list, or unpin it (pinned=false).",
             json!({"type":"object","required":["thread_id"],"properties":{"thread_id":thread,"pinned":{"type":"boolean","default":true}}}), false, false),
         tool("move_thread", "Move a conversation: archive, trash, spam, inbox, or any folder by name/path (see list_folders). On Gmail, moving to a label adds that label and takes the conversation out of the Inbox.",
@@ -250,10 +257,29 @@ impl Server {
             "starred": t.starred,
             "has_attachments": t.has_attachments,
             "pinned": t.pinned,
-            "category": crate::category::name(t.category),
+            "category": self.store.category_name(t.category),
             "labels": self.labels_of(t.account_id, &t.thread_key)?,
             "snoozed_until": snoozed.map(|d| d.to_rfc3339()),
         }))
+    }
+
+    /// A tab by name for sort_sender / sort_thread ("auto": None), made if
+    /// `create` and it doesn't exist.
+    fn category_arg(&self, cat: &str, create: bool) -> Result<Option<u8>> {
+        let cat = cat.trim();
+        if cat.eq_ignore_ascii_case("auto") {
+            return Ok(None);
+        }
+        if let Some(c) = self.store.category_by_name(cat).filter(|_| cat.parse::<u8>().is_err()) {
+            return Ok(Some(c));
+        }
+        if !create {
+            let own: Vec<String> = self.store.tabs()?.into_iter().map(|(_, n)| n).collect();
+            return Err(anyhow!("there's no {cat:?} tab (tabs: primary, promotions, social{}); pass create: true to make it", own.iter().map(|n| format!(", {n}")).collect::<String>()));
+        }
+        let tab = crate::snooze_sync::new_tab(&self.store, cat)?;
+        crate::snooze_sync::save_tab_change(&self.store, &crate::snooze_sync::TabChange::Tab(tab))?;
+        self.store.category_by_name(cat).map(Some).ok_or_else(|| anyhow!("couldn't make the {cat:?} tab"))
     }
 
     /// A folder by id, path or name (case-insensitive), optionally created.
@@ -394,6 +420,7 @@ impl Server {
     pub fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
         let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(25).min(200) as usize;
+        let create = args.get("create").and_then(Value::as_bool).unwrap_or(false);
         match name {
             "list_accounts" => {
                 let mut out = vec![];
@@ -509,13 +536,39 @@ impl Server {
                 if !email.contains('@') {
                     return Err(anyhow!("{email:?} isn't an email address"));
                 }
-                let cat = s("category");
-                let category = match cat.trim().to_ascii_lowercase().as_str() {
-                    "auto" => None,
-                    c => Some(crate::category::parse(c).ok_or_else(|| anyhow!("unknown category {cat:?}: use primary, promotions, social or auto"))?),
-                };
+                let category = self.category_arg(&s("category"), create)?;
                 crate::snooze_sync::set_sender_rule(&self.store, &email, category)?;
-                Ok(json!({"email": email, "category": category.map(crate::category::name).unwrap_or("auto")}))
+                Ok(json!({"email": email, "category": category.map(|c| self.store.category_name(c)).unwrap_or("auto".into())}))
+            }
+            "sort_thread" => {
+                let (acc, key) = split_thread_id(&s("thread_id"))?;
+                let account = self.account(acc)?;
+                if self.store.thread_messages(acc, &key)?.is_empty() {
+                    return Err(anyhow!("thread not found"));
+                }
+                let category = self.category_arg(&s("category"), create)?;
+                let was = self.store.thread_category(acc, &key)?;
+                let rule = crate::snooze_sync::thread_rule(&self.store, acc, &key, category)?;
+                crate::snooze_sync::save_tab_change(&self.store, &crate::snooze_sync::TabChange::Thread(rule))?;
+                if !account.demo {
+                    crate::snooze_sync::unlabel_tab(&self.store, &account, &key, was)?;
+                    crate::snooze_sync::label_tabs(&self.store, &account)?;
+                }
+                let now = self.store.thread_category(acc, &key)?;
+                Ok(json!({"thread_id": thread_id(acc, &key), "category": self.store.category_name(now)}))
+            }
+            "list_tabs" => {
+                let inbox = MailboxView::Unified(FolderRole::Inbox);
+                let mut tabs: Vec<(u8, String)> = crate::category::ALL.iter().map(|c| (*c, crate::category::label(*c).to_string())).collect();
+                tabs.extend(self.store.tabs()?);
+                let list: Vec<Value> = tabs
+                    .into_iter()
+                    .map(|(c, name)| {
+                        let unread = self.store.threads(&inbox, &format!("is:unread category:{c}"), 500).map(|t| t.len()).unwrap_or(0);
+                        json!({"name": name, "own": crate::category::is_tab(c), "unread": unread})
+                    })
+                    .collect();
+                Ok(json!({"tabs": list}))
             }
             "pin_thread" => {
                 let (acc, key) = split_thread_id(&s("thread_id"))?;
@@ -772,6 +825,38 @@ mod tests {
         assert!(!list(&mut s, 8, "category:social").iter().any(|t| t.contains("Dinner")));
         let r = rpc(&mut s, 9, "tools/call", json!({"name":"list_threads","arguments":{"mailbox":"inbox","query":"category:promotions"}}));
         assert_eq!(r["result"]["structuredContent"]["threads"][0]["category"], "promotions");
+    }
+
+    #[test]
+    fn own_tabs_via_tools() {
+        let mut s = server();
+        let call = |s: &mut Server, id: i64, name: &str, args: Value| rpc(s, id, "tools/call", json!({"name":name,"arguments":args}))["result"].clone();
+        let list = |s: &mut Server, id: i64, q: &str| -> Vec<Value> {
+            let r = rpc(s, id, "tools/call", json!({"name":"list_threads","arguments":{"mailbox":"inbox","query":q}}));
+            r["result"]["structuredContent"]["threads"].as_array().unwrap().clone()
+        };
+        // No such tab until it's made.
+        let r = call(&mut s, 1, "sort_sender", json!({"email":"maya@chen.family","category":"Invoices"}));
+        assert_eq!(r["isError"], true);
+        let r = call(&mut s, 2, "sort_sender", json!({"email":"maya@chen.family","category":"Invoices","create":true}));
+        assert_eq!(r["structuredContent"]["category"], "Invoices", "{r}");
+        let inv = list(&mut s, 3, "category:invoices");
+        assert!(inv.iter().any(|t| t["subject"].as_str().unwrap().contains("Dinner")));
+        assert!(inv.iter().all(|t| t["category"] == "Invoices"));
+        let tabs = call(&mut s, 4, "list_tabs", json!({}));
+        let names: Vec<&str> = tabs["structuredContent"]["tabs"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Primary", "Promotions", "Social", "Invoices"]);
+        // One conversation by hand beats the sender rule.
+        let dinner = inv.iter().find(|t| t["subject"].as_str().unwrap().contains("Dinner")).unwrap()["thread_id"].clone();
+        let r = call(&mut s, 5, "sort_thread", json!({"thread_id":dinner,"category":"primary"}));
+        assert_eq!(r["structuredContent"]["category"], "primary", "{r}");
+        assert!(!list(&mut s, 6, "category:invoices").iter().any(|t| t["thread_id"] == dinner));
+        // And the newsletter goes in by hand.
+        let roast = list(&mut s, 7, "category:promotions")[0]["thread_id"].clone();
+        call(&mut s, 8, "sort_thread", json!({"thread_id":roast,"category":"invoices"}));
+        assert!(list(&mut s, 9, "category:invoices").iter().any(|t| t["thread_id"] == roast));
+        call(&mut s, 10, "sort_thread", json!({"thread_id":roast,"category":"auto"}));
+        assert!(list(&mut s, 11, "category:promotions").iter().any(|t| t["thread_id"] == roast));
     }
 
     #[test]
