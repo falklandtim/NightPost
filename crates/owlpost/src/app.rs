@@ -292,6 +292,14 @@ impl Default for SnoozePick {
 /// The All tab: the whole Inbox, whatever its category.
 const ALL_TAB: u8 = u8::MAX;
 
+/// The sidebar's folder dialogs.
+enum FolderDialog {
+    /// New folder in an account, inside `parent` when given.
+    New { account: AccountId, parent: Option<Folder>, name: String, error: Option<String> },
+    /// Are you sure? `gmail`: its mail stays in All Mail rather than going to Trash.
+    Delete { folder: Folder, gmail: bool },
+}
+
 /// The "New tab" dialog: the name so far, and what goes in the tab once made.
 struct NewTab {
     name: String,
@@ -441,6 +449,8 @@ pub struct OwlPostApp {
     tabs: Vec<(u8, String, i64)>,
     /// The "New tab" dialog, while it's open.
     new_tab: Option<NewTab>,
+    /// The New folder / Delete folder dialog, while it's open.
+    folder_dialog: Option<FolderDialog>,
     /// Recolour HTML emails to match a dark theme.
     dark_emails: bool,
     /// Where the web view goes this frame (the reading pane below the subject).
@@ -624,6 +634,7 @@ impl OwlPostApp {
             category: ALL_TAB,
             tabs: Vec::new(),
             new_tab: None,
+            folder_dialog: None,
             web_rect: None,
             remote_images: HashSet::new(),
             pending_input: vec![],
@@ -1495,6 +1506,101 @@ impl OwlPostApp {
         }
     }
 
+    /// The sidebar's New folder and Delete folder dialogs.
+    fn folder_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.folder_dialog.as_mut() else { return };
+        let col = self.colors.clone();
+        let mut done: Option<bool> = None;
+        egui::Modal::new(egui::Id::new("folder-dialog")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            match dialog {
+                FolderDialog::New { parent, name, error, .. } => {
+                    ui.label(RichText::new("New folder").size(17.0).strong().color(col.heading));
+                    if let Some(p) = parent {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("Inside “{}”", p.name)).color(col.subtle));
+                    }
+                    ui.add_space(8.0);
+                    let r = ui.add(egui::TextEdit::singleline(name).hint_text("Receipts").desired_width(f32::INFINITY));
+                    if !r.has_focus() && error.is_none() && name.is_empty() {
+                        r.request_focus();
+                    }
+                    if r.changed() {
+                        *error = None;
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        done = Some(true);
+                    }
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(col.error));
+                    }
+                    ui.add_space(8.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Create")).clicked() {
+                            done = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            done = Some(false);
+                        }
+                    });
+                }
+                FolderDialog::Delete { folder, gmail } => {
+                    ui.label(RichText::new(format!("Delete “{}”?", folder.name)).size(17.0).strong().color(col.heading));
+                    ui.add_space(6.0);
+                    let what = if *gmail {
+                        "The label is removed. Its mail isn't deleted: it stays in All Mail."
+                    } else {
+                        "The folder is deleted from the server. Any mail in it is moved to Trash first."
+                    };
+                    ui.label(RichText::new(what).color(col.subtle));
+                    ui.add_space(10.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(RichText::new("Delete folder").color(col.error)).clicked() {
+                            done = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            done = Some(false);
+                        }
+                    });
+                }
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                done = Some(false);
+            }
+        });
+        match done {
+            Some(true) => match self.folder_dialog.take() {
+                Some(FolderDialog::New { account, parent, name, .. }) => {
+                    let name = name.trim().to_string();
+                    let parent_path = parent.as_ref().map(|p| p.path.clone());
+                    let taken = self.folders.get(&account).into_iter().flatten().any(|f| {
+                        f.name.eq_ignore_ascii_case(&name) && owlpost_core::folder_parent(&f.path) == parent_path && f.role == FolderRole::Other
+                    });
+                    if taken || (parent.is_none() && name.eq_ignore_ascii_case("inbox")) {
+                        let error = Some(format!("There's already a folder called “{name}” there."));
+                        self.folder_dialog = Some(FolderDialog::New { account, parent, name, error });
+                        return;
+                    }
+                    if let Some(p) = &parent {
+                        // Open the parent so the new folder shows.
+                        self.open_folders.insert(folder_key(account, &p.path));
+                    }
+                    self.worker.send(Cmd::NewFolder(account, parent.map(|p| p.id), name));
+                }
+                Some(FolderDialog::Delete { folder, .. }) => {
+                    if self.selection == Selection::Folder(folder.id) {
+                        self.set_selection(Selection::Unified(FolderRole::Inbox));
+                    }
+                    self.toast(format!("Deleting “{}”…", folder.name), false);
+                    self.worker.send(Cmd::DeleteFolder(folder.id));
+                }
+                None => {}
+            },
+            Some(false) => self.folder_dialog = None,
+            None => {}
+        }
+    }
+
     /// The "New tab" dialog.
     fn new_tab_dialog(&mut self, ctx: &egui::Context) {
         let Some(nt) = self.new_tab.as_mut() else { return };
@@ -1850,10 +1956,11 @@ impl OwlPostApp {
                 self.apply_to(keys, |n| format!("{done} {n} conversations"), |s, a, k| s.move_thread(a, k, role));
             }
             DropTarget::Folder(f) => {
-                // Folders belong to one account.
+                // Mail from other accounts is copied across into this folder.
                 let (mine, other): (Vec<_>, Vec<_>) = keys.into_iter().partition(|(a, _)| *a == f.account_id);
                 if !other.is_empty() {
-                    self.toast(format!("{} of them {} in another account, so stayed put", other.len(), if other.len() == 1 { "is" } else { "are" }), true);
+                    let name = self.choice_label(0, &f);
+                    self.apply_to(other, |n| format!("Moving {n} conversations to {name}. The originals go to Trash."), |s, a, k| s.move_to(a, k, &f));
                 }
                 if mine.is_empty() || self.viewed_folder(f.account_id) == Some(f.id) {
                     return;
@@ -2384,12 +2491,14 @@ impl OwlPostApp {
         }
     }
 
-    /// Folders a conversation can be moved to / labelled with.
+    /// Folders a conversation can be moved to / labelled with. Moves list
+    /// the other accounts' folders after its own.
     fn folder_choices(&self, account: AccountId, kind: FolderUse) -> Vec<Folder> {
         let all = self.folders.get(&account).cloned().unwrap_or_default();
         let has_archive = all.iter().any(|f| f.role == FolderRole::Archive);
         let from = self.viewed_folder(account);
-        all.into_iter()
+        let mut out: Vec<Folder> = all
+            .into_iter()
             .filter(|f| !snooze_sync::is_internal_folder(&f.path))
             .filter(|f| match kind {
                 FolderUse::Label => f.role == FolderRole::Other,
@@ -2402,11 +2511,44 @@ impl OwlPostApp {
                         }
                 }
             })
-            .collect()
+            .collect();
+        if kind == FolderUse::Move {
+            for acc in self.accounts.iter().filter(|x| x.id != account) {
+                let theirs = self.folders.get(&acc.id).cloned().unwrap_or_default();
+                let has_archive = theirs.iter().any(|f| f.role == FolderRole::Archive);
+                out.extend(theirs.into_iter().filter(|f| {
+                    !snooze_sync::is_internal_folder(&f.path)
+                        && match f.role {
+                            FolderRole::Inbox | FolderRole::Archive | FolderRole::Other => true,
+                            FolderRole::All => !has_archive,
+                            _ => false,
+                        }
+                }));
+            }
+        }
+        out
+    }
+
+    /// A folder's name in the Move picker: another account's folders say
+    /// which account they're in.
+    fn choice_label(&self, account: AccountId, f: &Folder) -> String {
+        if f.account_id == account {
+            return folder_label(f);
+        }
+        let email = self.accounts.iter().find(|a| a.id == f.account_id).map(|a| a.email.as_str()).unwrap_or("another account");
+        format!("{} · {email}", folder_label(f))
     }
 
     fn move_to(&mut self, a: AccountId, k: &str, folder: &Folder) {
         let from = self.viewed_folder(a);
+        if folder.account_id != a {
+            // Into another account: copied across, originals to Trash. No
+            // undo (the copy would have to be deleted from the other server).
+            self.worker.send(Cmd::MoveAcross(a, k.to_string(), from, folder.id));
+            self.remove_row(a, k);
+            self.toast(format!("Moving to {}. The original goes to Trash.", self.choice_label(a, folder)), false);
+            return;
+        }
         let sources = self.accounts.iter().find(|x| x.id == a).and_then(|acc| engine::move_plan(&self.store, acc, k, folder.id, from).ok()).unwrap_or_default();
         self.worker.send(Cmd::MoveTo(a, k.to_string(), folder.id, from));
         self.remove_row(a, k);
@@ -2461,9 +2603,10 @@ impl OwlPostApp {
         }
         let q = self.picker_query.trim().to_lowercase();
         // Names starting with what's typed first, then the rest that contain it.
-        let mut matches: Vec<&Folder> = choices.iter().filter(|f| q.is_empty() || folder_label(f).to_lowercase().contains(&q)).collect();
-        matches.sort_by_key(|f| !folder_label(f).to_lowercase().starts_with(&q));
-        let exact = choices.iter().any(|f| folder_label(f).to_lowercase() == q || f.path.to_lowercase() == q);
+        let mut matches: Vec<&Folder> = choices.iter().filter(|f| q.is_empty() || self.choice_label(a, f).to_lowercase().contains(&q)).collect();
+        // Names starting with what's typed first; this account's before others.
+        matches.sort_by_key(|f| (!folder_label(f).to_lowercase().starts_with(&q), f.account_id != a));
+        let exact = choices.iter().any(|f| f.account_id == a && (folder_label(f).to_lowercase() == q || f.path.to_lowercase() == q));
         let can_create = !q.is_empty() && !exact;
         // The rows you can pick: the matches, then "Create …".
         let rows = matches.len() + can_create as usize;
@@ -2480,12 +2623,16 @@ impl OwlPostApp {
         ui.add_space(4.0);
         egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
             for (i, f) in matches.iter().enumerate() {
+                if f.account_id != a && (i == 0 || matches[i - 1].account_id == a) {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new("Other accounts").small().color(col.subtle));
+                }
                 let on = applied.contains(&f.id);
                 let icon = match kind {
                     FolderUse::Label => if on { "☑" } else { "☐" },
                     FolderUse::Move => f.role.icon(),
                 };
-                let b = ui.add(egui::Button::selectable(i == hi, format!("{icon}  {}", folder_label(f))).min_size(egui::vec2(250.0, 24.0)));
+                let b = ui.add(egui::Button::selectable(i == hi, format!("{icon}  {}", self.choice_label(a, f))).min_size(egui::vec2(250.0, 24.0)));
                 if i == hi && (up || down) {
                     b.scroll_to_me(None);
                 }
@@ -2543,7 +2690,7 @@ impl OwlPostApp {
         }
         match (pick, create) {
             (Some((f, add)), _) => {
-                let name = folder_label(&f);
+                let name = self.choice_label(a, &f);
                 match kind {
                     FolderUse::Move => self.for_each_target(|n| format!("Moved {n} conversations to {name}"), |s, a, k| s.move_to(a, k, &f)),
                     FolderUse::Label => self.for_each_target(
@@ -2732,6 +2879,11 @@ impl OwlPostApp {
                                     self.activity = Some(ActivityView::new(Some(a.id)));
                                     ui.close();
                                 }
+                                ui.separator();
+                                if ui.button("New folder…").clicked() {
+                                    self.folder_dialog = Some(FolderDialog::New { account: a.id, parent: None, name: String::new(), error: None });
+                                    ui.close();
+                                }
                             });
                         }
                         if label.clicked() {
@@ -2798,9 +2950,25 @@ impl OwlPostApp {
                                 if over {
                                     self.drop_target = Some(DropTarget::Folder((*f).clone()));
                                 }
-                                if nav_item_r(ui, &col, Icon::Folder, &f.name, count, sel, over).clicked() {
+                                let r = nav_item_r(ui, &col, Icon::Folder, &f.name, count, sel, over);
+                                if r.clicked() {
                                     self.set_selection(Selection::Folder(f.id));
                                 }
+                                r.context_menu(|ui| {
+                                    if ui.button("New folder inside…").clicked() {
+                                        self.folder_dialog = Some(FolderDialog::New { account: a.id, parent: Some((*f).clone()), name: String::new(), error: None });
+                                        ui.close();
+                                    }
+                                    let why = engine::cant_delete_folder(&self.store, f).unwrap_or(None);
+                                    let del = ui.add_enabled(why.is_none(), egui::Button::new("Delete folder…"));
+                                    if let Some(why) = &why {
+                                        del.clone().on_disabled_hover_text(why);
+                                    }
+                                    if del.clicked() {
+                                        self.folder_dialog = Some(FolderDialog::Delete { folder: (*f).clone(), gmail: a.is_gmail() });
+                                        ui.close();
+                                    }
+                                });
                             });
                         }
                         if let Some(k) = toggle {
@@ -4848,6 +5016,7 @@ impl OwlPostApp {
         self.reader(ctx);
         self.windows(ctx);
         self.new_tab_dialog(ctx);
+        self.folder_dialog_ui(ctx);
         self.keys_sheet(ctx);
         self.activity_sheet(ctx);
         self.drag_overlay(ctx);
@@ -5388,6 +5557,42 @@ mod ui_tests {
     }
 
     #[test]
+    fn sidebar_folder_dialogs() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness(theme::MOONLIT_LIGHT);
+        h.run_steps(2);
+        let acc = h.state().accounts.iter().find(|a| !a.is_gmail()).unwrap().clone();
+        let has = |h: &Harness<'static, OwlPostApp>, path: &str| h.state().folders.get(&acc.id).into_iter().flatten().find(|f| f.path == path).cloned();
+        let wait = |h: &mut Harness<'static, OwlPostApp>, path: &str, want: bool| {
+            for _ in 0..100 {
+                h.run_steps(1);
+                if has(h, path).is_some() == want {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        h.state_mut().folder_dialog = Some(FolderDialog::New { account: acc.id, parent: None, name: "Receipts".into(), error: None });
+        h.run_steps(2);
+        h.get_by_label("Create").click();
+        assert!(wait(&mut h, "Receipts", true), "the folder appears in the sidebar");
+        // The same name again is refused in the dialog.
+        h.state_mut().folder_dialog = Some(FolderDialog::New { account: acc.id, parent: None, name: "receipts".into(), error: None });
+        h.run_steps(1);
+        h.get_by_label("Create").click();
+        h.run_steps(2);
+        assert!(matches!(&h.state().folder_dialog, Some(FolderDialog::New { error: Some(_), .. })));
+        h.state_mut().folder_dialog = None;
+        // Delete it again.
+        let f = has(&h, "Receipts").unwrap();
+        h.state_mut().folder_dialog = Some(FolderDialog::Delete { folder: f, gmail: false });
+        h.run_steps(2);
+        h.get_by_label("Delete folder").click();
+        assert!(wait(&mut h, "Receipts", false), "and goes when deleted");
+    }
+
+    #[test]
     fn drag_conversations_onto_folders() {
         let mut h = harness(theme::MOONLIT_LIGHT);
         h.run_steps(2);
@@ -5401,12 +5606,22 @@ mod ui_tests {
         h.run_steps(2);
         assert_eq!(h.state().rows.len(), before - 2);
         assert!(h.state().toasts.iter().any(|t| t.text == "Archived 2 conversations"));
-        // One conversation onto a folder of another account stays put.
+        // One conversation onto a folder of another account moves across.
         let row = h.state().rows[0].t.clone();
         let other = h.state().folders.iter().find(|(a, _)| **a != row.account_id).and_then(|(_, fs)| fs.iter().find(|f| f.role == FolderRole::Other).cloned()).unwrap();
-        h.state_mut().drop_on(vec![(row.account_id, row.thread_key.clone())], DropTarget::Folder(other));
-        assert!(h.state().rows.iter().any(|r| r.t.thread_key == row.thread_key));
-        assert!(h.state().toasts.iter().any(|t| t.error && t.text.contains("another account")));
+        h.state_mut().drop_on(vec![(row.account_id, row.thread_key.clone())], DropTarget::Folder(other.clone()));
+        assert!(!h.state().rows.iter().any(|r| r.t.account_id == row.account_id && r.t.thread_key == row.thread_key), "it leaves the list");
+        assert!(h.state().toasts.iter().any(|t| !t.error && t.text.contains("Trash")), "and says the original goes to Trash");
+        let mut arrived = false;
+        for _ in 0..100 {
+            h.run_steps(1);
+            if h.state().store.threads(&MailboxView::Folder(other.id), "", 100).unwrap().iter().any(|t| t.account_id == other.account_id && t.subject == row.subject) {
+                arrived = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(arrived, "a copy lands in the other account's folder");
         // A real drag: press on the first row, move down (picks it up), then
         // left onto All Accounts → Archive, and let go.
         let rows_before = h.state().rows.len();

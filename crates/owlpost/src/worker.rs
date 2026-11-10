@@ -26,6 +26,14 @@ pub enum Cmd {
     Label(AccountId, String, FolderId, bool),
     /// Create a folder/label, then optionally move or label a thread into it.
     CreateFolder(AccountId, String, Option<(Vec<String>, FolderUse)>),
+    /// Make a folder from the sidebar, inside another one when given.
+    NewFolder(AccountId, Option<FolderId>, String),
+    /// Delete one of the account's own folders (its mail goes to Trash,
+    /// or stays in All Mail on Gmail).
+    DeleteFolder(FolderId),
+    /// Move a conversation into another account's folder: copy it across,
+    /// then put the originals in Trash. The folder id is the one being viewed.
+    MoveAcross(AccountId, String, Option<FolderId>, FolderId),
     /// Send; the composer's saved draft (if any) is then deleted.
     Send(AccountId, OutgoingMessage, DraftRef),
     /// Save to the Drafts folder, replacing the composer's previous draft.
@@ -95,7 +103,7 @@ impl Cmd {
     /// the order they were sent (so an undo never overtakes its action).
     fn thread(&self) -> Option<(AccountId, String)> {
         match self {
-            Cmd::SetUnread(a, k, _) | Cmd::SetStarred(a, k, _) | Cmd::Move(a, k, _) | Cmd::MoveTo(a, k, _, _) | Cmd::Label(a, k, _, _) | Cmd::Restore(a, k, _, _) | Cmd::Snooze(a, k, _) | Cmd::Unsnooze(a, k) => Some((*a, k.clone())),
+            Cmd::SetUnread(a, k, _) | Cmd::SetStarred(a, k, _) | Cmd::Move(a, k, _) | Cmd::MoveTo(a, k, _, _) | Cmd::MoveAcross(a, k, _, _) | Cmd::Label(a, k, _, _) | Cmd::Restore(a, k, _, _) | Cmd::Snooze(a, k, _) | Cmd::Unsnooze(a, k) => Some((*a, k.clone())),
             Cmd::CreateFolder(a, _, Some((ks, _))) => ks.first().map(|k| (*a, k.clone())),
             // A composer's saves, send and discard run one after another.
             Cmd::Send(_, _, r) | Cmd::SaveDraft(_, _, r, _) | Cmd::DeleteDraft(r) => Some((0, format!("composer:{}", r.composer))),
@@ -645,6 +653,30 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
                         }
                     }
                 }
+                let _ = ev.send(Event::Changed);
+            }
+            Cmd::NewFolder(a, parent, name) => {
+                let parent = match parent {
+                    Some(p) => Some(store.folder(p)?.ok_or_else(|| anyhow::anyhow!("that folder no longer exists"))?),
+                    None => None,
+                };
+                engine::create_folder_in(&store, &account(a)?, parent.as_ref(), &name)?;
+                let _ = ev.send(Event::Notice(format!("Created “{name}”")));
+                let _ = ev.send(Event::Changed);
+            }
+            Cmd::DeleteFolder(id) => {
+                let f = store.folder(id)?.ok_or_else(|| anyhow::anyhow!("that folder no longer exists"))?;
+                engine::delete_folder(&store, &account(f.account_id)?, &f)?;
+                let _ = ev.send(Event::Notice(format!("Deleted “{}”", f.name)));
+                let _ = ev.send(Event::Changed);
+            }
+            Cmd::MoveAcross(a, key, viewed, folder) => {
+                let f = store.folder(folder)?.ok_or_else(|| anyhow::anyhow!("that folder no longer exists"))?;
+                let (from, to) = (account(a)?, account(f.account_id)?);
+                let _ = ev.send(Event::Status(format!("Moving to {}…", to.email)));
+                let r = engine::move_thread_across(&store, &from, &key, viewed, &to, &f);
+                let _ = ev.send(Event::Status(String::new()));
+                r?;
                 let _ = ev.send(Event::Changed);
             }
             Cmd::Send(a, out, draft) => {

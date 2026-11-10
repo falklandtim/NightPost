@@ -519,20 +519,177 @@ pub fn set_label(store: &Store, account: &Account, thread_key: &str, label: &Fol
 
 /// Create a folder (a label on Gmail) and return its id.
 pub fn create_folder(store: &Store, account: &Account, name: &str) -> Result<FolderId> {
+    create_folder_in(store, account, None, name)
+}
+
+/// The server's folder separator: `/` on Gmail and iCloud, `.` on some others.
+fn hierarchy_delimiter(s: &mut Session) -> String {
+    s.list(Some(""), Some(""))
+        .ok()
+        .and_then(|names| names.iter().next().and_then(|n| n.delimiter().map(str::to_string)))
+        .unwrap_or_else(|| "/".to_string())
+}
+
+/// Create a folder, inside `parent` when given, and return its id. An
+/// existing folder of that name is returned as it is.
+pub fn create_folder_in(store: &Store, account: &Account, parent: Option<&Folder>, name: &str) -> Result<FolderId> {
     let name = name.trim();
     if name.is_empty() {
         return Err(anyhow!("folder name is empty"));
     }
-    if let Some(f) = store.folders(account.id)?.into_iter().find(|f| f.path.eq_ignore_ascii_case(name)) {
+    let mut session = if account.demo { None } else { Some(connect(account)?) };
+    let path = match parent {
+        Some(p) => {
+            let delim = session.as_mut().map(hierarchy_delimiter).unwrap_or_else(|| "/".into());
+            if name.contains(delim.as_str()) {
+                return Err(anyhow!("a folder name can't contain “{delim}”"));
+            }
+            format!("{}{delim}{name}", p.path)
+        }
+        None => name.to_string(),
+    };
+    if let Some(f) = store.folders(account.id)?.into_iter().find(|f| f.path.eq_ignore_ascii_case(&path)) {
         return Ok(f.id);
+    }
+    if let Some(mut s) = session {
+        s.create(&path).with_context(|| format!("the server wouldn't create “{path}”"))?;
+        let _ = s.subscribe(&path);
+        let _ = s.logout();
+    }
+    store.upsert_folder(account.id, &path, FolderRole::Other)
+}
+
+/// Why a folder can't be deleted, if it can't: only your own folders can
+/// go, and not while they have folders inside them.
+pub fn cant_delete_folder(store: &Store, folder: &Folder) -> Result<Option<String>> {
+    if folder.role != FolderRole::Other || crate::snooze_sync::is_internal_folder(&folder.path) {
+        return Ok(Some(format!("{} is one of the account's own folders", folder.name)));
+    }
+    let inside = store.folders(folder.account_id)?.into_iter().any(|f| crate::models::folder_parent(&f.path).as_deref() == Some(folder.path.as_str()));
+    Ok(inside.then(|| format!("“{}” has folders inside it. Delete those first.", folder.name)))
+}
+
+/// Delete a folder (a label on Gmail). Its mail isn't lost: Gmail keeps it
+/// in All Mail, and on other servers it's moved to Trash first (deleting an
+/// IMAP folder deletes the mail in it).
+pub fn delete_folder(store: &Store, account: &Account, folder: &Folder) -> Result<()> {
+    if let Some(why) = cant_delete_folder(store, folder)? {
+        return Err(anyhow!(why));
     }
     if !account.demo {
         let mut s = connect(account)?;
-        s.create(name)?;
-        let _ = s.subscribe(name);
+        let mut trash = None;
+        if !account.is_gmail() {
+            let mbox = s.select(&folder.path)?;
+            if mbox.exists > 0 {
+                let t = folder_for_role(store, account, FolderRole::Trash).context("there's nowhere to put its mail")?;
+                let uids: Vec<u32> = s.uid_search("ALL")?.into_iter().collect();
+                if !uids.is_empty() {
+                    let set = uid_set(&uids);
+                    if s.capabilities()?.has_str("MOVE") {
+                        s.uid_mv(&set, &t.path)?;
+                    } else {
+                        s.uid_copy(&set, &t.path)?;
+                        s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)")?;
+                        s.expunge()?;
+                    }
+                }
+                trash = Some(t);
+            }
+            // Some servers won't delete the folder that's open.
+            s.close()?;
+        }
+        s.delete(&folder.path).with_context(|| format!("the server wouldn't delete “{}”", folder.path))?;
+        let _ = s.unsubscribe(&folder.path);
+        if let Some(t) = trash {
+            let _ = sync_folder(store, &mut s, account, &t);
+        }
         let _ = s.logout();
+    } else if let Some(t) = store.folder_by_role(account.id, FolderRole::Trash)? {
+        for k in store.thread_keys_in_folder(folder.id)? {
+            store.move_thread_local_from(account.id, &k, &[folder.id], t.id)?;
+        }
     }
-    store.upsert_folder(account.id, name, FolderRole::Other)
+    store.delete_folder(folder.id)
+}
+
+/// Move a conversation into a folder of another account. Each message is
+/// copied across (keeping its date, and whether it's read or starred), then
+/// the originals go to the first account's Trash, so if anything fails part
+/// way nothing is lost. Returns how many messages were copied.
+pub fn move_thread_across(store: &Store, from: &Account, thread_key: &str, viewed: Option<FolderId>, to: &Account, target: &Folder) -> Result<usize> {
+    if target.account_id != to.id {
+        return Err(anyhow!("that folder belongs to another account"));
+    }
+    let trash = folder_for_role(store, from, FolderRole::Trash).with_context(|| format!("can't take the originals out of {}", from.email))?;
+    let sources = move_sources(from, copies_by_folder(store, from, thread_key)?, viewed, trash.id);
+    // Already in Trash: copy it out of there, and leave the originals.
+    let sources = if sources.is_empty() { move_sources(from, copies_by_folder(store, from, thread_key)?, viewed, 0) } else { sources };
+    if sources.is_empty() {
+        return Err(anyhow!("the conversation isn't in a folder it can be moved from"));
+    }
+    // Each message once, though Gmail lists it under several labels.
+    let mut seen = HashSet::new();
+    let wanted: Vec<FolderId> = sources.iter().map(|((id, _, _), _)| *id).collect();
+    let picked: Vec<Message> = store
+        .thread_copies(from.id, thread_key)?
+        .into_iter()
+        .filter(|m| wanted.contains(&m.folder_id))
+        .filter(|m| m.message_id.is_empty() || seen.insert(m.message_id.clone()))
+        .collect();
+    if from.demo || to.demo {
+        let mut uid = store.known_uids(target.id)?.into_iter().max().unwrap_or(0);
+        for m in &picked {
+            uid += 1;
+            let mut c = m.clone();
+            c.account_id = to.id;
+            c.folder_id = target.id;
+            c.uid = uid;
+            c.thread_key = store.resolve_thread_key(to.id, &c.message_id, &c.in_reply_to, &c.references)?;
+            store.insert_message(&c)?;
+        }
+        if !wanted.contains(&trash.id) {
+            store.move_thread_local_from(from.id, thread_key, &wanted, trash.id)?;
+        }
+        return Ok(picked.len());
+    }
+    // Download them all before writing anything.
+    let mut raws: Vec<(Vec<u8>, Vec<imap::types::Flag<'static>>, Option<chrono::DateTime<chrono::FixedOffset>>)> = Vec::new();
+    let mut s = connect(from)?;
+    let mut by_folder: BTreeMap<FolderId, Vec<&Message>> = BTreeMap::new();
+    for m in &picked {
+        by_folder.entry(m.folder_id).or_default().push(m);
+    }
+    for (fid, msgs) in by_folder {
+        let folder = store.folder(fid)?.ok_or_else(|| anyhow!("a folder the conversation is in no longer exists"))?;
+        s.select(&folder.path)?;
+        for m in msgs {
+            let fetches = s.uid_fetch(m.uid.to_string(), "(BODY.PEEK[] INTERNALDATE)")?;
+            let Some(f) = fetches.iter().find(|f| f.body().is_some()) else {
+                return Err(anyhow!("a message is no longer on the server. Sync, then try again"));
+            };
+            let mut flags = Vec::new();
+            if !m.unread {
+                flags.push(imap::types::Flag::Seen);
+            }
+            if m.starred {
+                flags.push(imap::types::Flag::Flagged);
+            }
+            raws.push((f.body().unwrap_or_default().to_vec(), flags, f.internal_date()));
+        }
+    }
+    let mut t = connect(to)?;
+    for (raw, flags, date) in &raws {
+        t.append_with_flags_and_date(&target.path, raw, flags, *date)
+            .with_context(|| format!("couldn't copy the mail into {} on {}", target.name, to.email))?;
+    }
+    let _ = sync_folder(store, &mut t, to, target);
+    let _ = t.logout();
+    let _ = s.logout();
+    if !wanted.contains(&trash.id) {
+        move_thread_to(store, from, thread_key, &trash, viewed)?;
+    }
+    Ok(raws.len())
 }
 
 /// Send a message and file a copy in Sent when the server won't.
@@ -936,6 +1093,57 @@ mod tests {
         let ids = store.thread_folder_ids(gmail.id, &t.thread_key).unwrap();
         assert!(ids.contains(&label.id), "archiving on Gmail must keep other labels");
         assert!(!ids.contains(&store.folder_by_role(gmail.id, FolderRole::Inbox).unwrap().unwrap().id));
+    }
+
+    #[test]
+    fn folders_can_be_made_and_deleted() {
+        let store = Store::open(&crate::test_db_path("sp-folders")).unwrap();
+        crate::demo::seed(&store).unwrap();
+        let account = store.accounts().unwrap().into_iter().find(|a| !a.is_gmail()).unwrap();
+        let top = create_folder_in(&store, &account, None, "Receipts").unwrap();
+        let top = store.folder(top).unwrap().unwrap();
+        let sub = create_folder_in(&store, &account, Some(&top), "2026").unwrap();
+        let sub = store.folder(sub).unwrap().unwrap();
+        assert_eq!(sub.path, "Receipts/2026");
+        assert_eq!(create_folder_in(&store, &account, Some(&top), "2026").unwrap(), sub.id, "making it twice finds the first");
+
+        let inbox = store.folder_by_role(account.id, FolderRole::Inbox).unwrap().unwrap();
+        assert!(cant_delete_folder(&store, &inbox).unwrap().is_some(), "the Inbox stays");
+        assert!(cant_delete_folder(&store, &top).unwrap().is_some(), "not while it has a folder inside");
+        assert!(delete_folder(&store, &account, &top).is_err());
+        delete_folder(&store, &account, &sub).unwrap();
+        assert!(store.folder(sub.id).unwrap().is_none());
+
+        // Mail in a deleted folder ends up in Trash, not gone.
+        let key = store.threads(&MailboxView::Folder(inbox.id), "", 10).unwrap().remove(0).thread_key;
+        move_thread_to(&store, &account, &key, &top, None).unwrap();
+        delete_folder(&store, &account, &top).unwrap();
+        let trash = store.folder_by_role(account.id, FolderRole::Trash).unwrap().unwrap();
+        assert!(store.thread_folder_ids(account.id, &key).unwrap().contains(&trash.id));
+        assert!(store.folder(top.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn moves_between_accounts() {
+        let store = Store::open(&crate::test_db_path("sp-across")).unwrap();
+        crate::demo::seed(&store).unwrap();
+        let accounts = store.accounts().unwrap();
+        let from = accounts.iter().find(|a| !a.is_gmail()).unwrap();
+        let to = accounts.iter().find(|a| a.is_gmail()).unwrap();
+        let inbox = store.folder_by_role(from.id, FolderRole::Inbox).unwrap().unwrap();
+        let key = store.threads(&MailboxView::Folder(inbox.id), "", 10).unwrap().remove(0).thread_key;
+        let messages = store.thread_copies(from.id, &key).unwrap().iter().filter(|m| m.folder_id == inbox.id).count();
+        let label = store.folders(to.id).unwrap().into_iter().find(|f| f.role == FolderRole::Other).unwrap();
+
+        let wrong = move_thread_across(&store, from, &key, None, to, &store.folder_by_role(from.id, FolderRole::Archive).unwrap().unwrap());
+        assert!(wrong.is_err(), "the folder must be in the other account");
+        assert_eq!(move_thread_across(&store, from, &key, None, to, &label).unwrap(), messages);
+
+        let copied = store.threads(&MailboxView::Folder(label.id), "", 50).unwrap();
+        assert!(copied.iter().any(|t| t.account_id == to.id), "it arrives in the other account");
+        let left = store.thread_folder_ids(from.id, &key).unwrap();
+        assert!(!left.contains(&inbox.id), "and leaves the first account's Inbox");
+        assert!(left.contains(&store.folder_by_role(from.id, FolderRole::Trash).unwrap().unwrap().id), "for its Trash");
     }
 
     #[test]

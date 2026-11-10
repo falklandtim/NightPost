@@ -764,7 +764,7 @@ mod offscreen {
         use gtk::prelude::*;
         use std::cell::RefCell;
         use std::sync::{Arc, Mutex};
-        use webkit2gtk::{LoadEvent, SnapshotOptions, SnapshotRegion, WebViewExt};
+        use webkit2gtk::{LoadEvent, SettingsExt, SnapshotOptions, SnapshotRegion, WebViewExt};
 
         struct Off {
             _window: gtk::OffscreenWindow,
@@ -806,6 +806,12 @@ mod offscreen {
                 if o.is_none() {
                     let window = gtk::OffscreenWindow::new();
                     let view = webkit2gtk::WebView::new();
+                    // An offscreen window has no OpenGL, and if WebKit switches
+                    // to GL compositing (some emails, a resize) GDK aborts the
+                    // whole app. A snapshot only needs software drawing.
+                    if let Some(settings) = WebViewExt::settings(&view) {
+                        settings.set_hardware_acceleration_policy(webkit2gtk::HardwareAccelerationPolicy::Never);
+                    }
                     view.connect_load_changed(|_, ev| {
                         if ev == LoadEvent::Finished {
                             let gen = OFF.with(|o| o.borrow().as_ref().map(|off| off.gen));

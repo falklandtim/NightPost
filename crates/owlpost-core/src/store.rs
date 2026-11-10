@@ -461,6 +461,13 @@ impl Store {
         Ok(())
     }
 
+    /// Forget a folder and the copies of mail stored in it.
+    pub fn delete_folder(&self, id: FolderId) -> Result<()> {
+        self.conn.execute("DELETE FROM messages WHERE folder_id=?1", [id])?;
+        self.conn.execute("DELETE FROM folders WHERE id=?1", [id])?;
+        Ok(())
+    }
+
     pub fn set_folder_sync_state(&self, id: FolderId, uid_validity: u32, last_uid: u32) -> Result<()> {
         self.conn.execute(
             "UPDATE folders SET uid_validity=?2, last_uid=?3 WHERE id=?1",
