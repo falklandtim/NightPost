@@ -3326,6 +3326,13 @@ impl OwlPostApp {
                             (col.list_focused, col.list_focused_text, col.list_focused_text.gamma_multiply(0.8))
                         } else if selected {
                             (col.list_focused, col.list_focused_text, col.subtle)
+                        } else if t.pinned {
+                            // Pinned: a pale wash of the star's yellow.
+                            (pinned_wash(&col, hovered), col.text, col.subtle)
+                        } else if t.unread {
+                            // Unread: a lighter wash of the sidebar's highlight
+                            // (full strength would look like the selected row).
+                            (unread_wash(&col, hovered), col.text, col.subtle)
                         } else if hovered {
                             (col.list_hover, col.text, col.subtle)
                         } else {
@@ -3334,7 +3341,7 @@ impl OwlPostApp {
                         let selected = selected && !soft;
                         // Full-width rows with a hairline between them.
                         p.rect_filled(rect_c, 0.0, bg);
-                        p.hline(rect_c.x_range(), rect_c.bottom() - 0.5, egui::Stroke::new(1.0_f32, col.list_border));
+                        p.hline(rect_c.x_range(), rect_c.bottom() - style::DIVIDER_WIDTH / 2.0, egui::Stroke::new(style::DIVIDER_WIDTH, col.list_border));
                         let rect = rect_c;
                         let top = rect.top();
                         let latest = t.participants.last().cloned().unwrap_or_default();
@@ -4572,6 +4579,25 @@ impl FolderTree {
     }
 }
 
+/// Is the list dark (a dark theme)?
+fn list_is_dark(col: &Colors) -> bool {
+    let c = col.list;
+    (c.r() as u32 + c.g() as u32 + c.b() as u32) < 384
+}
+
+/// An unread row's background: the sidebar's highlight, lighter (full
+/// strength would look selected). A touch stronger on dark themes.
+fn unread_wash(col: &Colors, hovered: bool) -> egui::Color32 {
+    let base = if list_is_dark(col) { 0.60 } else { 0.55 };
+    style::blend(col.sidebar_active, col.list, if hovered { base + 0.25 } else { base })
+}
+
+/// A pinned row's background: a pale wash of the star's yellow.
+fn pinned_wash(col: &Colors, hovered: bool) -> egui::Color32 {
+    let base = if list_is_dark(col) { 0.08 } else { 0.10 };
+    style::blend(col.star, col.list, if hovered { base + 0.06 } else { base })
+}
+
 /// The sidebar's line icon for a folder role.
 fn role_icon(role: FolderRole) -> Icon {
     match role {
@@ -5035,6 +5061,31 @@ mod ui_tests {
         let d = std::env::var("OWLPOST_SHOTS").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("owlpost-shots"));
         let _ = std::fs::create_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn unread_rows_are_tinted() {
+        for (name, th) in [("light", theme::MOONLIT_LIGHT), ("dark", theme::MOONLIT_DARK)] {
+            let mut h = harness(th);
+            h.run();
+            let col = h.state().colors.clone();
+            assert!(h.state().rows.iter().any(|r| r.t.unread), "unread mail in the demo inbox");
+            let read = h.state().rows.iter().find(|r| !r.t.unread).map(|r| (r.t.account_id, r.t.thread_key.clone())).unwrap();
+            h.state_mut().toggle_pin(read.0, &read.1);
+            h.state_mut().reload();
+            h.run();
+            save(&mut h, &format!("unread-rows-{name}"));
+            // Down the list's left edge, some rows wear the unread wash.
+            if let Ok(img) = h.render() {
+                let x = (h.state().sidebar_right * h.ctx.pixels_per_point() + 6.0) as u32;
+                let want = unread_wash(&col, false);
+                let near = |p: &image::Rgba<u8>| (0..3).all(|c| (p[c] as i32 - want.to_array()[c] as i32).abs() <= 2);
+                assert!((0..img.height()).any(|y| near(img.get_pixel(x, y))), "unread rows use the sidebar's highlight ({name})");
+                let want = pinned_wash(&col, false);
+                let near = |p: &image::Rgba<u8>| (0..3).all(|c| (p[c] as i32 - want.to_array()[c] as i32).abs() <= 2);
+                assert!((0..img.height()).any(|y| near(img.get_pixel(x, y))), "pinned rows are yellow ({name})");
+            }
+        }
     }
 
     #[test]

@@ -14,6 +14,9 @@ pub fn hex(s: &str) -> Color32 {
 }
 
 /// Every colour the views need, pre-converted.
+/// How thick the lines between panels and between messages are (points).
+pub const DIVIDER_WIDTH: f32 = 1.5;
+
 #[derive(Clone)]
 pub struct Colors {
     pub p: Palette,
@@ -113,7 +116,8 @@ impl Colors {
         let w = &mut v.widgets;
         w.noninteractive.bg_fill = self.bg;
         w.noninteractive.weak_bg_fill = self.bg;
-        w.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.divider);
+        // Also the lines between the panels (egui draws those with it).
+        w.noninteractive.bg_stroke = Stroke::new(DIVIDER_WIDTH, self.divider);
         w.noninteractive.fg_stroke = Stroke::new(1.0_f32, self.text);
         w.inactive.bg_fill = c(p.button);
         w.inactive.weak_bg_fill = c(p.button);
