@@ -329,13 +329,10 @@ impl Worker {
                         let all_accounts: Vec<Account> = store.accounts().unwrap_or_default().into_iter().filter(|a| !a.demo).collect();
                         // Pushed changes: just the Inbox, quietly.
                         for a in all_accounts.iter().filter(|a| plan.inboxes.contains(&a.id) && !plan.covers_fully(a.id)) {
-                            match engine::sync_inbox(&store, a) {
-                                Ok(_) => {
-                                    let _ = ev.send(Event::Changed);
-                                    ctx.request_repaint();
-                                }
-                                Err(_) => {} // recorded in the activity log
-
+                            // A failure is recorded in the activity log.
+                            if engine::sync_inbox(&store, a).is_ok() {
+                                let _ = ev.send(Event::Changed);
+                                ctx.request_repaint();
                             }
                         }
                         if !plan.all && plan.accounts.is_empty() {

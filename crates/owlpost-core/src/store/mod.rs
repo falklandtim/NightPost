@@ -1,4 +1,5 @@
-//! Local SQLite cache of accounts, folders, messages and snoozes.
+//! Local SQLite cache of accounts, folders, messages, snoozes, pins and
+//! tab rules. Inbox tabs live in `categories.rs` and pins in `pins.rs`.
 //!
 //! The database runs in WAL mode so the desktop app, the background sync
 //! worker and the MCP server process can all use it at the same time.
@@ -9,6 +10,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+mod categories;
+mod pins;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS accounts (
@@ -154,6 +158,8 @@ CREATE TABLE IF NOT EXISTS activity (
 );
 "#;
 
+/// One connection to OwlPost's database. Each thread and process opens its
+/// own; WAL mode lets them read and write side by side.
 pub struct Store {
     pub(crate) conn: Connection,
     path: PathBuf,
@@ -175,6 +181,8 @@ fn from_ts(t: i64) -> DateTime<Utc> {
 }
 
 impl Store {
+    /// Open (or create) the database at `path`, creating missing tables and
+    /// running the column migrations below.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
@@ -282,6 +290,7 @@ impl Store {
 
     // ----- signatures -------------------------------------------------------
 
+    /// Every saved signature, oldest first.
     pub fn signatures(&self) -> Result<Vec<Signature>> {
         let mut st = self.conn.prepare("SELECT id, title, body, html FROM signatures ORDER BY id")?;
         let v = st
@@ -310,6 +319,7 @@ impl Store {
         }
     }
 
+    /// Delete a signature; accounts using it as their default lose it.
     pub fn delete_signature(&self, id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM signatures WHERE id=?1", [id])?;
         Ok(())
@@ -322,6 +332,7 @@ impl Store {
         Ok(v)
     }
 
+    /// Set (or, with `None`, clear) an account's default signature.
     pub fn set_default_signature(&self, account_id: AccountId, signature: Option<i64>) -> Result<()> {
         match signature {
             Some(sig) => self.conn.execute(
@@ -334,10 +345,12 @@ impl Store {
         Ok(())
     }
 
+    /// Open the database at [`default_db_path`].
     pub fn open_default() -> Result<Self> {
         Self::open(&default_db_path())
     }
 
+    /// Where this database file is.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -349,6 +362,8 @@ impl Store {
 
     // ----- accounts ---------------------------------------------------------
 
+    /// Save a new account (its `id` is ignored) and return its id. A
+    /// signature on it becomes a named signature, set as its default.
     pub fn add_account(&self, a: &Account) -> Result<AccountId> {
         self.conn.execute(
             "INSERT INTO accounts (display_name,email,username,imap_host,imap_port,imap_security,
@@ -370,6 +385,8 @@ impl Store {
         Ok(id)
     }
 
+    /// Save changes to an account's name, servers, colour and sign-in.
+    /// The email address and signature are not changed here.
     pub fn update_account(&self, a: &Account) -> Result<()> {
         self.conn.execute(
             "UPDATE accounts SET display_name=?2, username=?3, imap_host=?4, imap_port=?5,
@@ -385,11 +402,14 @@ impl Store {
         Ok(())
     }
 
+    /// Delete an account and, through the foreign keys, its folders, mail,
+    /// snoozes and pins. Its keychain entry is the caller's to remove.
     pub fn remove_account(&self, id: AccountId) -> Result<()> {
         self.conn.execute("DELETE FROM accounts WHERE id=?1", [id])?;
         Ok(())
     }
 
+    /// Every account, in the order they were added.
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let mut st = self.conn.prepare(
             "SELECT id,display_name,email,username,imap_host,imap_port,imap_security,
@@ -430,10 +450,12 @@ impl Store {
         Ok(accounts)
     }
 
+    /// One account by id.
     pub fn account(&self, id: AccountId) -> Result<Option<Account>> {
         Ok(self.accounts()?.into_iter().find(|a| a.id == id))
     }
 
+    /// One account by address (ignoring case).
     pub fn account_by_email(&self, email: &str) -> Result<Option<Account>> {
         Ok(self
             .accounts()?
@@ -443,6 +465,8 @@ impl Store {
 
     // ----- folders ----------------------------------------------------------
 
+    /// Add a folder from the server's list, or refresh its role and name;
+    /// returns its id either way.
     pub fn upsert_folder(&self, account_id: AccountId, path: &str, role: FolderRole) -> Result<FolderId> {
         let name = crate::models::folder_leaf(path).to_string();
         let name = if path.eq_ignore_ascii_case("inbox") { "Inbox".to_string() } else { name };
@@ -460,6 +484,8 @@ impl Store {
         Ok(id)
     }
 
+    /// Forget an account's folders that the server no longer lists (with
+    /// their cached mail). `keep` holds the paths the server sent.
     pub fn delete_folders_not_in(&self, account_id: AccountId, keep: &[String]) -> Result<()> {
         let existing = self.folders(account_id)?;
         for f in existing {
@@ -477,6 +503,7 @@ impl Store {
         Ok(())
     }
 
+    /// Record how far a folder has been synced (see [`Folder::last_uid`]).
     pub fn set_folder_sync_state(&self, id: FolderId, uid_validity: u32, last_uid: u32) -> Result<()> {
         self.conn.execute(
             "UPDATE folders SET uid_validity=?2, last_uid=?3 WHERE id=?1",
@@ -505,6 +532,8 @@ impl Store {
         })
     }
 
+    /// An account's folders with their unread counts: standard roles first
+    /// (Inbox, Starred, Drafts…), then the rest by path.
     pub fn folders(&self, account_id: AccountId) -> Result<Vec<Folder>> {
         let mut st = self.conn.prepare(
             "SELECT f.id,f.account_id,f.path,f.name,f.role,f.uid_validity,f.last_uid,
@@ -518,6 +547,7 @@ impl Store {
         Ok(v)
     }
 
+    /// One folder by id, with its unread count.
     pub fn folder(&self, id: FolderId) -> Result<Option<Folder>> {
         Ok(self
             .conn
@@ -531,6 +561,7 @@ impl Store {
             .optional()?)
     }
 
+    /// An account's folder with this role (its Inbox, Trash…), if it has one.
     pub fn folder_by_role(&self, account_id: AccountId, role: FolderRole) -> Result<Option<Folder>> {
         Ok(self.folders(account_id)?.into_iter().find(|f| f.role == role))
     }
@@ -601,6 +632,8 @@ impl Store {
             .unwrap_or_else(|| message_id.to_string()))
     }
 
+    /// Save a downloaded message. If the folder already has that UID, only
+    /// its read and starred flags are updated.
     pub fn insert_message(&self, m: &Message) -> Result<MessageId> {
         self.conn.execute(
             "INSERT INTO messages (account_id,folder_id,uid,message_id,thread_key,in_reply_to,refs,subject,
@@ -618,12 +651,14 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// The UIDs cached for a folder (to compare with the server's).
     pub fn known_uids(&self, folder_id: FolderId) -> Result<Vec<u32>> {
         let mut st = self.conn.prepare("SELECT uid FROM messages WHERE folder_id=?1")?;
         let v = st.query_map([folder_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         Ok(v)
     }
 
+    /// Forget messages the server no longer has in this folder.
     pub fn delete_uids(&self, folder_id: FolderId, uids: &[u32]) -> Result<()> {
         for u in uids {
             self.conn.execute("DELETE FROM messages WHERE folder_id=?1 AND uid=?2", params![folder_id, u])?;
@@ -631,6 +666,7 @@ impl Store {
         Ok(())
     }
 
+    /// Copy one message's read and starred flags from the server.
     pub fn set_flags_by_uid(&self, folder_id: FolderId, uid: u32, unread: bool, starred: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE messages SET unread=?3, starred=?4 WHERE folder_id=?1 AND uid=?2",
@@ -668,6 +704,7 @@ impl Store {
     const MSG_COLS: &'static str = "id,account_id,folder_id,uid,message_id,thread_key,in_reply_to,refs,subject,
         from_name,from_email,to_json,cc_json,date,snippet,body_text,body_html,attachments,unread,starred,category";
 
+    /// One message by id, with its body.
     pub fn message(&self, id: MessageId) -> Result<Option<Message>> {
         let sql = format!("SELECT {} FROM messages WHERE id=?1", Self::MSG_COLS);
         Ok(self.conn.query_row(&sql, [id], Self::message_from_row).optional()?)
@@ -726,6 +763,8 @@ impl Store {
         Ok(v)
     }
 
+    /// Mark every message in a conversation read or unread, here only (the
+    /// worker tells the server).
     pub fn set_thread_unread(&self, account_id: AccountId, thread_key: &str, unread: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE messages SET unread=?3 WHERE account_id=?1 AND thread_key=?2",
@@ -734,6 +773,7 @@ impl Store {
         Ok(())
     }
 
+    /// Star or unstar every message in a conversation, here only.
     pub fn set_thread_starred(&self, account_id: AccountId, thread_key: &str, starred: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE messages SET starred=?3 WHERE account_id=?1 AND thread_key=?2",
@@ -966,191 +1006,10 @@ impl Store {
         Ok(out)
     }
 
-    // ----- inbox categories -------------------------------------------------
-
-    /// A conversation's category, as SQL over the row `m`. In order: a
-    /// rule for the conversation itself (the newest), a sender rule (the
-    /// newest message from a sender with one), and otherwise the lowest of
-    /// its messages' guesses, so a reply makes it Primary. Unsorted
-    /// messages don't count; none sorted is Primary. A rule for a tab that
-    /// was removed counts as no rule.
-    const THREAD_CATEGORY: &'static str = "(SELECT COALESCE(
-        (SELECT CASE WHEN q.tab IS NULL THEN q.category ELSE (SELECT t.num FROM tabs t WHERE t.key = q.tab AND t.removed = 0) END
-          FROM messages z JOIN thread_rules q ON q.message_id = z.message_id AND q.removed = 0
-          WHERE z.account_id = m.account_id AND z.thread_key = m.thread_key ORDER BY q.updated DESC LIMIT 1),
-        (SELECT CASE WHEN r.tab IS NULL THEN r.category ELSE (SELECT t.num FROM tabs t WHERE t.key = r.tab AND t.removed = 0) END
-          FROM messages y JOIN sender_rules r ON r.email = lower(y.from_email) AND r.removed = 0
-          WHERE y.account_id = m.account_id AND y.thread_key = m.thread_key ORDER BY y.date DESC LIMIT 1),
-        (SELECT MIN(x.category) FROM messages x WHERE x.account_id = m.account_id AND x.thread_key = m.thread_key),
-        0))";
-
-    pub fn thread_category(&self, account_id: AccountId, thread_key: &str) -> Result<u8> {
-        let sql = format!("SELECT {} FROM (SELECT ?1 AS account_id, ?2 AS thread_key) m", Self::THREAD_CATEGORY);
-        Ok(self.conn.query_row(&sql, params![account_id, thread_key], |r| r.get(0))?)
-    }
-
-    /// UIDs in a folder not sorted into a category yet.
-    pub fn unsorted_uids(&self, folder_id: FolderId) -> Result<Vec<u32>> {
-        let mut st = self.conn.prepare("SELECT uid FROM messages WHERE folder_id=?1 AND category IS NULL")?;
-        let v = st.query_map([folder_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        Ok(v)
-    }
-
-    /// Each message in a folder with its category (None: unsorted).
-    pub fn folder_categories(&self, folder_id: FolderId) -> Result<Vec<(u32, Option<u8>)>> {
-        let mut st = self.conn.prepare("SELECT uid, category FROM messages WHERE folder_id=?1")?;
-        let v = st.query_map([folder_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-        Ok(v)
-    }
-
-    /// Sort a message (every copy of it in the account, found by the one
-    /// at `folder_id`/`uid`).
-    pub fn set_category_by_uid(&self, folder_id: FolderId, uid: u32, category: u8) -> Result<()> {
-        self.conn.execute(
-            "UPDATE messages SET category=?3 WHERE (account_id, message_id) IN
-               (SELECT account_id, message_id FROM messages WHERE folder_id=?1 AND uid=?2)",
-            params![folder_id, uid, category],
-        )?;
-        Ok(())
-    }
-
-    /// Every sender rule, tombstones included.
-    pub fn sender_rules(&self) -> Result<Vec<crate::snooze_sync::SenderRule>> {
-        let mut st = self.conn.prepare("SELECT email, category, tab, updated, removed FROM sender_rules ORDER BY email")?;
-        let v = st
-            .query_map([], |r| {
-                Ok(crate::snooze_sync::SenderRule { email: r.get(0)?, category: r.get(1)?, tab: r.get(2)?, updated: r.get(3)?, removed: r.get(4)? })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(v)
-    }
-
-    /// The category this address's mail always goes to, if there's a rule
-    /// (and its tab, if it's one of yours, hasn't been removed).
-    pub fn sender_rule(&self, email: &str) -> Result<Option<u8>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT CASE WHEN r.tab IS NULL THEN r.category ELSE (SELECT t.num FROM tabs t WHERE t.key = r.tab AND t.removed = 0) END
-                 FROM sender_rules r WHERE r.email=lower(?1) AND r.removed=0",
-                [email.trim()],
-                |r| r.get::<_, Option<u8>>(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    /// Store a rule, unless the one here is newer.
-    pub fn put_sender_rule(&self, r: &crate::snooze_sync::SenderRule) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO sender_rules (email,category,tab,updated,removed) VALUES (lower(?1),?2,?3,?4,?5)
-             ON CONFLICT(email) DO UPDATE SET category=excluded.category, tab=excluded.tab, updated=excluded.updated, removed=excluded.removed
-             WHERE excluded.updated >= sender_rules.updated",
-            params![r.email.trim(), r.category, r.tab, r.updated, r.removed],
-        )?;
-        Ok(())
-    }
-
-    /// Every conversation rule, tombstones included, one per change (the
-    /// Message-IDs set together).
-    pub fn thread_rules(&self) -> Result<Vec<crate::snooze_sync::ThreadRule>> {
-        let mut st = self.conn.prepare("SELECT message_id, category, tab, updated, removed FROM thread_rules ORDER BY updated, message_id")?;
-        let rows: Vec<(String, u8, Option<String>, i64, bool)> =
-            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
-        let mut out: Vec<crate::snooze_sync::ThreadRule> = Vec::new();
-        for (id, category, tab, updated, removed) in rows {
-            match out.iter_mut().find(|o| o.updated == updated && o.category == category && o.tab == tab && o.removed == removed) {
-                Some(o) => o.ids.push(id),
-                None => out.push(crate::snooze_sync::ThreadRule { ids: vec![id], category, tab, updated, removed }),
-            }
-        }
-        Ok(out)
-    }
-
-    /// Store a conversation rule, for each Message-ID unless the one here is newer.
-    pub fn put_thread_rule(&self, r: &crate::snooze_sync::ThreadRule) -> Result<()> {
-        let mut st = self.conn.prepare_cached(
-            "INSERT INTO thread_rules (message_id,category,tab,updated,removed) VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(message_id) DO UPDATE SET category=excluded.category, tab=excluded.tab, updated=excluded.updated, removed=excluded.removed
-             WHERE excluded.updated >= thread_rules.updated",
-        )?;
-        for id in &r.ids {
-            st.execute(params![id, r.category, r.tab, r.updated, r.removed])?;
-        }
-        Ok(())
-    }
-
-    /// The category a conversation was put in by hand, if it was.
-    pub fn thread_rule(&self, account_id: AccountId, thread_key: &str) -> Result<Option<u8>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT CASE WHEN q.tab IS NULL THEN q.category ELSE (SELECT t.num FROM tabs t WHERE t.key = q.tab AND t.removed = 0) END
-                 FROM messages z JOIN thread_rules q ON q.message_id = z.message_id AND q.removed = 0
-                 WHERE z.account_id = ?1 AND z.thread_key = ?2 ORDER BY q.updated DESC LIMIT 1",
-                params![account_id, thread_key],
-                |r| r.get::<_, Option<u8>>(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    /// Your own tabs, in the order they were made: (category number, name).
-    pub fn tabs(&self) -> Result<Vec<(u8, String)>> {
-        let mut st = self.conn.prepare("SELECT num, name FROM tabs WHERE removed=0 ORDER BY created, key")?;
-        let v = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-        Ok(v)
-    }
-
-    /// Every tab, tombstones included.
-    pub fn all_tabs(&self) -> Result<Vec<crate::snooze_sync::Tab>> {
-        let mut st = self.conn.prepare("SELECT key, name, created, updated, removed FROM tabs ORDER BY key")?;
-        let v = st
-            .query_map([], |r| Ok(crate::snooze_sync::Tab { id: r.get(0)?, name: r.get(1)?, created: r.get(2)?, updated: r.get(3)?, removed: r.get(4)? }))?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(v)
-    }
-
-    /// Store a tab, unless the one here is newer. A new one gets the next
-    /// category number.
-    pub fn put_tab(&self, t: &crate::snooze_sync::Tab) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO tabs (key,num,name,created,updated,removed)
-               VALUES (?1, (SELECT MAX(COALESCE(MAX(num), 0) + 1, ?6) FROM tabs), ?2, ?3, ?4, ?5)
-             ON CONFLICT(key) DO UPDATE SET name=excluded.name, updated=excluded.updated, removed=excluded.removed
-             WHERE excluded.updated >= tabs.updated",
-            params![t.id, t.name, t.created, t.updated, t.removed, crate::category::FIRST_TAB],
-        )?;
-        Ok(())
-    }
-
-    /// A tab's key (the same on every machine) from its number here.
-    pub fn tab_key(&self, num: u8) -> Result<Option<String>> {
-        Ok(self.conn.query_row("SELECT key FROM tabs WHERE num=?1", [num], |r| r.get(0)).optional()?)
-    }
-
-    /// A category's name: "promotions", or one of your tabs ("Invoices").
-    pub fn category_name(&self, c: u8) -> String {
-        if !crate::category::is_tab(c) {
-            return crate::category::name(c).to_string();
-        }
-        self.conn.query_row("SELECT name FROM tabs WHERE num=?1", [c], |r| r.get(0)).unwrap_or_else(|_| "primary".into())
-    }
-
-    /// A category by name (any case) or number; your tabs included.
-    pub fn category_by_name(&self, name: &str) -> Option<u8> {
-        let name = name.trim();
-        if let Some(c) = crate::category::parse(name) {
-            return Some(c);
-        }
-        if let Ok(n) = name.parse::<u8>() {
-            return Some(n);
-        }
-        self.conn.query_row("SELECT num FROM tabs WHERE removed=0 AND lower(name)=lower(?1)", [name], |r| r.get(0)).optional().ok().flatten()
-    }
-
     // ----- snooze -----------------------------------------------------------
 
+    /// Snooze a conversation here until `until` (or move its wake time).
+    /// [`crate::snooze_sync::snooze_thread`] also records it on the server.
     pub fn snooze(&self, account_id: AccountId, thread_key: &str, until: DateTime<Utc>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO snoozes (account_id,thread_key,until) VALUES (?1,?2,?3)
@@ -1160,6 +1019,7 @@ impl Store {
         Ok(())
     }
 
+    /// Cancel a conversation's snooze here.
     pub fn unsnooze(&self, account_id: AccountId, thread_key: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM snoozes WHERE account_id=?1 AND thread_key=?2",
@@ -1168,6 +1028,7 @@ impl Store {
         Ok(())
     }
 
+    /// When a conversation wakes, if it's snoozed and not yet due.
     pub fn snoozed_until(&self, account_id: AccountId, thread_key: &str) -> Result<Option<DateTime<Utc>>> {
         let t: Option<i64> = self
             .conn
@@ -1294,113 +1155,6 @@ impl Store {
             }
         }
         Ok(None)
-    }
-
-    // ----- pins -------------------------------------------------------------
-
-    /// Pin a conversation to the top of every list it appears in (and
-    /// record it for the other machines).
-    pub fn pin(&self, account_id: AccountId, thread_key: &str) -> Result<()> {
-        self.set_pinned_here(account_id, thread_key, true)?;
-        self.mark_pin(account_id, thread_key, false)
-    }
-
-    pub fn unpin(&self, account_id: AccountId, thread_key: &str) -> Result<()> {
-        self.set_pinned_here(account_id, thread_key, false)?;
-        self.mark_pin(account_id, thread_key, true)
-    }
-
-    /// Pin or unpin on this machine only (applying a change made elsewhere).
-    pub(crate) fn set_pinned_here(&self, account_id: AccountId, thread_key: &str, pinned: bool) -> Result<()> {
-        if pinned {
-            self.conn.execute(
-                "INSERT OR IGNORE INTO pins (account_id,thread_key,pinned_at) VALUES (?1,?2,?3)",
-                params![account_id, thread_key, Utc::now().timestamp()],
-            )?;
-        } else {
-            self.conn.execute("DELETE FROM pins WHERE account_id=?1 AND thread_key=?2", params![account_id, thread_key])?;
-        }
-        Ok(())
-    }
-
-    fn thread_message_ids(&self, account_id: AccountId, thread_key: &str) -> Result<Vec<String>> {
-        let mut st = self.conn.prepare_cached("SELECT DISTINCT message_id FROM messages WHERE account_id=?1 AND thread_key=?2 AND message_id<>'' ORDER BY message_id")?;
-        let v = st.query_map(params![account_id, thread_key], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        Ok(v)
-    }
-
-    /// Record a pin (or, `removed`, an unpin) of a conversation, timed after
-    /// any earlier change to it so an undo straight after still wins.
-    fn mark_pin(&self, account_id: AccountId, thread_key: &str, removed: bool) -> Result<()> {
-        let ids = self.thread_message_ids(account_id, thread_key)?;
-        let mut prev: Option<i64> = None;
-        for id in &ids {
-            let u: Option<i64> =
-                self.conn.query_row("SELECT updated FROM pin_marks WHERE account_id=?1 AND message_id=?2", params![account_id, id], |r| r.get(0)).optional()?;
-            prev = prev.max(u);
-        }
-        let now = Utc::now().timestamp();
-        let updated = prev.map_or(now, |p| now.max(p + 1));
-        self.put_pin_mark(account_id, &crate::snooze_sync::Pin { ids, updated, removed })
-    }
-
-    /// Every pin and unpin recorded for an account, one per change.
-    pub fn pin_marks(&self, account_id: AccountId) -> Result<Vec<crate::snooze_sync::Pin>> {
-        let mut st = self.conn.prepare("SELECT message_id, updated, removed FROM pin_marks WHERE account_id=?1 ORDER BY updated, message_id")?;
-        let rows: Vec<(String, i64, bool)> = st.query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
-        let mut out: Vec<crate::snooze_sync::Pin> = Vec::new();
-        for (id, updated, removed) in rows {
-            match out.iter_mut().find(|o| o.updated == updated && o.removed == removed) {
-                Some(o) => o.ids.push(id),
-                None => out.push(crate::snooze_sync::Pin { ids: vec![id], updated, removed }),
-            }
-        }
-        Ok(out)
-    }
-
-    /// Store a pin or unpin, for each Message-ID unless the one here is newer.
-    pub fn put_pin_mark(&self, account_id: AccountId, p: &crate::snooze_sync::Pin) -> Result<()> {
-        let mut st = self.conn.prepare_cached(
-            "INSERT INTO pin_marks (account_id,message_id,updated,removed) VALUES (?1,?2,?3,?4)
-             ON CONFLICT(account_id,message_id) DO UPDATE SET updated=excluded.updated, removed=excluded.removed
-             WHERE excluded.updated >= pin_marks.updated",
-        )?;
-        for id in &p.ids {
-            st.execute(params![account_id, id, p.updated, p.removed])?;
-        }
-        Ok(())
-    }
-
-    /// Pins made before pins were synced have no record: give them one,
-    /// dated when they were pinned.
-    pub fn backfill_pin_marks(&self, account_id: AccountId) -> Result<()> {
-        let mut st = self.conn.prepare("SELECT thread_key, pinned_at FROM pins WHERE account_id=?1")?;
-        let pinned: Vec<(String, i64)> = st.query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-        for (key, at) in pinned {
-            let ids = self.thread_message_ids(account_id, &key)?;
-            let mut known = false;
-            for id in &ids {
-                known |= self.conn.query_row("SELECT 1 FROM pin_marks WHERE account_id=?1 AND message_id=?2", params![account_id, id], |_| Ok(())).optional()?.is_some();
-            }
-            if !known && !ids.is_empty() {
-                self.put_pin_mark(account_id, &crate::snooze_sync::Pin { ids, updated: at, removed: false })?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn is_pinned(&self, account_id: AccountId, thread_key: &str) -> Result<bool> {
-        Ok(self
-            .conn
-            .query_row("SELECT 1 FROM pins WHERE account_id=?1 AND thread_key=?2", params![account_id, thread_key], |_| Ok(()))
-            .optional()?
-            .is_some())
-    }
-
-    fn pin_set(&self) -> Result<std::collections::HashSet<(AccountId, String)>> {
-        let mut st = self.conn.prepare("SELECT account_id, thread_key FROM pins")?;
-        let v = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-        Ok(v)
     }
 
     // ----- contacts ---------------------------------------------------------

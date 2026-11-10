@@ -9,3 +9,7 @@
 /*.rtf
 /*.eml
 /*.txt
+
+# Tim's own reference material and artwork, kept out of the repository.
+/zzz Misc from Timbo/
+/Artwork/

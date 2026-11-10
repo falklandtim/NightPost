@@ -30,7 +30,9 @@ pub enum ViewEvent {
     ReplyAll,
     Forward,
     /// A key pressed while the page had focus, for the app's shortcuts:
-    /// (key, ⌘ held).
+    /// (key, ⌘ held). Only the Mac's web view sends it: on Linux the page is
+    /// a picture inside egui, so keys reach the app directly.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Key(String, bool),
 }
 

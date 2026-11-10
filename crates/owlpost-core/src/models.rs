@@ -3,10 +3,15 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// An account's row id in the local database (not shared between machines).
 pub type AccountId = i64;
+/// A folder's row id in the local database.
 pub type FolderId = i64;
+/// A message's row id in the local database. One email in two Gmail
+/// labels is two messages here, one per folder.
 pub type MessageId = i64;
 
+/// How a connection to a mail server is encrypted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Security {
     /// Implicit TLS (IMAPS 993 / SMTPS 465).
@@ -29,12 +34,14 @@ pub enum Auth {
 }
 
 impl Auth {
+    /// How it's stored in the database.
     pub fn as_str(self) -> &'static str {
         match self {
             Auth::Password => "password",
             Auth::Google => "google",
         }
     }
+    /// The inverse of [`Auth::as_str`]; anything unknown is a password.
     pub fn parse(s: &str) -> Self {
         match s {
             "google" => Auth::Google,
@@ -44,6 +51,7 @@ impl Auth {
 }
 
 impl Security {
+    /// How it's stored in the database.
     pub fn as_str(self) -> &'static str {
         match self {
             Security::Tls => "tls",
@@ -51,6 +59,7 @@ impl Security {
             Security::None => "none",
         }
     }
+    /// The inverse of [`Security::as_str`]; anything unknown is TLS, the safe choice.
     pub fn parse(s: &str) -> Self {
         match s {
             "starttls" => Security::StartTls,
@@ -58,6 +67,7 @@ impl Security {
             _ => Security::Tls,
         }
     }
+    /// The name shown in account settings.
     pub fn label(self) -> &'static str {
         match self {
             Security::Tls => "SSL/TLS",
@@ -67,6 +77,7 @@ impl Security {
     }
 }
 
+/// Where an IMAP or SMTP server is and how to reach it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub host: String,
@@ -74,9 +85,12 @@ pub struct ServerConfig {
     pub security: Security,
 }
 
+/// A mail account. Its password or Google sign-in is in the system
+/// keychain ([`crate::credentials`]), never here or in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: AccountId,
+    /// The name on outgoing mail ("Tim Morrison").
     pub display_name: String,
     pub email: String,
     /// Login username (usually the email address).
@@ -90,6 +104,7 @@ pub struct Account {
     pub signature: String,
     /// Demo accounts are seeded locally and never touch the network.
     pub demo: bool,
+    /// How it signs in. Missing in older saved data, so it defaults to a password.
     #[serde(default)]
     pub auth: Auth,
 }
@@ -103,7 +118,7 @@ impl Account {
     }
 }
 
-/// A named, plain-text signature. Each account can pick one as its default.
+/// A named signature, in plain text or HTML. Each account can pick one as its default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Signature {
     pub id: i64,
@@ -141,6 +156,7 @@ pub enum FolderRole {
 }
 
 impl FolderRole {
+    /// How it's stored in the database.
     pub fn as_str(self) -> &'static str {
         match self {
             FolderRole::Inbox => "inbox",
@@ -154,6 +170,7 @@ impl FolderRole {
             FolderRole::Other => "other",
         }
     }
+    /// The inverse of [`FolderRole::as_str`]; anything unknown is `Other`.
     pub fn parse(s: &str) -> Self {
         match s {
             "inbox" => FolderRole::Inbox,
@@ -167,6 +184,7 @@ impl FolderRole {
             _ => FolderRole::Other,
         }
     }
+    /// The name shown in the sidebar and menus.
     pub fn label(self) -> &'static str {
         match self {
             FolderRole::Inbox => "Inbox",
@@ -180,6 +198,8 @@ impl FolderRole {
             FolderRole::Other => "Folder",
         }
     }
+    /// An emoji for the role, for text-only places such as the Move picker.
+    /// The sidebar draws its own line icons.
     pub fn icon(self) -> &'static str {
         match self {
             FolderRole::Inbox => "📥",
@@ -265,6 +285,7 @@ pub fn folder_parent(path: &str) -> Option<String> {
     (segs.len() > 1).then(|| segs[..segs.len() - 1].join(if path.contains('/') { "/" } else { "." }))
 }
 
+/// A folder (or Gmail label) on an account's server, as last synced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Folder {
     pub id: FolderId,
@@ -274,11 +295,16 @@ pub struct Folder {
     /// Human friendly name (last path segment).
     pub name: String,
     pub role: FolderRole,
+    /// The server's UIDVALIDITY: when it changes, every UID we hold for the
+    /// folder is stale and the folder is downloaded again.
     pub uid_validity: u32,
+    /// The highest UID downloaded so far; the next sync fetches above it.
     pub last_uid: u32,
+    /// Unread messages, counted locally.
     pub unread: i64,
 }
 
+/// A person in an address field: a name (may be empty) and an address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Contact {
     pub name: String,
@@ -286,6 +312,7 @@ pub struct Contact {
 }
 
 impl Contact {
+    /// A contact from a name (empty if unknown) and an address.
     pub fn new(name: impl Into<String>, email: impl Into<String>) -> Self {
         Self { name: name.into(), email: email.into() }
     }
@@ -296,6 +323,7 @@ impl Contact {
         }
         self.email.split('@').next().unwrap_or(&self.email).to_string()
     }
+    /// The name if known, otherwise the whole address.
     pub fn display(&self) -> String {
         if self.name.trim().is_empty() {
             self.email.clone()
@@ -303,6 +331,7 @@ impl Contact {
             self.name.trim().to_string()
         }
     }
+    /// As written in a To/Cc header: `"Name" <address>`, or the bare address.
     pub fn to_header(&self) -> String {
         if self.name.trim().is_empty() {
             self.email.clone()
@@ -351,15 +380,19 @@ impl Contact {
         }
         Some(Contact { name: String::new(), email: s.trim_matches('"').to_string() })
     }
+    /// A list as one header value, comma separated.
     pub fn join(list: &[Contact]) -> String {
         list.iter().map(|c| c.to_header()).collect::<Vec<_>>().join(", ")
     }
 }
 
+/// A received attachment's name, type and size. Sync keeps only these; the
+/// file is fetched from the server when first opened.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attachment {
     pub filename: String,
     pub mime_type: String,
+    /// In bytes.
     pub size: usize,
 }
 

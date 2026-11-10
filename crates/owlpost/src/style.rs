@@ -236,7 +236,7 @@ pub fn line(
     w
 }
 
-/// [`line`] drawn twice, half a point apart: egui's bundled font has no bold.
+/// [`line()`] drawn twice, half a point apart: egui's bundled font has no bold.
 pub fn bold_line(painter: &egui::Painter, pos: egui::Pos2, text: &str, font: egui::FontId, color: Color32, max_width: f32) -> f32 {
     line(painter, pos + egui::vec2(0.5, 0.0), text, font.clone(), color, max_width - 0.5);
     line(painter, pos, text, font, color, max_width - 0.5) + 0.5

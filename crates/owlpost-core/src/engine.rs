@@ -613,6 +613,9 @@ pub fn delete_folder(store: &Store, account: &Account, folder: &Folder) -> Resul
     store.delete_folder(folder.id)
 }
 
+/// A message copied off a server: its raw bytes, flags and arrival date.
+type Downloaded = (Vec<u8>, Vec<imap::types::Flag<'static>>, Option<chrono::DateTime<chrono::FixedOffset>>);
+
 /// Move a conversation into a folder of another account. Each message is
 /// copied across (keeping its date, and whether it's read or starred), then
 /// the originals go to the first account's Trash, so if anything fails part
@@ -654,7 +657,7 @@ pub fn move_thread_across(store: &Store, from: &Account, thread_key: &str, viewe
         return Ok(picked.len());
     }
     // Download them all before writing anything.
-    let mut raws: Vec<(Vec<u8>, Vec<imap::types::Flag<'static>>, Option<chrono::DateTime<chrono::FixedOffset>>)> = Vec::new();
+    let mut raws: Vec<Downloaded> = Vec::new();
     let mut s = connect(from)?;
     let mut by_folder: BTreeMap<FolderId, Vec<&Message>> = BTreeMap::new();
     for m in &picked {

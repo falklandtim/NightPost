@@ -11,7 +11,7 @@
 //! Every change reads the state, merges it (the newer change to a
 //! conversation wins), appends the new state and deletes the old copies.
 //! Two machines writing at once just leave two copies, merged next time.
-//! Cancelled snoozes stay as tombstones for [`TOMBSTONE_DAYS`] so a machine
+//! Cancelled snoozes stay as tombstones for `TOMBSTONE_DAYS` (30) so a machine
 //! that was offline doesn't bring them back.
 //!
 //! It also carries pins ([`Pin`]), by Message-ID, the newer pin or unpin

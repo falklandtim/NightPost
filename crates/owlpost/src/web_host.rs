@@ -26,10 +26,14 @@ pub enum HostEvent {
 
 /// What a new window looks like.
 pub struct WindowSpec {
+    /// The window's title bar text.
     pub title: String,
+    /// Size in points (logical pixels).
     pub width: f64,
     pub height: f64,
+    /// The whole page, loaded as is.
     pub html: String,
+    /// Shown behind the page while it loads, so a dark theme doesn't flash white.
     pub background: (u8, u8, u8),
 }
 
@@ -54,6 +58,8 @@ pub fn available() -> bool {
     imp::available()
 }
 
+/// Open a new window, hidden until [`show`]. `id` is the caller's: events
+/// from the window carry it, and the other calls take it.
 pub fn open(id: u64, spec: WindowSpec) -> anyhow::Result<()> {
     imp::open(id, spec)
 }
@@ -63,14 +69,17 @@ pub fn eval(id: u64, js: &str) {
     imp::eval(id, js.to_string())
 }
 
+/// Change a window's title (the composer shows its subject).
 pub fn set_title(id: u64, title: &str) {
     imp::set_title(id, title.to_string())
 }
 
+/// Show a window and bring it to the front.
 pub fn show(id: u64) {
     imp::show(id)
 }
 
+/// Hide a window without closing it (its page keeps its state).
 pub fn hide(id: u64) {
     imp::hide(id)
 }
@@ -110,11 +119,13 @@ mod events {
     static QUEUE: Mutex<Vec<HostEvent>> = Mutex::new(Vec::new());
     static CTX: OnceLock<egui::Context> = OnceLock::new();
 
-    pub fn set_ctx(ctx: &egui::Context) {
+    /// Remember egui's context, so new events can wake the UI.
+    pub(super) fn set_ctx(ctx: &egui::Context) {
         let _ = CTX.set(ctx.clone());
     }
 
-    pub fn push(e: HostEvent) {
+    /// Queue an event (from any thread) and ask egui to repaint.
+    pub(super) fn push(e: HostEvent) {
         if let Ok(mut q) = QUEUE.lock() {
             q.push(e);
         }
@@ -123,7 +134,8 @@ mod events {
         }
     }
 
-    pub fn take() -> Vec<HostEvent> {
+    /// Everything queued since the last call.
+    pub(super) fn take() -> Vec<HostEvent> {
         QUEUE.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
     }
 }
@@ -165,7 +177,7 @@ mod imp {
         }
     }
 
-    pub fn init(ctx: &egui::Context) -> bool {
+    pub(super) fn init(ctx: &egui::Context) -> bool {
         if MainThreadMarker::new().is_none() {
             return false;
         }
@@ -175,11 +187,11 @@ mod imp {
         true
     }
 
-    pub fn available() -> bool {
+    pub(super) fn available() -> bool {
         READY.get()
     }
 
-    pub fn open(id: u64, spec: WindowSpec) -> anyhow::Result<()> {
+    pub(super) fn open(id: u64, spec: WindowSpec) -> anyhow::Result<()> {
         let mtm = MainThreadMarker::new().ok_or_else(|| anyhow::anyhow!("not on the main thread"))?;
         let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable;
         let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(spec.width, spec.height));
@@ -211,38 +223,38 @@ mod imp {
         })
     }
 
-    pub fn eval(id: u64, js: String) {
+    pub(super) fn eval(id: u64, js: String) {
         with(id, |w| {
             let _ = w.webview.evaluate_script(&js);
         })
     }
 
-    pub fn set_title(id: u64, title: String) {
+    pub(super) fn set_title(id: u64, title: String) {
         with(id, |w| w.window.setTitle(&NSString::from_str(&title)))
     }
 
-    pub fn show(id: u64) {
+    pub(super) fn show(id: u64) {
         with(id, |w| {
             w.hidden = false;
             w.window.makeKeyAndOrderFront(None);
         })
     }
 
-    pub fn hide(id: u64) {
+    pub(super) fn hide(id: u64) {
         with(id, |w| {
             w.hidden = true;
             w.window.orderOut(None);
         })
     }
 
-    pub fn close(id: u64) {
+    pub(super) fn close(id: u64) {
         if let Some(w) = WINS.with(|w| w.borrow_mut().remove(&id)) {
             w.window.orderOut(None);
             w.window.close();
         }
     }
 
-    pub fn poll() -> Vec<HostEvent> {
+    pub(super) fn poll() -> Vec<HostEvent> {
         let mut out = events::take();
         // The close button hides the window (it's kept): report it.
         WINS.with(|w| {
@@ -267,7 +279,7 @@ mod edit_menu {
     use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
     use objc2_foundation::NSString;
 
-    pub fn install() {
+    pub(super) fn install() {
         let Some(mtm) = MainThreadMarker::new() else { return };
         let app = NSApplication::sharedApplication(mtm);
         let main = match app.mainMenu() {
@@ -326,7 +338,7 @@ mod imp {
         static WINS: RefCell<HashMap<u64, Win>> = RefCell::new(HashMap::new());
     }
 
-    pub fn init(ctx: &egui::Context) -> bool {
+    pub(super) fn init(ctx: &egui::Context) -> bool {
         if READY.load(Ordering::SeqCst) {
             return true;
         }
@@ -350,7 +362,7 @@ mod imp {
         ok
     }
 
-    pub fn available() -> bool {
+    pub(super) fn available() -> bool {
         READY.load(Ordering::SeqCst)
     }
 
@@ -359,7 +371,7 @@ mod imp {
         gtk::glib::MainContext::default().invoke(f);
     }
 
-    pub fn open(id: u64, spec: WindowSpec) -> anyhow::Result<()> {
+    pub(super) fn open(id: u64, spec: WindowSpec) -> anyhow::Result<()> {
         if !available() {
             anyhow::bail!("GTK isn't running");
         }
@@ -427,17 +439,17 @@ mod imp {
         });
     }
 
-    pub fn eval(id: u64, js: String) {
+    pub(super) fn eval(id: u64, js: String) {
         with(id, move |w| {
             let _ = w.webview.evaluate_script(&js);
         })
     }
 
-    pub fn set_title(id: u64, title: String) {
+    pub(super) fn set_title(id: u64, title: String) {
         with(id, move |w| w.window.set_title(&title))
     }
 
-    pub fn show(id: u64) {
+    pub(super) fn show(id: u64) {
         let token = super::activation::token();
         with(id, move |w| {
             w.window.show_all();
@@ -449,11 +461,11 @@ mod imp {
         })
     }
 
-    pub fn hide(id: u64) {
+    pub(super) fn hide(id: u64) {
         with(id, |w| w.window.hide())
     }
 
-    pub fn close(id: u64) {
+    pub(super) fn close(id: u64) {
         on_gtk(move || {
             if let Some(w) = WINS.with(|w| w.borrow_mut().remove(&id)) {
                 drop(w.webview);
@@ -463,7 +475,7 @@ mod imp {
         });
     }
 
-    pub fn poll() -> Vec<HostEvent> {
+    pub(super) fn poll() -> Vec<HostEvent> {
         events::take()
     }
 }
@@ -484,7 +496,7 @@ mod activation {
     /// The main window's wl_display and wl_surface.
     static MAIN: Mutex<Option<(usize, usize)>> = Mutex::new(None);
 
-    pub fn remember(window: &(impl HasWindowHandle + HasDisplayHandle)) {
+    pub(super) fn remember(window: &(impl HasWindowHandle + HasDisplayHandle)) {
         let (Ok(w), Ok(d)) = (window.window_handle(), window.display_handle()) else { return };
         if let (RawWindowHandle::Wayland(w), RawDisplayHandle::Wayland(d)) = (w.as_raw(), d.as_raw()) {
             if let Ok(mut m) = MAIN.lock() {
@@ -518,7 +530,7 @@ mod activation {
 
     /// On the GTK thread: activate a shown GTK window with `token`, using
     /// GTK's own Wayland connection. Does nothing under X11.
-    pub fn activate_gtk(window: &gtk::Window, token: &str) {
+    pub(super) fn activate_gtk(window: &gtk::Window, token: &str) {
         use gtk::glib::translate::ToGlibPtr;
         use gtk::prelude::*;
         let Some(gdk_window) = window.window() else { return };
@@ -540,6 +552,7 @@ mod activation {
             let (globals, mut queue) = registry_queue_init::<State>(&conn).ok()?;
             let qh = queue.handle();
             let activation: xdg_activation_v1::XdgActivationV1 = globals.bind(&qh, 1..=1, ()).ok()?;
+            // SAFETY: `wl_surface` is the window's live surface (non-null, checked above).
             let id = unsafe { wayland_backend::sys::client::ObjectId::from_ptr(WlSurface::interface(), wl_surface.cast()) }.ok()?;
             let surface = WlSurface::from_id(&conn, id).ok()?;
             activation.activate(token.to_string(), &surface);
@@ -551,7 +564,7 @@ mod activation {
     }
 
     /// A fresh token, or None (not Wayland, or the compositor said no).
-    pub fn token() -> Option<String> {
+    pub(super) fn token() -> Option<String> {
         let (display, surface) = (*MAIN.lock().ok()?)?;
         // SAFETY: winit's display and surface live as long as the main window,
         // which outlives every composer; this only adds a queue of our own.
@@ -587,21 +600,21 @@ mod imp {
     use super::{HostEvent, WindowSpec};
     use eframe::egui;
 
-    pub fn init(_ctx: &egui::Context) -> bool {
+    pub(super) fn init(_ctx: &egui::Context) -> bool {
         false
     }
-    pub fn available() -> bool {
+    pub(super) fn available() -> bool {
         false
     }
-    pub fn open(_id: u64, _spec: WindowSpec) -> anyhow::Result<()> {
+    pub(super) fn open(_id: u64, _spec: WindowSpec) -> anyhow::Result<()> {
         anyhow::bail!("web windows aren't available on this system")
     }
-    pub fn eval(_id: u64, _js: String) {}
-    pub fn set_title(_id: u64, _title: String) {}
-    pub fn show(_id: u64) {}
-    pub fn hide(_id: u64) {}
-    pub fn close(_id: u64) {}
-    pub fn poll() -> Vec<HostEvent> {
+    pub(super) fn eval(_id: u64, _js: String) {}
+    pub(super) fn set_title(_id: u64, _title: String) {}
+    pub(super) fn show(_id: u64) {}
+    pub(super) fn hide(_id: u64) {}
+    pub(super) fn close(_id: u64) {}
+    pub(super) fn poll() -> Vec<HostEvent> {
         vec![]
     }
 }

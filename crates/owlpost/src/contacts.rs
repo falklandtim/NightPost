@@ -54,6 +54,9 @@ mod imp {
 
     fn allowed() -> bool {
         static ALLOWED: OnceLock<bool> = OnceLock::new();
+        // SAFETY: Contacts framework calls with valid, retained arguments. The
+        // framework copies the completion block, which owns its sender, so it
+        // stays valid even if the answer comes after we stop waiting.
         *ALLOWED.get_or_init(|| unsafe {
             if NSBundle::mainBundle().objectForInfoDictionaryKey(ns_string!("NSContactsUsageDescription")).is_none() {
                 return false;
@@ -76,6 +79,8 @@ mod imp {
         if !allowed() {
             return None;
         }
+        // SAFETY: the predicate, key array and store are retained objects that
+        // live to the end of the block; the returned data is copied out.
         unsafe {
             let store = CNContactStore::new();
             let predicate = CNContact::predicateForContactsMatchingEmailAddress(&NSString::from_str(email));
@@ -92,6 +97,9 @@ mod imp {
             return Vec::new();
         }
         let out = std::cell::RefCell::new(Vec::new());
+        // SAFETY: the enumeration block runs synchronously, before this
+        // function returns, so the `out` it borrows is still alive; each
+        // `CNContact` pointer it gets is valid for the call.
         unsafe {
             let keys: [&ProtocolObject<dyn CNKeyDescriptor>; 4] = [
                 ProtocolObject::from_ref(CNContactGivenNameKey),
