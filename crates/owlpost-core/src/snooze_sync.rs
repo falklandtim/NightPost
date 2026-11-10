@@ -14,6 +14,9 @@
 //! Cancelled snoozes stay as tombstones for [`TOMBSTONE_DAYS`] so a machine
 //! that was offline doesn't bring them back.
 //!
+//! It also carries pins ([`Pin`]), by Message-ID, the newer pin or unpin
+//! of a conversation winning.
+//!
 //! The same state carries the inbox tabs: your own tabs ([`Tab`]), sender
 //! rules ([`SenderRule`]) and conversation rules ([`ThreadRule`]), merged
 //! the same way: the newer change to a tab, address or conversation wins.
@@ -153,6 +156,43 @@ pub fn merge_thread_rules(docs: impl IntoIterator<Item = ThreadRule>, now: i64) 
     out
 }
 
+/// A pinned conversation (a tombstone when `removed`: unpinned).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pin {
+    /// Message-IDs in the conversation; any one identifies it.
+    pub ids: Vec<String>,
+    /// When it was pinned or unpinned (Unix seconds); the newer change wins.
+    pub updated: i64,
+    #[serde(default)]
+    pub removed: bool,
+}
+
+/// Merge pins: per conversation the newest change wins (and the
+/// Message-IDs are pooled); old tombstones go.
+pub fn merge_pins(docs: impl IntoIterator<Item = Pin>, now: i64) -> Vec<Pin> {
+    let mut docs: Vec<Pin> = docs.into_iter().collect();
+    docs.sort_by_key(|p| std::cmp::Reverse(p.updated));
+    let mut out: Vec<Pin> = Vec::new();
+    for p in docs {
+        match out.iter_mut().find(|o| o.ids.iter().any(|i| p.ids.contains(i))) {
+            Some(o) => {
+                for id in p.ids {
+                    if !o.ids.contains(&id) {
+                        o.ids.push(id);
+                    }
+                }
+            }
+            None => out.push(p),
+        }
+    }
+    out.retain(|p| !(p.removed && p.updated < now - TOMBSTONE_DAYS * 86_400));
+    for p in &mut out {
+        p.ids.sort();
+    }
+    out.sort_by(|a, b| (a.updated, &a.ids).cmp(&(b.updated, &b.ids)));
+    out
+}
+
 /// Merge tabs: per tab the newest change wins; old tombstones go.
 pub fn merge_tabs(docs: impl IntoIterator<Item = Tab>, now: i64) -> Vec<Tab> {
     let mut out: Vec<Tab> = Vec::new();
@@ -183,6 +223,9 @@ pub struct State {
     /// Conversations put in a tab by hand.
     #[serde(default)]
     pub threads: Vec<ThreadRule>,
+    /// Pinned conversations.
+    #[serde(default)]
+    pub pins: Vec<Pin>,
 }
 
 impl State {
@@ -190,12 +233,13 @@ impl State {
     /// (and their Message-IDs are pooled). Old tombstones are dropped.
     pub fn merge(docs: impl IntoIterator<Item = State>, now: i64) -> State {
         let mut out: Vec<Entry> = Vec::new();
-        let (mut senders, mut tabs, mut threads) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut senders, mut tabs, mut threads, mut pins) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let docs: Vec<State> = docs.into_iter().collect();
         for d in &docs {
             senders.extend(d.senders.iter().cloned());
             tabs.extend(d.tabs.iter().cloned());
             threads.extend(d.threads.iter().cloned());
+            pins.extend(d.pins.iter().cloned());
         }
         for e in docs.into_iter().flat_map(|d| d.entries) {
             match out.iter_mut().find(|o| o.same_conversation(&e.ids)) {
@@ -214,7 +258,14 @@ impl State {
         }
         out.retain(|e| !(e.removed && e.updated < now - TOMBSTONE_DAYS * 86_400));
         out.sort_by_key(|e| (e.removed, e.until));
-        State { version: 1, entries: out, senders: merge_rules(senders, now), tabs: merge_tabs(tabs, now), threads: merge_thread_rules(threads, now) }
+        State {
+            version: 1,
+            entries: out,
+            senders: merge_rules(senders, now),
+            tabs: merge_tabs(tabs, now),
+            threads: merge_thread_rules(threads, now),
+            pins: merge_pins(pins, now),
+        }
     }
 
     /// Snooze (`Some(until)`) or cancel (`None`) a conversation.
@@ -562,8 +613,9 @@ pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
     for r in &threads {
         store.put_thread_rule(r)?;
     }
-    let rules_changed = rules != state.senders || tabs != state.tabs || threads != merge_thread_rules(state.threads.clone(), now);
-    (state.senders, state.tabs, state.threads) = (rules, tabs, threads);
+    let (pins, pins_changed) = pool_pins(store, account.id, &state.pins, now)?;
+    let rules_changed = rules != state.senders || tabs != state.tabs || threads != merge_thread_rules(state.threads.clone(), now) || pins_changed;
+    (state.senders, state.tabs, state.threads, state.pins) = (rules, tabs, threads, pins);
     // Never snoozed anywhere: nothing else to do.
     if local.snoozes.is_empty() && local.parked.is_empty() && state.entries.iter().all(|e| e.removed) {
         if rules_changed {
@@ -627,6 +679,47 @@ pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
         engine::set_thread_unread(store, account, &key, true)?;
     }
     Ok(p.wake.len())
+}
+
+/// Pool this machine's pins with the server's, keep the result here and
+/// pin or unpin to match. Returns the pooled pins and whether the server
+/// is missing any of it.
+fn pool_pins(store: &Store, account_id: AccountId, server: &[Pin], now: i64) -> Result<(Vec<Pin>, bool)> {
+    store.backfill_pin_marks(account_id)?;
+    let pins = merge_pins(server.iter().cloned().chain(store.pin_marks(account_id)?), now);
+    for p in &pins {
+        store.put_pin_mark(account_id, p)?;
+    }
+    // Oldest first, so the newest change to a conversation is the one kept.
+    let mut want: HashMap<String, bool> = HashMap::new();
+    for p in &pins {
+        if let Some(k) = store.thread_key_for_ids(account_id, &p.ids)? {
+            want.insert(k, !p.removed);
+        }
+    }
+    for (k, pinned) in want {
+        if store.is_pinned(account_id, &k)? != pinned {
+            store.set_pinned_here(account_id, &k, pinned)?;
+        }
+    }
+    let changed = pins != merge_pins(server.iter().cloned(), now);
+    Ok((pins, changed))
+}
+
+/// Save this machine's pins and unpins to the server, at once rather than
+/// at the next sync.
+pub fn push_pins(store: &Store, account: &Account) -> Result<()> {
+    if account.demo {
+        return Ok(());
+    }
+    let (old, mut state) = read_state(account)?;
+    let now = Utc::now().timestamp();
+    let (pins, changed) = pool_pins(store, account.id, &state.pins, now)?;
+    if changed {
+        state.pins = pins;
+        write_state(store, account, &old, &State::merge([state], now))?;
+    }
+    Ok(())
 }
 
 /// How a category is written in the state: a built-in one by number,
@@ -802,8 +895,8 @@ mod tests {
 
     #[test]
     fn newer_change_wins_and_ids_pool() {
-        let a = State { version: 1, entries: vec![entry(&["a"], NOW + 100, NOW - 50, false)], senders: vec![], tabs: vec![], threads: vec![] };
-        let b = State { version: 1, entries: vec![entry(&["a", "b"], 0, NOW - 10, true), entry(&["c"], NOW + 5, NOW - 5, false)], senders: vec![], tabs: vec![], threads: vec![] };
+        let a = State { version: 1, entries: vec![entry(&["a"], NOW + 100, NOW - 50, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
+        let b = State { version: 1, entries: vec![entry(&["a", "b"], 0, NOW - 10, true), entry(&["c"], NOW + 5, NOW - 5, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
         let m = State::merge([a.clone(), b.clone()], NOW);
         assert_eq!(m.entries.len(), 2);
         let first = m.entries.iter().find(|e| e.ids.contains(&"a".into())).unwrap();
@@ -821,7 +914,7 @@ mod tests {
         let m = State::merge([a, b.clone()], NOW);
         assert_eq!(m.senders, vec![r("li@linkedin.com", 2, NOW - 5, false), r("shop@x.com", 0, NOW - 10, true)]);
         // A state without rules (an older OwlPost's) still reads.
-        let raw = State { version: 1, entries: vec![], senders: vec![], tabs: vec![], threads: vec![] }.to_message(DateTime::from_timestamp(NOW, 0).unwrap());
+        let raw = State { version: 1, entries: vec![], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] }.to_message(DateTime::from_timestamp(NOW, 0).unwrap());
         assert_eq!(State::from_message(&raw).unwrap().senders, vec![]);
         let back = State::from_message(&b.to_message(DateTime::from_timestamp(NOW, 0).unwrap())).unwrap();
         assert_eq!(back.senders, b.senders);
@@ -847,14 +940,63 @@ mod tests {
     }
 
     #[test]
+    fn pins_merge_newest_wins() {
+        let pin = |i: &[&str], at: i64, removed: bool| Pin { ids: ids(i), updated: at, removed };
+        let a = State { pins: vec![pin(&["m1"], NOW - 50, false), pin(&["m5"], NOW - 40 * 86_400, true)], ..Default::default() };
+        let b = State { pins: vec![pin(&["m2", "m1"], NOW - 10, true), pin(&["m9"], NOW - 30, false)], ..Default::default() };
+        let m = State::merge([a.clone(), b.clone()], NOW);
+        // The later unpin wins, the IDs are pooled, the old tombstone goes.
+        assert_eq!(m.pins, vec![pin(&["m9"], NOW - 30, false), pin(&["m1", "m2"], NOW - 10, true)]);
+        assert_eq!(State::merge([b, a], NOW), m);
+        assert_eq!(State::merge([m.clone()], NOW), m);
+        // Through an email and back.
+        assert_eq!(State::from_message(&m.to_message(DateTime::from_timestamp(NOW, 0).unwrap())).unwrap().pins, m.pins);
+    }
+
+    #[test]
+    fn pins_follow_you_between_machines() {
+        let machine = |name: &str| {
+            let s = Store::open(&crate::test_db_path(name)).unwrap();
+            crate::demo::seed(&s).unwrap();
+            s
+        };
+        let (mac, laptop) = (machine("pins-mac"), machine("pins-laptop"));
+        let inbox = |s: &Store| s.threads(&MailboxView::Unified(FolderRole::Inbox), "", 100).unwrap();
+        let t = inbox(&mac).into_iter().last().unwrap();
+        let ids = thread_ids(&mac, &mac.account(t.account_id).unwrap().unwrap(), &t.thread_key).unwrap();
+        let same = |s: &Store| s.thread_key_for_ids(t.account_id, &ids).unwrap().unwrap();
+        let now = Utc::now().timestamp();
+
+        // A pin made before pins were synced is uploaded.
+        mac.set_pinned_here(t.account_id, &t.thread_key, true).unwrap();
+        let (server, changed) = pool_pins(&mac, t.account_id, &[], now).unwrap();
+        assert!(changed && server.len() == 1 && !server[0].removed);
+        // The laptop picks it up, and has nothing new to say.
+        let (back, changed) = pool_pins(&laptop, t.account_id, &server, now).unwrap();
+        assert!(laptop.is_pinned(t.account_id, &same(&laptop)).unwrap());
+        assert!(!changed && back == server);
+        assert!(inbox(&laptop)[0].pinned);
+
+        // Unpinned on the laptop (even in the same second): the Mac follows.
+        laptop.unpin(t.account_id, &same(&laptop)).unwrap();
+        let (server, changed) = pool_pins(&laptop, t.account_id, &server, now).unwrap();
+        assert!(changed && server[0].removed);
+        pool_pins(&mac, t.account_id, &server, now).unwrap();
+        assert!(!mac.is_pinned(t.account_id, &t.thread_key).unwrap());
+        // And the Mac's old pin doesn't come back on its next sync.
+        let (again, changed) = pool_pins(&mac, t.account_id, &server, now).unwrap();
+        assert!(!changed && again == server);
+    }
+
+    #[test]
     fn old_tombstones_are_dropped() {
-        let s = State { version: 1, entries: vec![entry(&["a"], 0, NOW - 31 * 86_400, true), entry(&["b"], 0, NOW - 86_400, true)], senders: vec![], tabs: vec![], threads: vec![] };
+        let s = State { version: 1, entries: vec![entry(&["a"], 0, NOW - 31 * 86_400, true), entry(&["b"], 0, NOW - 86_400, true)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
         assert_eq!(State::merge([s], NOW).entries, vec![entry(&["b"], 0, NOW - 86_400, true)]);
     }
 
     #[test]
     fn state_round_trips_through_an_email() {
-        let s = State { version: 1, entries: vec![entry(&["abc@example.com", "dé@x"], NOW, NOW, false)], senders: vec![], tabs: vec![], threads: vec![] };
+        let s = State { version: 1, entries: vec![entry(&["abc@example.com", "dé@x"], NOW, NOW, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
         let raw = s.to_message(DateTime::from_timestamp(NOW, 0).unwrap());
         assert_eq!(State::from_message(&raw), Some(s));
         assert!(String::from_utf8(raw).unwrap().contains(STATE_FROM));
@@ -871,7 +1013,7 @@ mod tests {
 
     #[test]
     fn picks_up_a_snooze_from_another_machine() {
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 60, false)], senders: vec![], tabs: vec![], threads: vec![] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 60, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
         let p = plan(st, &local(&[], &["t1"], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.snooze, vec![("t1".into(), NOW + 3600)]);
         assert!(p.write.is_none() && p.wake.is_empty() && p.release.is_empty());
@@ -879,7 +1021,7 @@ mod tests {
 
     #[test]
     fn wakes_due_snoozes_once() {
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW - 1, NOW - 600, false)], senders: vec![], tabs: vec![], threads: vec![] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW - 1, NOW - 600, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
         let p = plan(st, &local(&[("t1", NOW - 1)], &["t1"], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.wake, vec!["t1".to_string()]);
         let w = p.write.expect("tombstone written");
@@ -892,7 +1034,7 @@ mod tests {
 
     #[test]
     fn cancelled_elsewhere_is_dropped_here() {
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 5, true)], senders: vec![], tabs: vec![], threads: vec![] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 5, true)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
         let p = plan(st, &local(&[("t1", NOW + 3600)], &["t1"], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.unsnooze, vec!["t1".to_string()]);
         assert_eq!(p.release, vec!["t1".to_string()]);
@@ -910,12 +1052,12 @@ mod tests {
     #[test]
     fn taken_out_of_the_folder_elsewhere_means_unsnoozed() {
         // Snoozed an hour ago, but no longer in the Snoozed folder.
-        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 3600, false)], senders: vec![], tabs: vec![], threads: vec![] };
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 3600, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
         let p = plan(st.clone(), &local(&[("t1", NOW + 3600)], &[], &[("t1", &["m1"])]), NOW);
         assert_eq!(p.unsnooze, vec!["t1".to_string()]);
         assert!(p.write.unwrap().entries[0].removed);
         // Just snoozed (the move may still be on its way): leave it.
-        let fresh = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 30, false)], senders: vec![], tabs: vec![], threads: vec![] };
+        let fresh = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 30, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
         let p = plan(fresh, &local(&[("t1", NOW + 3600)], &[], &[("t1", &["m1"])]), NOW);
         assert!(p.unsnooze.is_empty() && p.write.is_none());
     }
@@ -935,7 +1077,7 @@ mod tests {
 
     #[test]
     fn unknown_mail_is_kept_until_long_overdue() {
-        let st = State { version: 1, entries: vec![entry(&["x"], NOW + 60, NOW - 9000, false), entry(&["y"], NOW - 2 * 86_400, NOW - 9000, false)], senders: vec![], tabs: vec![], threads: vec![] };
+        let st = State { version: 1, entries: vec![entry(&["x"], NOW + 60, NOW - 9000, false), entry(&["y"], NOW - 2 * 86_400, NOW - 9000, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
         let p = plan(st, &Local::default(), NOW);
         let w = p.write.unwrap();
         assert!(!w.entries.iter().find(|e| e.ids == ids(&["x"])).unwrap().removed);

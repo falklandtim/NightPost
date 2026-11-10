@@ -722,6 +722,7 @@ impl OwlPostApp {
             }
             Undo::Pin { a, k } => {
                 let _ = if self.store.is_pinned(*a, k).unwrap_or(false) { self.store.unpin(*a, k) } else { self.store.pin(*a, k) };
+                self.worker.send(Cmd::SyncPins(*a));
             }
             Undo::Unread { items } => {
                 for (a, k, was) in items {
@@ -1850,6 +1851,7 @@ impl OwlPostApp {
             self.toast(format!("Couldn't pin: {e:#}"), true);
             return;
         }
+        self.worker.send(Cmd::SyncPins(a));
         self.did(if pinned { "Unpinned" } else { "Pinned to top" }, Undo::Pin { a, k: k.to_string() });
         self.reload();
     }

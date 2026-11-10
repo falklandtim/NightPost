@@ -62,6 +62,8 @@ pub enum Cmd {
     Snooze(AccountId, String, chrono::DateTime<chrono::Utc>),
     /// Cancel a snooze everywhere and return the conversation to the Inbox.
     Unsnooze(AccountId, String),
+    /// Save the account's pins and unpins to the server for other machines.
+    SyncPins(AccountId),
     /// Is a Google OAuth client saved? (Read off the UI thread: the keychain
     /// may wait on a permission prompt.)
     CheckGoogle,
@@ -617,6 +619,8 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
                 let _ = ev.send(Event::Changed);
                 r?;
             }
+            Cmd::SyncPins(a) => owlpost_core::snooze_sync::push_pins(&store, &account(a)?)
+                .map_err(|e| e.context("Pinned here; couldn't save it for your other computers yet (it'll try again at the next sync)"))?,
             Cmd::Move(a, key, role) => {
                 engine::move_thread(&store, &account(a)?, &key, role)?;
                 let _ = ev.send(Event::Changed);

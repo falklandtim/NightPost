@@ -573,6 +573,10 @@ impl Server {
                 } else {
                     self.store.unpin(acc, &key)?;
                 }
+                // Other machines get it now, or at the next sync if this fails.
+                if let Err(e) = self.account(acc).and_then(|a| crate::snooze_sync::push_pins(&self.store, &a)) {
+                    log::warn!("couldn't save the pin to the server: {e:#}");
+                }
                 Ok(json!({"thread_id": thread_id(acc, &key), "pinned": pinned}))
             }
             "move_thread" => {
