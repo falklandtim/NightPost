@@ -2835,11 +2835,13 @@ impl OwlPostApp {
                         let header = ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             ui.add_space(4.0);
-                            let (chev, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
+                            let (chev, chev_r) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::click());
                             let c = chev.center();
                             let sub = col.sidebar_text.gamma_multiply(0.75);
                             let pts = if collapsed { vec![c + egui::vec2(-1.5, -3.5), c + egui::vec2(2.0, 0.0), c + egui::vec2(-1.5, 3.5)] } else { vec![c + egui::vec2(-3.5, -1.5), c + egui::vec2(0.0, 2.0), c + egui::vec2(3.5, -1.5)] };
-                            ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.4_f32, sub)));
+                            ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.4_f32, if chev_r.hovered() { col.sidebar_text } else { sub })));
+                            chev_r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{} {}", if collapsed { "Expand" } else { "Collapse" }, a.email)));
+                            let chev_r = chev_r.on_hover_text(if collapsed { "Show folders" } else { "Hide folders" });
                             if multi {
                                 let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
                                 ui.painter().circle_filled(dot.center(), 4.0, style::hex(&a.color));
@@ -2863,9 +2865,9 @@ impl OwlPostApp {
                                 r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{} status: {}", a.email, h.as_str())));
                                 r.on_hover_text(format!("{}\n\nClick for Sync activity", st.summary(Utc::now())))
                             });
-                            (label, dot)
+                            (label, dot, chev_r.clicked())
                         });
-                        let (label, dot) = header.inner;
+                        let (label, dot, chev_clicked) = header.inner;
                         if dot.is_some_and(|d| d.clicked()) {
                             self.activity = Some(ActivityView::new(Some(a.id)));
                         }
@@ -2888,7 +2890,7 @@ impl OwlPostApp {
                                 }
                             });
                         }
-                        if label.clicked() {
+                        if label.clicked() || chev_clicked {
                             if collapsed {
                                 self.collapsed_accounts.retain(|x| *x != a.id);
                             } else {
