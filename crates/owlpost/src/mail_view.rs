@@ -18,8 +18,12 @@ pub use owlpost_core::html_clean::{has_remote_content, strip_trackers, tag_attr}
 pub enum ViewEvent {
     /// A link was clicked: open it in the browser.
     OpenLink(String),
-    /// Open (or right-click: save) attachment `usize` of a message.
+    /// Open attachment `usize` of a message.
     Attachment(MessageId, usize),
+    /// Save it to Downloads (from its right-click menu).
+    SaveAttachment(MessageId, usize),
+    /// Save it where you choose (Save As…).
+    SaveAttachmentAs(MessageId, usize),
     /// Show remote images in this conversation.
     LoadImages,
     Reply,
@@ -36,6 +40,8 @@ pub fn parse_action(url: &str) -> Option<ViewEvent> {
     let mut parts = rest.trim_end_matches('/').split('/');
     match parts.next()? {
         "attachment" => Some(ViewEvent::Attachment(parts.next()?.parse().ok()?, parts.next()?.parse().ok()?)),
+        "attachment-save" => Some(ViewEvent::SaveAttachment(parts.next()?.parse().ok()?, parts.next()?.parse().ok()?)),
+        "attachment-save-as" => Some(ViewEvent::SaveAttachmentAs(parts.next()?.parse().ok()?, parts.next()?.parse().ok()?)),
         "load-images" => Some(ViewEvent::LoadImages),
         "reply" => Some(ViewEvent::Reply),
         "reply-all" => Some(ViewEvent::ReplyAll),
@@ -203,7 +209,7 @@ pub fn document(page: &Page, col: &Colors) -> String {
             body.push_str("<div class=attachments>");
             for (j, a) in m.attachments.iter().enumerate() {
                 body.push_str(&format!(
-                    "<a class=attachment href=\"owlpost://attachment/{}/{j}\" title=\"Open\">📎 {} <span>{}</span></a>",
+                    "<a class=attachment href=\"owlpost://attachment/{}/{j}\" title=\"Click to open · right-click to save\">📎 {} <span>{}</span></a>",
                     m.id,
                     escape(&a.filename),
                     escape(&crate::attachments::human_size(a.size))
@@ -279,6 +285,10 @@ hr {{ border: 0; border-top: 1px solid {hair}; margin: 12px 0; }}
 .attachment {{ text-decoration: none; color: {text}; background: {bg2}; border: 1px solid {border}; border-radius: 6px; padding: 6px 10px; font-size: 13px; }}
 .attachment span {{ color: {subtle}; font-size: 11.5px; margin-left: 4px; }}
 .attachment:hover {{ filter: brightness(0.96); }}
+.menu {{ position: fixed; z-index: 10; min-width: 170px; padding: 4px; background: {menu_bg}; border: 1px solid {border}; border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.18); font-size: 13px; }}
+.menu a {{ display: block; padding: 5px 10px; border-radius: 5px; color: {text}; text-decoration: none; cursor: default; }}
+.menu a:hover {{ background: {link}; color: #fff; }}
 .text {{ white-space: pre-wrap; word-wrap: break-word; }}
 .quote summary {{ color: {very_subtle}; cursor: pointer; list-style: none; font-size: 12px; }}
 .quoted {{ color: {subtle}; white-space: pre-wrap; border-left: 2px solid {hair}; padding-left: 10px; margin-top: 4px; }}
@@ -293,6 +303,7 @@ hr {{ border: 0; border-top: 1px solid {hair}; margin: 12px 0; }}
         scheme = if dark { "dark" } else { "light" },
         bg = css(col.bg),
         bg2 = css(col.bg_secondary),
+        menu_bg = css(col.bg),
         text = css(col.text),
         subtle = css(col.subtle),
         very_subtle = css(col.very_subtle),
@@ -428,6 +439,37 @@ function forward(e) {
   }
 }
 document.addEventListener('keydown', forward);
+// Right-click an attachment: Open, Save to Downloads, Save As…
+var menu = null;
+function closeMenu() { if (menu) { menu.remove(); menu = null; } }
+document.addEventListener('contextmenu', function (e) {
+  closeMenu();
+  var a = e.target.closest && e.target.closest('a.attachment');
+  if (!a) return;
+  e.preventDefault();
+  var rest = a.getAttribute('href').replace('owlpost://attachment/', '');
+  menu = document.createElement('div');
+  menu.className = 'menu';
+  [['Open', 'attachment'], ['Save to Downloads', 'attachment-save'], ['Save As\u2026', 'attachment-save-as']].forEach(function (it) {
+    var l = document.createElement('a');
+    l.textContent = it[0];
+    l.href = 'owlpost://' + it[1] + '/' + rest;
+    l.addEventListener('click', function () { setTimeout(closeMenu, 0); });
+    menu.appendChild(l);
+  });
+  document.body.appendChild(menu);
+  var x = Math.min(e.clientX, window.innerWidth - menu.offsetWidth - 4);
+  var y = e.clientY + menu.offsetHeight > window.innerHeight ? e.clientY - menu.offsetHeight : e.clientY;
+  menu.style.left = Math.max(4, x) + 'px';
+  menu.style.top = Math.max(4, y) + 'px';
+});
+document.addEventListener('mousedown', function (e) { if (menu && !menu.contains(e.target)) closeMenu(); });
+document.addEventListener('keydown', function (e) {
+  // Escape closes the menu only (not the conversation too).
+  if (menu && e.key === 'Escape') { closeMenu(); e.preventDefault(); e.stopImmediatePropagation(); }
+}, true);
+window.addEventListener('scroll', closeMenu, true);
+window.addEventListener('blur', closeMenu);
 "#;
 
 /// Turn a key from the page into egui input, so the app's shortcuts work
@@ -635,9 +677,39 @@ mod offscreen {
         events: Vec<ViewEvent>,
         bg: egui::Color32,
         shown_key: u64,
+        /// An attachment's right-click menu: its "id/index" and where it opened.
+        menu: Option<(String, egui::Pos2)>,
+        /// Where the menu was drawn last frame (clicks there aren't the page's).
+        menu_rect: egui::Rect,
     }
 
     impl MailView {
+        /// The page is a picture here, so an attachment's right-click menu
+        /// (Open, Save to Downloads, Save As…) is drawn by the app.
+        fn attachment_menu(&mut self, ctx: &egui::Context) {
+            let Some((rest, pos)) = self.menu.clone() else { return };
+            let area = egui::Area::new(egui::Id::new("mail_view_attachment_menu")).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
+                egui::Frame::menu(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(160.0);
+                    for (label, action) in [("Open", "attachment"), ("Save to Downloads", "attachment-save"), ("Save As…", "attachment-save-as")] {
+                        if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                            if let Some(e) = parse_action(&format!("owlpost://{action}/{rest}")) {
+                                self.events.push(e);
+                            }
+                            self.menu = None;
+                        }
+                    }
+                });
+            });
+            self.menu_rect = area.response.rect;
+            let away = ctx.input(|i| {
+                i.key_pressed(egui::Key::Escape) || (i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !area.response.rect.contains(p)) && !i.pointer.secondary_pressed())
+            });
+            if away {
+                self.menu = None;
+            }
+        }
+
         pub fn new<W>(_window: &W, bg: egui::Color32) -> Option<Self> {
             if !crate::web_host::available() {
                 return None;
@@ -652,6 +724,8 @@ mod offscreen {
                 events: vec![],
                 bg,
                 shown_key: 0,
+                menu: None,
+                menu_rect: egui::Rect::NOTHING,
             })
         }
 
@@ -703,8 +777,12 @@ mod offscreen {
             }
             self.scroll = self.scroll.clamp(0.0, max_scroll);
             let origin = rect.min - egui::vec2(0.0, self.scroll);
-            if let Some(p) = pointer {
+            if let Some(p) = pointer.filter(|p| !(self.menu.is_some() && self.menu_rect.contains(*p))) {
                 let at = (p - origin).to_pos2();
+                // A right-click anywhere else closes an open menu.
+                if ctx.input(|i| i.pointer.secondary_clicked()) {
+                    self.menu = None;
+                }
                 if let Some(t) = self.targets.iter().find(|t| t.rect.contains(at)).cloned() {
                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                     if ctx.input(|i| i.pointer.primary_clicked()) {
@@ -712,9 +790,16 @@ mod offscreen {
                             Hit::Link(url) => self.events.push(parse_action(&url).unwrap_or(ViewEvent::OpenLink(url))),
                             Hit::Fold(i) => request(Job::Fold(i), self.shared.clone(), ctx.clone()),
                         }
+                    } else if ctx.input(|i| i.pointer.secondary_clicked()) {
+                        if let Hit::Link(url) = &t.hit {
+                            if let Some(rest) = url.strip_prefix("owlpost://attachment/") {
+                                self.menu = Some((rest.to_string(), p));
+                            }
+                        }
                     }
                 }
             }
+            self.attachment_menu(ctx);
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("mail_view"))).with_clip_rect(rect);
             painter.rect_filled(rect, 0.0, self.bg);
             if self.tiles.is_empty() || self.shown_key != self.requested.0 {
@@ -1078,6 +1163,8 @@ mod tests {
     #[test]
     fn page_links_and_keys() {
         assert_eq!(parse_action("owlpost://attachment/12/3"), Some(ViewEvent::Attachment(12, 3)));
+        assert_eq!(parse_action("owlpost://attachment-save/12/3"), Some(ViewEvent::SaveAttachment(12, 3)));
+        assert_eq!(parse_action("owlpost://attachment-save-as/12/3"), Some(ViewEvent::SaveAttachmentAs(12, 3)));
         assert_eq!(parse_action("owlpost://reply-all"), Some(ViewEvent::ReplyAll));
         assert_eq!(parse_action("https://x"), None);
         assert!(matches!(key_events("e", false).as_slice(), [egui::Event::Text(t)] if t == "e"));

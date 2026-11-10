@@ -3840,9 +3840,14 @@ impl OwlPostApp {
                         ctx.open_url(egui::OpenUrl::new_tab(url));
                     }
                 }
-                ViewEvent::Attachment(id, i) => {
+                ViewEvent::Attachment(id, i) | ViewEvent::SaveAttachment(id, i) | ViewEvent::SaveAttachmentAs(id, i) => {
+                    let what = match e {
+                        ViewEvent::SaveAttachment(..) => AttachmentClick::SaveToDownloads,
+                        ViewEvent::SaveAttachmentAs(..) => AttachmentClick::SaveAs,
+                        _ => AttachmentClick::Open,
+                    };
                     if let Some(m) = self.open.as_ref().and_then(|o| o.messages.iter().find(|m| m.id == id)).cloned() {
-                        self.attachment(m, i, AttachmentClick::Open);
+                        self.attachment(m, i, what);
                     }
                 }
                 ViewEvent::LoadImages => {
