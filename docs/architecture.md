@@ -7,6 +7,7 @@ A map for anyone opening the code cold. The house rules are in [AGENTS.md](../AG
 | Crate | What it is | Depends on egui? |
 |---|---|---|
 | `crates/owlpost-core` | Everything that isn't the window: models, the SQLite store, the IMAP engine and push, SMTP, Google sign-in, snooze and its server sync, inbox categories, themes, and the MCP server. | No, and it must stay that way |
+| `crates/owlpost-ffi` | The core for the iPhone app: a `Mail` object that UniFFI turns into Swift (`scripts/ios-rust.sh`). Plain records only: ids, strings, Unix-second dates. See [ios.md](ios.md). | No |
 | `crates/owlpost` | The app: the egui window and its parts, the background threads, the web views (HTML email and the composer), Contacts, sender pictures, logging. One binary, `owlpost`, which is also the MCP server and a small CLI. | Yes |
 
 ```
@@ -26,13 +27,17 @@ owlpost (binary)
         ├── smtp.rs, oauth.rs, credentials.rs, parse.rs, category.rs
         ├── mcp.rs         the MCP server
         └── theme.rs       Mailspring-compatible themes
+
+owlpost-ffi (library for the iPhone app, UniFFI → Swift)
+└── uses owlpost-core: the same store, engine and sync state
 ```
 
 ## Processes
 
-Two kinds of process use the same database, `~/Library/Application Support/co.timson.OwlPost/owlpost.db` on a Mac (`~/.local/share/…` on Linux, or `OWLPOST_DB`):
+On a computer, two kinds of process use the same database, `~/Library/Application Support/co.timson.OwlPost/owlpost.db` on a Mac (`~/.local/share/…` on Linux, or `OWLPOST_DB`):
 
 - **The app** (`owlpost`): the window and its threads.
+- **The iPhone app** (`ios/`, SwiftUI) has its own database in its sandbox, set with `owlpost_core::use_folders`. It agrees with the computers through the mail server, like any other copy.
 - **The MCP server** (`owlpost mcp`): started by an assistant (Claude, Dobby) over stdio. It reads mail from the database, and makes changes both there and on the server, with the same `engine` functions the app uses. It cannot send mail: `save_draft` puts a message in Drafts.
 
 The database runs in WAL mode with a 10-second busy timeout, so both can read and write at once. Each thread opens its own `Store` connection. Anything both need to see, such as sync health and the activity log, lives in the database, not in memory.

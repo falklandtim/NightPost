@@ -1,0 +1,22 @@
+[package]
+name = "owlpost-ffi"
+description = "The OwlPost core for the iPhone app, through UniFFI's Swift bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# staticlib for the iPhone app; cdylib so uniffi-bindgen can read the
+# interface from a Mac build; lib for the tests.
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "owlpost_ffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+owlpost-core = { path = "../owlpost-core" }
+anyhow.workspace = true
+chrono.workspace = true
+uniffi = { version = "0.29", features = ["cli"] }

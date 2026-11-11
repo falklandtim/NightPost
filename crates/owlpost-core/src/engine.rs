@@ -844,9 +844,13 @@ fn demo_send(store: &Store, account: &Account, out: &OutgoingMessage) -> Result<
 /// Where downloaded attachments are kept, e.g.
 /// `~/Library/Caches/co.timson.OwlPost/attachments`. It's a cache: the
 /// server keeps the real copy, and macOS may clear this folder.
+/// `OWLPOST_CACHE`, then [`crate::use_folders`], override it.
 pub fn attachment_cache_dir() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("OWLPOST_CACHE") {
         return std::path::PathBuf::from(p).join("attachments");
+    }
+    if let Some(cache) = crate::chosen_cache_dir() {
+        return cache.join("attachments");
     }
     directories::ProjectDirs::from("co", "timson", "OwlPost")
         .map(|d| d.cache_dir().join("attachments"))

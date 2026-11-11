@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/owlpost-core", "crates/owlpost"]
+members = ["crates/owlpost-core", "crates/owlpost", "crates/owlpost-ffi"]
 
 [workspace.package]
 version = "0.1.0"

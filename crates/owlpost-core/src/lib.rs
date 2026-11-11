@@ -23,12 +23,38 @@ pub mod theme;
 pub use models::*;
 pub use store::Store;
 
+/// Folders chosen by the app that embeds the core (see [`use_folders`]).
+struct Folders {
+    data: std::path::PathBuf,
+    cache: std::path::PathBuf,
+}
+
+static FOLDERS: std::sync::OnceLock<Folders> = std::sync::OnceLock::new();
+
+/// Keep the database in `data` and downloaded files in `cache`, instead of
+/// the usual per-user folders. For the iPhone app, whose sandbox decides
+/// where files go. Call it once, before opening the store; later calls
+/// return an error and change nothing, so the database can't move under a
+/// running app.
+pub fn use_folders(data: std::path::PathBuf, cache: std::path::PathBuf) -> anyhow::Result<()> {
+    FOLDERS.set(Folders { data, cache }).map_err(|_| anyhow::anyhow!("OwlPost's folders are already set"))
+}
+
+/// The cache folder chosen with [`use_folders`], if any.
+pub(crate) fn chosen_cache_dir() -> Option<std::path::PathBuf> {
+    FOLDERS.get().map(|f| f.cache.clone())
+}
+
 /// OwlPost's data folder (database and installed themes), e.g.
 /// `~/Library/Application Support/co.timson.OwlPost`.
 ///
 /// OwlPost used to be called SpringPost: the first time it runs, the old
 /// folder is renamed so accounts, mail and themes carry over.
 pub fn data_dir() -> std::path::PathBuf {
+    if let Some(dir) = FOLDERS.get().map(|f| f.data.clone()) {
+        let _ = std::fs::create_dir_all(&dir);
+        return dir;
+    }
     let Some(dirs) = directories::ProjectDirs::from("co", "timson", "OwlPost") else {
         return std::path::PathBuf::from(".");
     };

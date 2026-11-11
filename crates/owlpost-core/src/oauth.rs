@@ -7,6 +7,10 @@
 //! refresh token (kept in the keychain) and short-lived access tokens, which
 //! sign in to IMAP and SMTP with XOAUTH2. OwlPost never sees the password.
 //!
+//! The iPhone app can't listen on a port in the background, so it uses
+//! [`authorize`] with an [`ios_redirect`] link instead, and Google returns
+//! to the app itself; the code is checked and redeemed the same way.
+//!
 //! Each install uses its own OAuth client from Google Cloud (see the README).
 
 use crate::credentials;
@@ -67,12 +71,24 @@ pub struct SignedIn {
     pub expires_in: Duration,
 }
 
-/// A sign-in waiting for the browser.
-pub struct Pending {
-    listener: TcpListener,
+/// A sign-in in progress: Google's sign-in page, and what's needed to check
+/// and redeem the code it sends back. The desktop apps wrap it in
+/// [`Pending`], which receives the code on a local port; the iPhone app opens
+/// [`Authorize::url`] in `ASWebAuthenticationSession` and passes the link it
+/// returns to [`Authorize::code_from_redirect`].
+#[derive(Debug, Clone)]
+pub struct Authorize {
     verifier: String,
     state: String,
     redirect: String,
+    /// Open this in the browser.
+    pub url: String,
+}
+
+/// A desktop sign-in waiting for the browser to come back to a local port.
+pub struct Pending {
+    listener: TcpListener,
+    auth: Authorize,
     /// Open this in the browser.
     pub url: String,
 }
@@ -93,17 +109,23 @@ fn enc(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-/// Start signing in: listen locally and build Google's sign-in URL.
-/// `login_hint` pre-fills the account (when re-signing in).
-pub fn begin(client: &GoogleClient, login_hint: Option<&str>) -> Result<Pending> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("listening for the browser")?;
-    let redirect = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+/// The return link Google allows for an iOS OAuth client: the client ID
+/// reversed, e.g. `com.googleusercontent.apps.123-abc:/oauth2redirect`.
+/// The iPhone app registers the same scheme in its Info.plist.
+pub fn ios_redirect(client_id: &str) -> String {
+    let reversed: Vec<&str> = client_id.trim().split('.').rev().collect();
+    format!("{}:/oauth2redirect", reversed.join("."))
+}
+
+/// Start a sign-in that Google will send back to `redirect`. `login_hint`
+/// pre-fills the account (when re-signing in).
+pub fn authorize(client: &GoogleClient, redirect: &str, login_hint: Option<&str>) -> Result<Authorize> {
     let verifier = random_token(48)?;
     let state = random_token(16)?;
     let mut url = format!(
         "{AUTH_URL}?client_id={}&redirect_uri={}&response_type=code&scope={}&code_challenge={}&code_challenge_method=S256&state={}&access_type=offline&prompt=consent",
         enc(&client.id),
-        enc(&redirect),
+        enc(redirect),
         enc(SCOPES),
         challenge(&verifier),
         state
@@ -111,22 +133,50 @@ pub fn begin(client: &GoogleClient, login_hint: Option<&str>) -> Result<Pending>
     if let Some(h) = login_hint {
         url.push_str(&format!("&login_hint={}", enc(h)));
     }
-    Ok(Pending { listener, verifier, state, redirect, url })
+    Ok(Authorize { verifier, state, redirect: redirect.to_string(), url })
 }
 
-impl Pending {
-    /// Wait for the browser to return, then exchange the code for tokens.
-    /// Gives up after `timeout`, or when `cancel` is set.
-    pub fn finish(self, client: &GoogleClient, cancel: &AtomicBool, timeout: Duration) -> Result<SignedIn> {
-        let code = self.wait_for_code(cancel, timeout)?;
-        let v = post_form(&[
-            ("code", code.as_str()),
-            ("client_id", &client.id),
-            ("client_secret", &client.secret),
-            ("redirect_uri", &self.redirect),
+/// Start signing in on a desktop: listen locally and build Google's sign-in
+/// URL. `login_hint` pre-fills the account (when re-signing in).
+pub fn begin(client: &GoogleClient, login_hint: Option<&str>) -> Result<Pending> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("listening for the browser")?;
+    let redirect = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+    let auth = authorize(client, &redirect, login_hint)?;
+    Ok(Pending { listener, url: auth.url.clone(), auth })
+}
+
+impl Authorize {
+    /// The one-time code in the link Google sent back, after checking it
+    /// belongs to this sign-in (the `state`), so another app or page can't
+    /// slip in a code of its own.
+    pub fn code_from_redirect(&self, link: &str) -> Result<String> {
+        let query = link.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let query = query.split('#').next().unwrap_or("");
+        let params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+        if params.get("state").map(String::as_str) != Some(self.state.as_str()) {
+            bail!("the browser returned an unexpected sign-in (state mismatch)");
+        }
+        if let Some(err) = params.get("error") {
+            bail!(if err == "access_denied" { "sign-in was cancelled in the browser".to_string() } else { format!("Google refused the sign-in: {err}") });
+        }
+        params.get("code").cloned().ok_or_else(|| anyhow!("Google sent no sign-in code"))
+    }
+
+    /// Exchange the one-time code for tokens and find out who signed in.
+    /// Blocks on the network.
+    pub fn exchange(&self, client: &GoogleClient, code: &str) -> Result<SignedIn> {
+        let mut form = vec![
+            ("code", code),
+            ("client_id", client.id.as_str()),
+            ("redirect_uri", self.redirect.as_str()),
             ("grant_type", "authorization_code"),
-            ("code_verifier", &self.verifier),
-        ])?;
+            ("code_verifier", self.verifier.as_str()),
+        ];
+        // iOS clients have no secret, and Google rejects an empty one.
+        if !client.secret.is_empty() {
+            form.push(("client_secret", client.secret.as_str()));
+        }
+        let v = post_form(&form)?;
         let refresh_token = v["refresh_token"].as_str().ok_or_else(|| anyhow!("Google didn't send a refresh token"))?.to_string();
         let access_token = v["access_token"].as_str().ok_or_else(|| anyhow!("Google didn't send an access token"))?.to_string();
         let expires_in = Duration::from_secs(v["expires_in"].as_u64().unwrap_or(3600));
@@ -137,6 +187,15 @@ impl Pending {
         }
         let name = claims["name"].as_str().unwrap_or_default().to_string();
         Ok(SignedIn { email, name, refresh_token, access_token, expires_in })
+    }
+}
+
+impl Pending {
+    /// Wait for the browser to return, then exchange the code for tokens.
+    /// Gives up after `timeout`, or when `cancel` is set.
+    pub fn finish(self, client: &GoogleClient, cancel: &AtomicBool, timeout: Duration) -> Result<SignedIn> {
+        let code = self.wait_for_code(cancel, timeout)?;
+        self.auth.exchange(client, &code)
     }
 
     /// Accept browser requests until one carries the code (or an error).
@@ -166,7 +225,7 @@ impl Pending {
                 respond(&mut stream, "404 Not Found", "");
                 continue;
             }
-            if params.get("state").map(String::as_str) != Some(self.state.as_str()) {
+            if params.get("state").map(String::as_str) != Some(self.auth.state.as_str()) {
                 respond(&mut stream, "400 Bad Request", &page("Something went wrong", "This sign-in link didn't match. Go back to OwlPost and try again."));
                 bail!("the browser returned an unexpected sign-in (state mismatch)");
             }
@@ -266,7 +325,11 @@ pub fn access_token(account: &Account) -> Result<String> {
     }
     let client = GoogleClient::load().ok_or_else(|| anyhow!("Google sign-in isn't set up — add your client ID in Preferences > Accounts"))?;
     let refresh = credentials::get_refresh_token(&account.email).map_err(|_| anyhow!(SignInExpired))?;
-    let v = post_form(&[("client_id", &client.id), ("client_secret", &client.secret), ("refresh_token", &refresh), ("grant_type", "refresh_token")])?;
+    let mut form = vec![("client_id", client.id.as_str()), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")];
+    if !client.secret.is_empty() {
+        form.push(("client_secret", client.secret.as_str()));
+    }
+    let v = post_form(&form)?;
     let token = v["access_token"].as_str().ok_or_else(|| anyhow!("Google didn't send an access token"))?.to_string();
     remember(&account.email, &token, Duration::from_secs(v["expires_in"].as_u64().unwrap_or(3600)));
     Ok(token)
@@ -357,6 +420,26 @@ mod tests {
     }
 
     #[test]
+    fn iphone_redirect_link_delivers_the_code() {
+        let client = GoogleClient { id: "123-abc.apps.googleusercontent.com".into(), secret: String::new() };
+        let redirect = ios_redirect(&client.id);
+        assert_eq!(redirect, "com.googleusercontent.apps.123-abc:/oauth2redirect");
+        let a = authorize(&client, &redirect, None).unwrap();
+        assert!(a.url.contains("redirect_uri=com.googleusercontent.apps.123-abc%3A%2Foauth2redirect"), "{}", a.url);
+        assert!(!a.url.contains("login_hint"));
+
+        let back = |q: &str| format!("{redirect}?{q}");
+        assert_eq!(a.code_from_redirect(&back(&format!("state={}&code=4%2F0Abc&scope=email", a.state))).unwrap(), "4/0Abc");
+        // A code from some other sign-in is refused.
+        assert!(a.code_from_redirect(&back("state=forged&code=evil")).unwrap_err().to_string().contains("state mismatch"));
+        assert!(a.code_from_redirect(&back("code=evil")).is_err());
+        let cancelled = a.code_from_redirect(&back(&format!("state={}&error=access_denied", a.state))).unwrap_err();
+        assert!(cancelled.to_string().contains("cancelled"), "{cancelled}");
+        assert!(a.code_from_redirect(&back(&format!("state={}", a.state))).is_err());
+        assert!(a.code_from_redirect(&redirect).is_err());
+    }
+
+    #[test]
     fn browser_redirect_delivers_the_code() {
         let client = GoogleClient { id: "123.apps.googleusercontent.com".into(), secret: "s".into() };
         let p = begin(&client, Some("tim@example.com")).unwrap();
@@ -364,8 +447,8 @@ mod tests {
         for part in ["code_challenge_method=S256", "access_type=offline", "login_hint=tim%40example.com", "scope=https%3A%2F%2Fmail.google.com%2F+openid+email"] {
             assert!(p.url.contains(part), "{part} in {}", p.url);
         }
-        let port: u16 = p.redirect.rsplit(':').next().unwrap().parse().unwrap();
-        let state = p.state.clone();
+        let port: u16 = p.auth.redirect.rsplit(':').next().unwrap().parse().unwrap();
+        let state = p.auth.state.clone();
         // Play the browser: a favicon request, then the real redirect.
         let browser = std::thread::spawn(move || {
             let get = |path: &str| {
@@ -390,7 +473,7 @@ mod tests {
     fn wrong_state_or_cancel_is_refused() {
         let client = GoogleClient { id: "1.apps.googleusercontent.com".into(), secret: String::new() };
         let p = begin(&client, None).unwrap();
-        let port: u16 = p.redirect.rsplit(':').next().unwrap().parse().unwrap();
+        let port: u16 = p.auth.redirect.rsplit(':').next().unwrap().parse().unwrap();
         let t = std::thread::spawn(move || {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
             write!(s, "GET /?state=forged&code=x HTTP/1.1\r\n\r\n").unwrap();

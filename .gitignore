@@ -13,3 +13,10 @@
 # Tim's own reference material and artwork, kept out of the repository.
 /zzz Misc from Timbo/
 /Artwork/
+
+# iPhone app build output: remade by scripts/ios-rust.sh and Xcode
+/ios/build/
+/ios/OwlPost/Generated/
+/ios/DerivedData/
+xcuserdata/
+*.xcuserstate

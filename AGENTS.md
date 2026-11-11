@@ -73,6 +73,7 @@ scripts/audit.sh                             # no number got worse
 | Linux | `scripts/install-linux.sh` (installs to `~/.local/bin/owlpost` with a launcher) |
 | MCP | `owlpost mcp` on stdio; register with `claude mcp add owlpost -- <path> mcp` |
 | Demo | `cargo run --release -- --demo` |
+| iPhone | `scripts/ios-rust.sh` builds the core and Swift bindings for `ios/`; then open `ios/OwlPost.xcodeproj` in Xcode (see `docs/ios.md`) |
 | UI screenshots | `OWLPOST_SHOTS=<dir> cargo test -p owlpost <test>` saves PNGs from the offscreen UI tests |
 
 On a small Linux machine (4 GB), build with `CARGO_BUILD_JOBS=2`, and run long builds under `systemd-run --user` so a dropped SSH connection or sleep doesn't kill them. Clean `target/` when disk runs low; it only holds build output.
@@ -84,5 +85,5 @@ On a small Linux machine (4 GB), build with `CARGO_BUILD_JOBS=2`, and run long b
 | `README.md` | What OwlPost does, for users: every feature, the MCP server, snooze sync, known issues |
 | `docs/architecture.md` | How it fits together: crates, threads, processes, data, sync |
 | `docs/code-audit.md` | The audit process and each audit's results |
-| `docs/ios.md` | The iPhone app plan (not started) |
+| `docs/ios.md` | The iPhone app: plan, decisions and progress |
 | `scripts/audit.sh` | The audit numbers |
