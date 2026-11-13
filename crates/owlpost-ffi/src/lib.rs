@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex};
 
 uniffi::setup_scaffolding!();
 
+mod google;
+pub use google::GoogleSignIn;
+
 /// What went wrong, in words to show the user.
 #[derive(Debug, uniffi::Error)]
 pub enum MailError {
@@ -264,13 +267,15 @@ impl Mail {
     }
 
     /// Remove an account and its mail from this phone (the server keeps it)
-    /// and forget its password.
+    /// and forget its password or Google sign-in.
     pub fn remove_account(&self, account_id: i64) -> Result<()> {
         let store = self.store()?;
         let acc = self.account(&store, account_id)?;
         store.remove_account(account_id)?;
         if !acc.demo {
-            credentials::forget_password(&acc.email);
+            // Also drops a Google refresh token, so a removed account can't
+            // keep reading mail.
+            let _ = credentials::delete_password(&acc.email);
         }
         Ok(())
     }

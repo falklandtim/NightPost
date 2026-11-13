@@ -1,7 +1,7 @@
 // Adding an account, and the welcome screen before there is one.
 //
-// Accounts sign in with an app-specific password for now; Google sign-in
-// comes once an iOS OAuth client exists (see docs/ios.md). Gmail and iCloud
+// Gmail and Google Workspace use Sign in with Google (GoogleSignInButton);
+// other accounts sign in with an app-specific password. Gmail and iCloud
 // addresses pick their provider by themselves; an address on your own
 // domain (Google Workspace, iCloud custom domain) needs it picked.
 
@@ -24,10 +24,13 @@ struct WelcomeView: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 32)
             Spacer()
+            GoogleSignInButton()
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
             Button { adding = true } label: {
-                Text("Add an Account").frame(maxWidth: .infinity)
+                Text(GoogleClient.id == nil ? "Add an Account" : "Add Another Account").frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.bordered)
             .controlSize(.large)
             Button("Try the Demo") { Task { await model.openDemo() } }
                 .padding(.bottom)
@@ -49,6 +52,13 @@ struct AddAccountView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if GoogleClient.id != nil {
+                    Section {
+                        GoogleSignInButton { dismiss() }
+                    } footer: {
+                        Text("For Gmail and Google Workspace. No password to make.")
+                    }
+                }
                 Section {
                     TextField("Your name", text: $name)
                         .textContentType(.name)
@@ -100,7 +110,7 @@ struct AddAccountView: View {
         case .iCloud:
             return "Make an app-specific password at account.apple.com, under Sign-In and Security."
         case .google:
-            return "Make an app password at myaccount.google.com/apppasswords, signed in as this address. It needs 2-Step Verification turned on. Sign in with Google is coming."
+            return "Make an app password at myaccount.google.com/apppasswords, signed in as this address. It needs 2-Step Verification turned on. Sign in with Google above needs no password."
         case .none where email.contains("@"):
             return "For an address on your own domain, pick who runs its mail: Google for Google Workspace."
         default:

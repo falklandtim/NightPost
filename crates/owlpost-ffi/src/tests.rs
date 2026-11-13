@@ -122,3 +122,46 @@ fn removing_an_account_takes_its_mail() {
     assert!(!mail.accounts().unwrap().iter().any(|a| a.id == gone));
     assert!(!inbox(&mail).iter().any(|r| r.account_id == gone));
 }
+
+#[test]
+fn google_sign_in_returns_to_the_app() {
+    let (mail, _) = demo();
+    let id = "123-abc.apps.googleusercontent.com";
+    let s = mail.start_google_sign_in(id.into(), Some("tim@example.com".into())).unwrap();
+    assert_eq!(s.callback_scheme(), "com.googleusercontent.apps.123-abc");
+    let url = s.url();
+    assert!(url.starts_with(owlpost_core::oauth::AUTH_URL), "{url}");
+    assert!(url.contains("client_id=123-abc.apps.googleusercontent.com"));
+    assert!(url.contains("redirect_uri=com.googleusercontent.apps.123-abc%3A%2Foauth2redirect"));
+    assert!(url.contains("login_hint=tim%40example.com"));
+    assert!(!url.contains("client_secret"), "iOS clients have no secret");
+}
+
+#[test]
+fn google_sign_in_rejects_bad_client_ids() {
+    let (mail, _) = demo();
+    for bad in ["", "not-a-client", ".apps.googleusercontent.com", "x.apps.example.com"] {
+        assert!(mail.start_google_sign_in(bad.into(), None).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn google_sign_in_refuses_links_that_are_not_its_own() {
+    // These fail before any network call or keychain write.
+    let (mail, _) = demo();
+    let before = mail.accounts().unwrap().len();
+    let s = mail.start_google_sign_in("123-abc.apps.googleusercontent.com".into(), None).unwrap();
+    let back = "com.googleusercontent.apps.123-abc:/oauth2redirect";
+    for link in [
+        format!("{back}?state=forged&code=evil"),
+        format!("{back}?code=evil"),
+        back.to_string(),
+        "garbage".to_string(),
+    ] {
+        assert!(mail.finish_google_sign_in(s.clone(), link.clone()).is_err(), "{link}");
+    }
+    let state = s.url().split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+    let MailError::Failed { message } = mail.finish_google_sign_in(s, format!("{back}?state={state}&error=access_denied")).unwrap_err();
+    assert!(message.contains("cancelled"), "{message}");
+    assert_eq!(mail.accounts().unwrap().len(), before, "no account added");
+}

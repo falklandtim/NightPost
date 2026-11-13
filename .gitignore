@@ -18,5 +18,7 @@
 /ios/build/
 /ios/OwlPost/Generated/
 /ios/DerivedData/
+# The iOS Google OAuth client ID, built into the app by scripts/ios-rust.sh
+/ios/google-client-id.txt
 xcuserdata/
 *.xcuserstate

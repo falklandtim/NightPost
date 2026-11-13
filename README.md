@@ -143,7 +143,7 @@ Each change merges with what's on the server, and for any one conversation the n
 
 ## Plans
 
-- iPhone app: see [docs/ios.md](docs/ios.md). A first version builds (`ios/`): accounts with app passwords, the unified list with swipes, conversations in plain text, snooze and pin that sync with the computers. Not yet run on a phone; no HTML email, Google sign-in or compose yet.
+- iPhone app: see [docs/ios.md](docs/ios.md). A first version builds (`ios/`): Sign in with Google for Gmail and Workspace, app passwords for other accounts, the unified list with swipes, conversations in plain text, snooze and pin that sync with the computers. Not yet run on a phone; no HTML email or compose yet.
 
 ## Known issues
 

@@ -1,6 +1,6 @@
 # OwlPost for iPhone
 
-Status: **first version builds.** The core builds for iPhone, the Swift bridge works, and a SwiftUI app with the first screens builds for the simulator and for a phone. It hasn't run on a phone yet. First plan written 2026-11-07; updated 2026-11-11.
+Status: **first version builds; Sign in with Google added 2026-11-14.** The core builds for iPhone, the Swift bridge works, and a SwiftUI app with the first screens builds for the simulator and for a phone. It hasn't run on a phone yet. First plan written 2026-11-07; updated 2026-11-11.
 
 ## Decisions
 
@@ -16,6 +16,7 @@ ios/OwlPost.xcodeproj  the Xcode project (hand-written; folders sync, so new .sw
 ios/OwlPost/           the SwiftUI code
 ios/OwlPost/Generated/ Swift bindings     } made by scripts/ios-rust.sh,
 ios/build/             OwlPostCore.xcframework } not committed
+ios/google-client-id.txt  the iOS OAuth client ID (not committed)
 ```
 
 ## Done
@@ -29,7 +30,8 @@ ios/build/             OwlPostCore.xcframework } not committed
    - `threads(mailbox, query, limit)` for Inbox, Starred, Drafts, Sent, Archive, Trash and Snoozed across all accounts, with the desktop's search words;
    - `messages(accountId, threadKey)`: a conversation, oldest first, plain text;
    - `sync(accountId?)`: new mail, plus snoozes, pins and tabs from the server;
-   - `setRead`, `setStarred`, `setPinned`, `archive`, `trash`, `snooze(until)`, `unsnooze`.
+   - `setRead`, `setStarred`, `setPinned`, `archive`, `trash`, `snooze(until)`, `unsnooze`;
+   - `startGoogleSignIn(clientId, loginHint)` and `finishGoogleSignIn(signIn, redirect)` (see *Sign in with Google* below).
    
    Errors come to Swift as `MailError.Failed(message)`, in words to show. Tested in Rust against the demo accounts, and from a Swift program on the Mac (open, list, read, snooze, an error).
 5. **The SwiftUI app, first screens:**
@@ -40,6 +42,20 @@ ios/build/             OwlPostCore.xcframework } not committed
    - snooze: later today, this evening, tomorrow, this weekend, next week, or a date and time.
    
    `MailModel.swift` runs every core call off the main thread and updates the list at once, then reloads after the server answers.
+
+6. **Sign in with Google** (2026-11-14): a button on the welcome screen and at the top of Add Account. It opens Google's page in Apple's sign-in sheet (`ASWebAuthenticationSession`), which closes when Google returns to the app through the client ID reversed (`com.googleusercontent.apps.…`). The core checks the link belongs to this sign-in, redeems the code, saves the refresh token and the client ID in the phone's keychain, and adds the account; an account already here with an app password switches to Google sign-in. Removing an account also forgets its Google sign-in. Tested in Rust up to the call to Google; the real sign-in is for Tim to try.
+
+7. **App icon** (2026-11-14): the desktop's owl, filled square for iOS (which rounds the corners itself), in `ios/OwlPost/Assets.xcassets`. **The list fills in during a sync**, every 3 seconds, so a long first sync doesn't show an empty Inbox until the end.
+
+## Sign in with Google
+
+The phone uses its own OAuth client, an **iOS** client in the same Google Cloud project as the desktop's (so the same name, *Internal* audience and Gmail permission). A Desktop client can't be used: Google only returns a Desktop client's sign-in to a local web server, and it has a secret.
+
+To set it up (done for timson.co on 2026-11-14):
+
+1. At [console.cloud.google.com/auth/clients](https://console.cloud.google.com/auth/clients), in the OwlPost project: **Create client → iOS**, name "OwlPost iPhone", Bundle ID `co.timson.OwlPost`. Leave App Store ID and Team ID empty.
+2. Put the Client ID in `ios/google-client-id.txt` (one line; not committed).
+3. Run `scripts/ios-rust.sh`. It writes `ios/OwlPost/Generated/GoogleClient.swift` from that file. Without the file the button is hidden and accounts use app passwords.
 
 ## Building and installing
 
@@ -53,9 +69,11 @@ Debug launch options (*Edit Scheme > Run > Arguments*, or `xcrun simctl launch <
 
 ## Adding your accounts
 
-On the phone, accounts sign in with an **app-specific password** for now (Sign in with Google comes later). The password is checked with the server before it's saved, and kept in that iPhone's (or simulator's) own keychain, not the Mac's. Revoking it doesn't affect the Mac app.
+**Gmail and Google Workspace (timson.co):** tap **Sign in with Google** (on the welcome screen, or ☰ → Settings → Add Account), pick your account in Google's sheet and allow access. The first time, iOS asks whether OwlPost may use google.com to sign in: tap Continue. The sign-in is kept in that iPhone's (or simulator's) own keychain. To revoke it, remove the account on the phone, or at myaccount.google.com → Security → Third-party apps (that signs out every device using OwlPost).
 
-**Google Workspace (timson.co):**
+Other accounts sign in with an **app-specific password**. The password is checked with the server before it's saved, and kept in that iPhone's (or simulator's) own keychain, not the Mac's. Revoking it doesn't affect the Mac app.
+
+**Google with an app password instead** (only if Sign in with Google isn't set up):
 
 1. Signed in as your timson.co address, go to **myaccount.google.com/apppasswords**, create one called "OwlPost iPhone", and copy the 16 letters. It needs 2-Step Verification on for that account. If the page says app passwords aren't available, check 2-Step Verification is on; as the Workspace admin you can allow it in the Admin console under Security → Authentication → 2-Step Verification. IMAP is already on (the Mac app uses it).
 2. In OwlPost: ☰ → **Settings** → **Add Account** (or *Add an Account* on the welcome screen).
@@ -77,7 +95,7 @@ Not on the phone. It still compiles there, but the bridge never calls it, so the
 
 1. **Run it on Tim's phone** with his real accounts (Tim, by hand): adding iCloud, sync, archive and snooze, and that a snooze or pin made on the phone shows on the Mac.
 2. **HTML email**: move the page builder (`document()`, `strip_trackers()`, `csp()`) from `crates/owlpost/src/mail_view.rs` into the core so the phone's WKWebView gets the same sandbox and tracker blocking. Then attachments.
-3. **Google sign-in on the phone**: add an iOS OAuth client in Google Cloud (Tim), register its reversed client ID as a URL scheme, and add a bridge call around `authorize` / `exchange`. Until then, Gmail can use an app password.
+3. **Sign in with Google on a real account** (Tim, by hand): built 2026-11-14, not yet tried with a real Google account.
 4. **Background refresh** (`BGAppRefreshTask`): iOS wakes the app every 15 minutes to a few hours to call `sync`.
 5. **Undo** after archive or snooze, as on the desktop (⌘Z there; a toast with Undo here).
 6. **Compose and reply**, saving drafts and sending through the core's SMTP.

@@ -88,6 +88,15 @@ final class MailModel {
         guard let mail, !syncing else { return }
         syncing = true
         defer { syncing = false }
+        // A first sync of a big account takes many minutes; show mail as it
+        // arrives rather than an empty Inbox until the very end.
+        let progress = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                if !Task.isCancelled { await reload() }
+            }
+        }
+        defer { progress.cancel() }
         do {
             let results = try await background { try mail.sync(accountId: nil) }
             let failed = results.compactMap { r in r.error.map { "\(r.email): \($0)" } }
@@ -107,6 +116,37 @@ final class MailModel {
         guard let mail else { return false }
         do {
             _ = try await background { try mail.addPasswordAccount(name: name, email: email, password: password, provider: provider) }
+            await reload()
+            Task { await sync() }
+            return true
+        } catch {
+            show(error)
+            return false
+        }
+    }
+
+    /// Start Sign in with Google: the page and return scheme for the
+    /// sign-in sheet. Leaves the demo first, so the account lands in the
+    /// real database. `nil` (with the error shown) if it can't start.
+    func startGoogleSignIn(hint: String? = nil) async -> GoogleSignIn? {
+        if isDemo {
+            await leaveDemo()
+        }
+        guard let mail, let id = GoogleClient.id else { return nil }
+        do {
+            return try mail.startGoogleSignIn(clientId: id, loginHint: hint)
+        } catch {
+            show(error)
+            return nil
+        }
+    }
+
+    /// Finish Sign in with Google with the link the sheet returned: adds the
+    /// account (or moves one here over from an app password), then syncs.
+    func finishGoogleSignIn(_ s: GoogleSignIn, redirect: URL) async -> Bool {
+        guard let mail else { return false }
+        do {
+            _ = try await background { try mail.finishGoogleSignIn(signIn: s, redirect: redirect.absoluteString) }
             await reload()
             Task { await sync() }
             return true
