@@ -1,5 +1,6 @@
-// The message list: every account together, with swipes as on the
-// desktop (right to archive, left to snooze), pull to refresh and search.
+// The message list: every account together (or one account's folder,
+// picked in Folders), with swipes as on the desktop (right to archive,
+// left to snooze), pull to refresh and search.
 
 import SwiftUI
 
@@ -7,6 +8,7 @@ struct InboxView: View {
     @Environment(MailModel.self) private var model
     @State private var snoozing: ThreadRow?
     @State private var settingsOpen = false
+    @State private var foldersOpen = false
     @State private var debugAdd = false
 
     var body: some View {
@@ -42,14 +44,14 @@ struct InboxView: View {
         .listStyle(.plain)
         .overlay {
             if model.rows.isEmpty && model.started {
-                EmptyListView(mailbox: model.mailbox, searching: !model.search.isEmpty)
+                EmptyListView(mailbox: model.mailbox, inFolder: model.folder != nil, searching: !model.search.isEmpty)
             }
         }
-        .navigationTitle(model.mailbox.title)
+        .navigationTitle(model.title)
         .navigationDestination(for: ThreadRow.self) { t in
             ThreadView(row: t)
         }
-        .searchable(text: $model.search, prompt: "Search all mail")
+        .searchable(text: $model.search, prompt: model.folder == nil ? "Search all mail" : "Search \(model.title)")
         .onSubmit(of: .search) { Task { await model.reload() } }
         .onChange(of: model.search) { _, new in
             if new.isEmpty { Task { await model.reload() } }
@@ -58,12 +60,19 @@ struct InboxView: View {
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Menu {
-                    Picker("Mailbox", selection: $model.mailbox) {
+                    // Picking a list leaves any folder; the selection shows
+                    // only while no folder is open.
+                    Picker("Mailbox", selection: Binding(get: { model.folder == nil ? model.mailbox : nil }, set: { m in
+                        guard let m else { return }
+                        model.mailbox = m
+                        if model.folder != nil { Task { await model.open(nil) } }
+                    })) {
                         ForEach(Mailbox.shown, id: \.self) { m in
-                            Label(m.title, systemImage: m.icon).tag(m)
+                            Label(m.title, systemImage: m.icon).tag(Optional(m))
                         }
                     }
                     Divider()
+                    Button { foldersOpen = true } label: { Label("Folders", systemImage: "folder") }
                     Button { settingsOpen = true } label: { Label("Settings", systemImage: "gearshape") }
                 } label: {
                     Image(systemName: "line.3.horizontal")
@@ -86,6 +95,9 @@ struct InboxView: View {
         .sheet(isPresented: $settingsOpen) {
             SettingsView()
         }
+        .sheet(isPresented: $foldersOpen) {
+            FoldersView()
+        }
         .navigationDestination(item: $debugOpen) { ThreadView(row: $0) }
         .sheet(isPresented: $debugAdd) { AddAccountView() }
         .onChange(of: model.rows.count) { debugShow() }
@@ -96,7 +108,7 @@ struct InboxView: View {
     @State private var debugShown = false
 
     /// Debug builds only: `-show thread` opens the longest conversation and
-    /// `-show snooze` the snooze sheet (`-show settings`, Settings; `-show add`, Add Account) once the list loads, for screenshots
+    /// `-show snooze` the snooze sheet (`-show settings`, Settings; `-show add`, Add Account; `-show folders`, Folders) once the list loads, for screenshots
     /// from the simulator (where nothing can tap).
     private func debugShow() {
         #if DEBUG
@@ -109,6 +121,7 @@ struct InboxView: View {
         case "snooze": snoozing = t
         case "settings": settingsOpen = true
         case "add": debugAdd = true
+        case "folders": foldersOpen = true
         default: break
         }
         #endif
@@ -179,11 +192,14 @@ struct ThreadRowView: View {
 
 struct EmptyListView: View {
     let mailbox: Mailbox
+    var inFolder = false
     let searching: Bool
 
     var body: some View {
         if searching {
             ContentUnavailableView.search
+        } else if inFolder {
+            ContentUnavailableView("No conversations here", systemImage: "folder")
         } else {
             switch mailbox {
             case .inbox:

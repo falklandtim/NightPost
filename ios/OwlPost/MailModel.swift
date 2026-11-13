@@ -17,6 +17,9 @@ final class MailModel {
     private(set) var accounts: [AccountInfo] = []
     private(set) var rows: [ThreadRow] = []
     var mailbox: Mailbox = .inbox
+    /// One account's folder, picked in Folders; `nil` shows `mailbox`
+    /// across every account.
+    var folder: FolderInfo?
     var search = ""
     var error: String?
     private(set) var syncing = false
@@ -70,15 +73,30 @@ final class MailModel {
 
     func reload() async {
         guard let mail else { return }
-        let (box, query) = (mailbox, search)
+        let (box, folder, query) = (mailbox, folder, search)
         do {
-            let (a, r) = try await background { (try mail.accounts(), try mail.threads(mailbox: box, query: query, limit: 300)) }
+            let (a, r) = try await background {
+                let rows = if let folder {
+                    try mail.folderThreads(folderId: folder.id, query: query, limit: 300)
+                } else {
+                    try mail.threads(mailbox: box, query: query, limit: 300)
+                }
+                return (try mail.accounts(), rows)
+            }
             accounts = a
             // Another list may have been picked meanwhile; keep the newest.
-            if box == mailbox && query == search {
+            if box == mailbox && folder == self.folder && query == search {
                 rows = r
             }
         } catch {
+            // The folder went (removed on the server, or its account
+            // removed): go back to the Inbox rather than show an error.
+            if folder != nil && folder == self.folder {
+                self.folder = nil
+                mailbox = .inbox
+                await reload()
+                return
+            }
             show(error)
         }
     }
@@ -158,6 +176,29 @@ final class MailModel {
 
     func removeAccount(_ a: AccountInfo) async {
         await act { try $0.removeAccount(accountId: a.id) }
+    }
+
+    /// An account's folders, standard ones first, then its own as a tree.
+    func folders(_ accountId: Int64) async -> [FolderInfo] {
+        guard let mail else { return [] }
+        do {
+            return try await background { try mail.folders(accountId: accountId) }
+        } catch {
+            show(error)
+            return []
+        }
+    }
+
+    /// Show one folder's conversations (or, with `nil`, the unified lists).
+    func open(_ f: FolderInfo?) async {
+        folder = f
+        rows = []
+        await reload()
+    }
+
+    /// What the list is called: the folder's name, or the unified list's.
+    var title: String {
+        folder?.name ?? mailbox.title
     }
 
     func account(_ id: Int64) -> AccountInfo? {

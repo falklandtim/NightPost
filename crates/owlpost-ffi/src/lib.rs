@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 
 uniffi::setup_scaffolding!();
 
+mod folders;
 mod google;
+pub use folders::{FolderInfo, FolderKind};
 pub use google::GoogleSignIn;
 
 /// What went wrong, in words to show the user.

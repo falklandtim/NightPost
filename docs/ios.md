@@ -31,6 +31,7 @@ ios/google-client-id.txt  the iOS OAuth client ID (not committed)
    - `messages(accountId, threadKey)`: a conversation, oldest first, plain text;
    - `sync(accountId?)`: new mail, plus snoozes, pins and tabs from the server;
    - `setRead`, `setStarred`, `setPinned`, `archive`, `trash`, `snooze(until)`, `unsnooze`;
+   - `folders(accountId)`: an account's folders as the desktop sidebar lists them (standard first, then its own as a tree, with depth and parent), and `folderThreads(folderId, query, limit)`: one folder's conversations;
    - `startGoogleSignIn(clientId, loginHint)` and `finishGoogleSignIn(signIn, redirect)` (see *Sign in with Google* below).
    
    Errors come to Swift as `MailError.Failed(message)`, in words to show. Tested in Rust against the demo accounts, and from a Swift program on the Mac (open, list, read, snooze, an error).
@@ -46,6 +47,8 @@ ios/google-client-id.txt  the iOS OAuth client ID (not committed)
 6. **Sign in with Google** (2026-11-14): a button on the welcome screen and at the top of Add Account. It opens Google's page in Apple's sign-in sheet (`ASWebAuthenticationSession`), which closes when Google returns to the app through the client ID reversed (`com.googleusercontent.apps.…`). The core checks the link belongs to this sign-in, redeems the code, saves the refresh token and the client ID in the phone's keychain, and adds the account; an account already here with an app password switches to Google sign-in. Removing an account also forgets its Google sign-in. Tested in Rust up to the call to Google; the real sign-in is for Tim to try.
 
 7. **App icon** (2026-11-14): the desktop's owl, filled square for iOS (which rounds the corners itself), in `ios/OwlPost/Assets.xcassets`. **The list fills in during a sync**, every 3 seconds, so a long first sync doesn't show an empty Inbox until the end.
+
+8. **Folders** (☰ → Folders): each account's own folders and Gmail labels, standard ones first, then the account's own as a tree; a parent folds its subfolders away and, folded, counts their unread mail too. Tapping one shows its conversations in the main list, with the same swipes; picking a list from the ☰ menu goes back to the unified lists. OwlPost's hidden folders are left out, as on the desktop.
 
 ## Sign in with Google
 

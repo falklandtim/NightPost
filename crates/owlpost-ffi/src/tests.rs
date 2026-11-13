@@ -165,3 +165,51 @@ fn google_sign_in_refuses_links_that_are_not_its_own() {
     assert!(message.contains("cancelled"), "{message}");
     assert_eq!(mail.accounts().unwrap().len(), before, "no account added");
 }
+
+#[test]
+fn folders_are_listed_as_a_tree() {
+    let (mail, _) = demo();
+    let acc = mail.accounts().unwrap()[0].clone();
+    {
+        let store = mail.store().unwrap();
+        // Out of order, a missing middle level, a name that sorts between a
+        // parent and its child by raw path, and OwlPost's hidden folders.
+        for path in ["Work/Receipts/2026", "Work", "Work B", "Work/Clients", "Archive Old", "OwlPost Sync", "OwlPost Snoozed"] {
+            store.upsert_folder(acc.id, path, owlpost_core::FolderRole::Other).unwrap();
+        }
+    }
+    let folders = mail.folders(acc.id).unwrap();
+    let names: Vec<(&str, u32)> = folders.iter().map(|f| (f.path.as_str(), f.depth)).collect();
+    let first_other = folders.iter().position(|f| f.kind == FolderKind::Other).unwrap();
+    assert!(folders[..first_other].iter().all(|f| f.kind != FolderKind::Other && f.depth == 0), "standard folders first: {names:?}");
+    assert_eq!(folders[0].kind, FolderKind::Inbox);
+    assert_eq!(folders[0].name, "Inbox");
+    // The demo's own folders sit among them, so only look at ours.
+    let ours: Vec<(&str, u32)> = names[first_other..].iter().copied().filter(|(p, _)| p.starts_with("Work") || p.starts_with("Archive Old") || p.starts_with("OwlPost")).collect();
+    assert_eq!(
+        ours,
+        [("Archive Old", 0), ("Work", 0), ("Work/Clients", 1), ("Work/Receipts/2026", 1), ("Work B", 0)],
+        "each folder after its parent; hidden folders left out"
+    );
+    let id = |p: &str| folders.iter().find(|f| f.path == p).unwrap().id;
+    let deep = folders.iter().find(|f| f.path == "Work/Receipts/2026").unwrap();
+    assert_eq!((deep.name.as_str(), deep.parent_id), ("2026", Some(id("Work"))), "nearest folder that exists");
+    assert!(mail.folders(9999).is_err());
+}
+
+#[test]
+fn a_folder_lists_its_conversations() {
+    let (mail, _) = demo();
+    let acc = mail.accounts().unwrap()[0].clone();
+    let folders = mail.folders(acc.id).unwrap();
+    let inbox = folders.iter().find(|f| f.kind == FolderKind::Inbox).unwrap();
+    let rows = mail.folder_threads(inbox.id, String::new(), 200).unwrap();
+    assert!(!rows.is_empty() && rows.iter().all(|r| r.account_id == acc.id), "only this account's mail");
+    let unified = inbox_rows_for(&mail, acc.id);
+    assert_eq!(rows.len(), unified, "same conversations as this account's part of the Inbox");
+    assert!(mail.folder_threads(9999, String::new(), 10).is_err());
+}
+
+fn inbox_rows_for(mail: &Mail, account_id: i64) -> usize {
+    inbox(mail).iter().filter(|r| r.account_id == account_id).count()
+}
