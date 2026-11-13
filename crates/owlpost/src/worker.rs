@@ -112,6 +112,39 @@ impl Cmd {
             _ => None,
         }
     }
+
+    /// For mailbox actions: the account, and what to call the action in Sync
+    /// activity when it fails. None for the rest, because their errors can
+    /// quote attachment names or recipients' addresses, which mustn't reach
+    /// the log.
+    fn failure_note(&self) -> Option<(Option<AccountId>, &'static str)> {
+        Some(match self {
+            Cmd::SetUnread(a, ..) => (Some(*a), "Marking read or unread"),
+            Cmd::SetStarred(a, ..) => (Some(*a), "Starring"),
+            Cmd::TabChange(_, moved) => (moved.as_ref().map(|m| m.0), "Changing inbox tabs"),
+            Cmd::Move(a, _, FolderRole::Trash) => (Some(*a), "Moving to Trash"),
+            Cmd::Move(a, _, FolderRole::Archive) => (Some(*a), "Archiving"),
+            Cmd::Move(a, ..) | Cmd::MoveTo(a, ..) | Cmd::MoveAcross(a, ..) => (Some(*a), "Moving"),
+            Cmd::Label(a, ..) => (Some(*a), "Labelling"),
+            Cmd::CreateFolder(a, ..) | Cmd::NewFolder(a, ..) => (Some(*a), "Making a folder"),
+            Cmd::DeleteFolder(_) => (None, "Deleting a folder"),
+            Cmd::Restore(a, ..) => (Some(*a), "Undo"),
+            Cmd::Snooze(a, ..) => (Some(*a), "Snoozing"),
+            Cmd::Unsnooze(a, ..) => (Some(*a), "Unsnoozing"),
+            Cmd::SyncPins(a) => (Some(*a), "Saving pins"),
+            _ => return None,
+        })
+    }
+}
+
+/// An action failed: say so in a toast and, for mailbox actions, keep it in
+/// Sync activity and the log file too, since a toast is gone in seconds.
+fn action_failed(store: &Store, note: Option<(Option<AccountId>, &'static str)>, ev: &Sender<Event>, e: &anyhow::Error) {
+    if let Some((account, what)) = note {
+        store.note(account, owlpost_core::activity::Level::Error, format!("{what} failed: {e:#}"));
+    }
+    let _ = ev.send(Event::Error(format!("{e:#}")));
+    let _ = ev.send(Event::Changed);
 }
 
 /// Runs actions on the same conversation one after another, in order.
@@ -578,6 +611,7 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
     let account = |id: AccountId| -> anyhow::Result<Account> {
         store.account(id)?.ok_or_else(|| anyhow::anyhow!("account {id} no longer exists"))
     };
+    let note = cmd.failure_note();
     let result: anyhow::Result<()> = (|| {
         match cmd {
             Cmd::Attachment(m, index, what) => {
@@ -778,8 +812,7 @@ fn run_action(db: &std::path::Path, cmd: Cmd, ev: &Sender<Event>, sync_tx: &Send
         Ok(())
     })();
     if let Err(e) = result {
-        let _ = ev.send(Event::Error(format!("{e:#}")));
-        let _ = ev.send(Event::Changed);
+        action_failed(&store, note, ev, &e);
     }
 }
 
@@ -985,6 +1018,21 @@ mod tests {
         }
         assert_eq!(*log.lock().unwrap(), [0, 1, 2, 3, 4]);
         assert!(turns.state.lock().unwrap().is_empty(), "finished conversations are forgotten");
+    }
+
+    #[test]
+    fn failed_actions_are_kept_in_sync_activity() {
+        let db = std::env::temp_dir().join(format!("sp-worker-fail-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
+        let (sync_tx, _sync_rx) = crossbeam_channel::unbounded();
+        // Account 999 doesn't exist, so the move fails without a server.
+        run_action(&db, Cmd::Move(999, "t".into(), FolderRole::Trash), &ev_tx, &sync_tx);
+        assert!(ev_rx.try_iter().any(|e| matches!(e, Event::Error(_))), "a toast still says so");
+        let store = Store::open(&db).unwrap();
+        let problems = store.activity(10, None, true).unwrap();
+        assert!(problems.iter().any(|p| p.text.starts_with("Moving to Trash failed:") && p.text.contains("account 999")), "{problems:?}");
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]

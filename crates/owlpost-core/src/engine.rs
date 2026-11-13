@@ -397,14 +397,17 @@ pub fn move_thread_to(store: &Store, account: &Account, thread_key: &str, target
     drop(caps);
     let mut moved_from = Vec::new();
     for ((fid, path, _), uids) in sources {
-        s.select(&path)?;
+        // Name the step that failed: the server's own words ("System Error",
+        // "parse error") don't say which command it turned down.
+        let step = |what: &str| format!("{what} ({} messages, {path} → {})", uids.len(), target.path);
+        s.select(&path).with_context(|| step("opening the folder"))?;
         let set = uid_set(&uids);
         if has_move {
-            s.uid_mv(&set, &target.path)?;
+            s.uid_mv(&set, &target.path).with_context(|| step("MOVE"))?;
         } else {
-            s.uid_copy(&set, &target.path)?;
-            s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)")?;
-            s.expunge()?;
+            uid_copy(&mut s, &set, &target.path).with_context(|| step("COPY"))?;
+            s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").with_context(|| step("marking deleted"))?;
+            s.expunge().with_context(|| step("EXPUNGE"))?;
         }
         moved_from.push((fid, uids));
     }
@@ -449,13 +452,13 @@ pub fn restore_thread(store: &Store, account: &Account, thread_key: &str, to: &F
     s.select(&from.path)?;
     let set = uid_set(&uids);
     if copy_only {
-        s.uid_copy(&set, &to.path)?;
+        uid_copy(&mut s, &set, &to.path)?;
     } else {
         let has_move = s.capabilities()?.has_str("MOVE");
         if has_move {
             s.uid_mv(&set, &to.path)?;
         } else {
-            s.uid_copy(&set, &to.path)?;
+            uid_copy(&mut s, &set, &to.path)?;
             s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)")?;
             s.expunge()?;
         }
@@ -469,6 +472,23 @@ pub fn restore_thread(store: &Store, account: &Account, thread_key: &str, to: &F
 /// Quote a mailbox / label name for an IMAP command.
 fn imap_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Add or remove a Gmail label. `.SILENT` matters: without it Gmail echoes
+/// each message's labels back (`* 1 FETCH (X-GM-LABELS …)`), which
+/// imap-proto 0.10 can't parse, so a label change that worked was reported as
+/// "Unable to parse status response" and the rest of the reply went unread.
+fn gmail_label<T: std::io::Read + std::io::Write>(s: &mut imap::Session<T>, set: &str, label: &str, add: bool) -> imap::error::Result<()> {
+    let op = if add { "+X-GM-LABELS.SILENT" } else { "-X-GM-LABELS.SILENT" };
+    s.uid_store(set, format!("{op} ({})", imap_quote(label))).map(|_| ())
+}
+
+/// `UID COPY` into a folder, with its name quoted. imap 2.4.1's `uid_copy`
+/// sends the name bare (unlike `uid_mv` and `select`), so a folder with a
+/// space, such as iCloud's "Deleted Messages", reached the server as two
+/// words and it answered "Parse Error". Don't call `Session::uid_copy` directly.
+fn uid_copy<T: std::io::Read + std::io::Write>(s: &mut imap::Session<T>, set: &str, folder: &str) -> imap::error::Result<()> {
+    s.uid_copy(set, imap_quote(folder))
 }
 
 /// Add or remove a label. Gmail uses real labels (`X-GM-LABELS`); on other
@@ -492,21 +512,20 @@ pub fn set_label(store: &Store, account: &Account, thread_key: &str, label: &Fol
             .or_else(|| copies.iter().find(|((id, _, _), _)| *id != label.id))
             .or_else(|| copies.iter().next())
             .ok_or_else(|| anyhow!("conversation not found"))?;
-        s.select(path)?;
-        let op = if add { "+X-GM-LABELS" } else { "-X-GM-LABELS" };
-        s.uid_store(uid_set(uids), format!("{op} ({})", imap_quote(&label.path)))?;
+        s.select(path).with_context(|| format!("opening {path}"))?;
+        gmail_label(&mut s, &uid_set(uids), &label.path, add).with_context(|| format!("changing label {} ({} messages)", label.path, uids.len()))?;
     } else if add {
         let ((_, path, _), uids) = copies
             .iter()
             .find(|((id, _, _), _)| *id != label.id)
             .ok_or_else(|| anyhow!("conversation not found"))?;
-        s.select(path)?;
-        s.uid_copy(uid_set(uids), &label.path)?;
+        s.select(path).with_context(|| format!("opening {path}"))?;
+        uid_copy(&mut s, &uid_set(uids), &label.path).with_context(|| format!("COPY to {} ({} messages)", label.path, uids.len()))?;
     } else if let Some(((_, path, _), uids)) = copies.iter().find(|((id, _, _), _)| *id == label.id) {
-        s.select(path)?;
+        s.select(path).with_context(|| format!("opening {path}"))?;
         let set = uid_set(uids);
-        s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)")?;
-        s.expunge()?;
+        s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").with_context(|| format!("marking deleted in {path}"))?;
+        s.expunge().with_context(|| format!("EXPUNGE in {path}"))?;
     }
     if add {
         let _ = sync_folder(store, &mut s, account, label);
@@ -589,7 +608,7 @@ pub fn delete_folder(store: &Store, account: &Account, folder: &Folder) -> Resul
                     if s.capabilities()?.has_str("MOVE") {
                         s.uid_mv(&set, &t.path)?;
                     } else {
-                        s.uid_copy(&set, &t.path)?;
+                        uid_copy(&mut s, &set, &t.path)?;
                         s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)")?;
                         s.expunge()?;
                     }
@@ -945,6 +964,62 @@ fn demo_attachment(filename: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// A pretend IMAP server: plays back `replies` and records what was sent.
+    struct Script {
+        replies: std::io::Cursor<Vec<u8>>,
+        sent: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    }
+
+    impl std::io::Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.replies.read(buf)
+        }
+    }
+
+    impl std::io::Write for Script {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sent.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn gmail_labels_are_changed_silently() {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let script = Script { replies: std::io::Cursor::new(b"a1 OK logged in\r\na2 OK stored\r\na3 OK stored\r\n".to_vec()), sent: sent.clone() };
+        let mut s = imap::Client::new(script).login("u", "p").map_err(|e| e.0).unwrap();
+        super::gmail_label(&mut s, "7", "Invoices", true).unwrap();
+        super::gmail_label(&mut s, "7", "Invoices", false).unwrap();
+        let sent = String::from_utf8(sent.borrow().clone()).unwrap();
+        assert!(sent.contains("a2 UID STORE 7 +X-GM-LABELS.SILENT (\"Invoices\")\r\n"), "{sent}");
+        assert!(sent.contains("a3 UID STORE 7 -X-GM-LABELS.SILENT (\"Invoices\")\r\n"), "{sent}");
+    }
+
+    /// Why `gmail_label` uses `.SILENT`: the IMAP library can't read Gmail's
+    /// label echo. If this starts passing, a library update fixed it.
+    #[test]
+    fn imap_library_cant_read_gmail_label_echo() {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let replies = b"a1 OK logged in\r\n* 1 FETCH (X-GM-LABELS (\"\\\\Inbox\" Invoices) UID 7)\r\na2 OK stored\r\n".to_vec();
+        let script = Script { replies: std::io::Cursor::new(replies), sent };
+        let mut s = imap::Client::new(script).login("u", "p").map_err(|e| e.0).unwrap();
+        let e = s.uid_store("7", "+X-GM-LABELS (Invoices)").err().map(|e| e.to_string());
+        assert_eq!(e.as_deref(), Some("Unable to parse status response"));
+    }
+
+    #[test]
+    fn copy_quotes_folder_names_with_spaces() {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let script = Script { replies: std::io::Cursor::new(b"a1 OK logged in\r\na2 OK copied\r\n".to_vec()), sent: sent.clone() };
+        let mut s = imap::Client::new(script).login("u", "p").map_err(|e| e.0).unwrap();
+        super::uid_copy(&mut s, "7", "Deleted Messages").unwrap();
+        let sent = String::from_utf8(sent.borrow().clone()).unwrap();
+        assert!(sent.contains("a2 UID COPY 7 \"Deleted Messages\"\r\n"), "{sent}");
+    }
+
     use super::*;
 
     #[test]
