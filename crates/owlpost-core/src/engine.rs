@@ -168,8 +168,14 @@ fn sync_all_folders(store: &Store, account: &Account, mut progress: impl FnMut(S
     store.delete_folders_not_in(account.id, &paths)?;
 
     let mut folders = store.folders(account.id)?;
-    // Inbox first so the most important mail lands quickly.
-    folders.sort_by_key(|f| if f.role == FolderRole::Inbox { 0 } else { 1 });
+    // Inbox first so the most important mail lands quickly; then Gmail's
+    // All Mail, so the labels after it can mostly reuse its copies
+    // (reuse_known_mail) instead of downloading the same mail again.
+    folders.sort_by_key(|f| match f.role {
+        FolderRole::Inbox => 0,
+        FolderRole::All => 1,
+        _ => 2,
+    });
     let total = folders.len();
     let mut new_total = 0;
     let mut failed = 0;
@@ -258,6 +264,37 @@ fn retry_on_new_connection<S, T>(
     }
 }
 
+/// Of the `new` UIDs, file the emails this account already has (the same
+/// Message-ID in another folder) from the local copy, and return the rest,
+/// which need downloading. Asking for only the Message-ID costs a few bytes
+/// an email, against the whole email with its attachments: on Gmail, where
+/// every label is a folder holding copies, this is most of a first sync.
+fn reuse_known_mail<T: std::io::Read + std::io::Write>(store: &Store, session: &mut imap::Session<T>, account: &Account, folder: &Folder, new: &[u32]) -> Result<Vec<u32>> {
+    let mut download = Vec::new();
+    for chunk in new.chunks(500) {
+        let fetches = session.uid_fetch(uid_set(chunk), "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")?;
+        let mut answered = HashSet::new();
+        for fetch in fetches.iter() {
+            let Some(uid) = fetch.uid else { continue };
+            answered.insert(uid);
+            let (unread, starred) = flags(fetch.flags());
+            let unread = unread && !matches!(folder.role, FolderRole::Sent | FolderRole::Drafts);
+            let known = match fetch.header().and_then(parse::message_id_of) {
+                Some(id) => store.copy_known_message(account.id, &id, folder.id, uid, unread, starred)?,
+                None => false,
+            };
+            if !known {
+                download.push(uid);
+            }
+        }
+        // A server that skipped one: download it the usual way.
+        download.extend(chunk.iter().filter(|u| !answered.contains(u)));
+    }
+    // Newest first, as uids_to_fetch gave them.
+    download.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(download)
+}
+
 fn sync_folder(store: &Store, session: &mut Session, account: &Account, folder: &Folder) -> Result<usize> {
     let mbox = session.select(&folder.path)?;
     let validity = mbox.uid_validity.unwrap_or(0);
@@ -285,6 +322,7 @@ fn sync_folder(store: &Store, session: &mut Session, account: &Account, folder: 
     }
 
     let new = uids_to_fetch(&server, &known, folder.last_uid);
+    let new = reuse_known_mail(store, session, account, folder, &new)?;
     let mut inserted = 0;
     for chunk in new.chunks(FETCH_CHUNK) {
         let set = uid_set(chunk);
@@ -1083,6 +1121,45 @@ mod tests {
     }
 
     use super::*;
+
+    /// A label's first sync files mail that's already here from the local
+    /// copy, asks only for Message-IDs, and downloads just the rest.
+    #[test]
+    fn mail_already_here_isnt_downloaded_again() {
+        let p = std::env::temp_dir().join(format!("owlpost-reuse-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let store = Store::open(&p).unwrap();
+        crate::demo::seed(&store).unwrap();
+        let row = store.threads(&crate::models::MailboxView::Unified(FolderRole::Inbox), "", 1).unwrap()[0].clone();
+        let have = store.thread_messages(row.account_id, &row.thread_key).unwrap()[0].clone();
+        let account = store.accounts().unwrap().into_iter().find(|a| a.id == have.account_id).unwrap();
+        let label = store.upsert_folder(account.id, "Label", FolderRole::Other).unwrap();
+        let folder = store.folders(account.id).unwrap().into_iter().find(|f| f.id == label).unwrap();
+
+        let header = |id: &str| format!("Message-ID: <{id}>\r\n\r\n");
+        let (known, unknown) = (header(&have.message_id), header("new@example.com"));
+        let replies = format!(
+            "a1 OK logged in\r\n\
+             * 1 FETCH (UID 41 FLAGS (\\Seen) BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{known})\r\n\
+             * 2 FETCH (UID 42 FLAGS () BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{unknown})\r\n\
+             a2 OK fetched\r\n",
+            known.len(),
+            unknown.len()
+        );
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let script = Script { replies: std::io::Cursor::new(replies.into_bytes()), sent: sent.clone() };
+        let mut s = imap::Client::new(script).login("u", "p").map_err(|e| e.0).unwrap();
+
+        // 43 isn't answered at all: it's downloaded the usual way.
+        let download = reuse_known_mail(&store, &mut s, &account, &folder, &[43, 42, 41]).unwrap();
+        assert_eq!(download, [43, 42]);
+        let sent = String::from_utf8(sent.borrow().clone()).unwrap();
+        assert!(sent.contains("BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]") && !sent.contains("BODY.PEEK[]"), "{sent}");
+        assert_eq!(store.known_uids(label).unwrap(), [41]);
+        let copy = store.thread_copies(account.id, &have.thread_key).unwrap().into_iter().find(|m| m.folder_id == label).unwrap();
+        assert_eq!((copy.subject, copy.body_text, copy.unread), (have.subject, have.body_text, false));
+        let _ = std::fs::remove_file(&p);
+    }
 
     /// Sync connections time out instead of waiting for ever on a server
     /// that has gone quiet.

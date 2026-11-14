@@ -338,3 +338,11 @@ fn addresses_are_suggested() {
     assert!(found.iter().any(|c| c.email == someone), "{someone} in {found:?}");
     assert!(mail.suggest_contacts("a".into()).unwrap().is_empty(), "one letter is too few");
 }
+
+#[test]
+fn sync_progress_is_clear_between_syncs() {
+    let (mail, _) = demo();
+    assert_eq!(mail.sync_progress(), None);
+    mail.sync(None).unwrap();
+    assert_eq!(mail.sync_progress(), None, "a finished sync leaves no progress behind");
+}

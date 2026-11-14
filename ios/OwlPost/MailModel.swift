@@ -23,6 +23,9 @@ final class MailModel {
     var search = ""
     var error: String?
     private(set) var syncing = false
+    /// How far the running sync has got (folder 12 of 110), for the
+    /// caption by the spinner; `nil` when not syncing.
+    private(set) var syncStatus: SyncStatus?
     /// The demo accounts: seeded locally, never on the network.
     private(set) var isDemo = false
 
@@ -59,6 +62,11 @@ final class MailModel {
             #if DEBUG
             // UI tests: reload as a long sync does, to check screens
             // survive the list changing underneath them.
+            // Screenshots of the sync caption (the demo never syncs).
+            if ProcessInfo.processInfo.arguments.contains("-syncing") {
+                syncing = true
+                syncStatus = SyncStatus(email: "alex@icloud.demo", folder: "INBOX", done: 83, total: 110)
+            }
             if ProcessInfo.processInfo.arguments.contains("-churn") {
                 Task {
                     while true {
@@ -120,13 +128,22 @@ final class MailModel {
         defer { syncing = false }
         // A first sync of a big account takes many minutes; show mail as it
         // arrives rather than an empty Inbox until the very end.
+        // The folder count every second (it only reads a number the sync
+        // keeps), the list every three.
         let progress = Task {
+            var tick = 0
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
-                if !Task.isCancelled { await reload() }
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { break }
+                syncStatus = mail.syncProgress()
+                tick += 1
+                if tick % 3 == 0 { await reload() }
             }
         }
-        defer { progress.cancel() }
+        defer {
+            progress.cancel()
+            syncStatus = nil
+        }
         do {
             let results = try await background { try mail.sync(accountId: nil) }
             let failed = results.compactMap { r in r.error.map { "\(r.email): \($0)" } }

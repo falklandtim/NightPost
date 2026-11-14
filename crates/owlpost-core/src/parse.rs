@@ -400,6 +400,13 @@ fn inline_links(html: &str) -> String {
 
 /// Parse a raw message. `thread_key` is filled with the root reference and
 /// should be refined with [`crate::store::Store::resolve_thread_key`].
+/// The Message-ID in a header block (from a `HEADER.FIELDS (MESSAGE-ID)`
+/// fetch), read the same way [`parse_message`] reads it, or `None` if the
+/// email has none.
+pub fn message_id_of(header: &[u8]) -> Option<String> {
+    MessageParser::default().parse_headers(header)?.message_id().map(|s| s.to_string()).filter(|s| !s.is_empty())
+}
+
 pub fn parse_message(raw: &[u8], account_id: AccountId, folder_id: FolderId, uid: u32) -> Option<Message> {
     let msg = MessageParser::default().parse(raw)?;
     let from = contacts(msg.from()).into_iter().next().unwrap_or_default();
@@ -461,6 +468,12 @@ pub fn parse_message(raw: &[u8], account_id: AccountId, folder_id: FolderId, uid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_id_from_a_header_fetch() {
+        assert_eq!(message_id_of(b"Message-ID: <abc@example.com>\r\n\r\n").as_deref(), Some("abc@example.com"));
+        assert_eq!(message_id_of(b"\r\n"), None);
+    }
 
     #[test]
     fn html_only_mail_reads_without_table_borders() {

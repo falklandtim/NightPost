@@ -73,7 +73,7 @@ To set it up (done for timson.co on 2026-11-14):
 4. **In the simulator** (it runs inside Xcode 27; there's no separate Simulator app): pick an iPhone at the top of the window and press ⌘R. *Try the Demo* opens the made-up accounts; *Add an Account* works with real ones. With a mouse or trackpad: click and drag a row sideways to swipe, drag the list down to sync. Light or dark: ☰ → Settings → Appearance (⇧⌘A doesn't switch the embedded simulator).
 5. **After changing Rust code**, run `scripts/ios-rust.sh` again before ⌘R. Swift changes only need ⌘R.
 
-Debug launch options (*Edit Scheme > Run > Arguments*, or `xcrun simctl launch <device> co.timson.OwlPost …`): `-demo` starts in the demo accounts; `-show thread|snooze|settings|add|folders|compose|new|html` opens that screen once the list loads, for screenshots. `-churn` reloads the list every second, as a long sync does.
+Debug launch options (*Edit Scheme > Run > Arguments*, or `xcrun simctl launch <device> co.timson.OwlPost …`): `-demo` starts in the demo accounts; `-show thread|snooze|settings|add|folders|compose|new|html` opens that screen once the list loads, for screenshots. `-churn` reloads the list every second, as a long sync does. `-syncing` shows the sync spinner with a folder count.
 
 UI tests (`ios/OwlPostUITests`, demo accounts only) tap and type in the composer as a finger would: `xcodebuild test -project ios/OwlPost.xcodeproj -scheme OwlPostUITests -destination 'id=<simulator>'`, or ⌘U in Xcode with that scheme.
 

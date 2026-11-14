@@ -651,6 +651,24 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// File a copy of a message this account already has (found by its
+    /// Message-ID, in any folder) under `uid` in `folder_id`, with the
+    /// server's flags, instead of downloading it again. Gmail shows one
+    /// email in every label it has, so most of a label's first sync is mail
+    /// that's already here. Returns false if there's no such message.
+    pub fn copy_known_message(&self, account_id: AccountId, message_id: &str, folder_id: FolderId, uid: u32, unread: bool, starred: bool) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT INTO messages (account_id,folder_id,uid,message_id,thread_key,in_reply_to,refs,subject,
+                from_name,from_email,to_json,cc_json,date,snippet,body_text,body_html,attachments,unread,starred,category)
+             SELECT account_id,?3,?4,message_id,thread_key,in_reply_to,refs,subject,
+                from_name,from_email,to_json,cc_json,date,snippet,body_text,body_html,attachments,?5,?6,category
+             FROM messages WHERE account_id=?1 AND message_id=?2 LIMIT 1
+             ON CONFLICT(folder_id,uid) DO UPDATE SET unread=excluded.unread, starred=excluded.starred",
+            params![account_id, message_id, folder_id, uid, unread, starred],
+        )?;
+        Ok(n > 0)
+    }
+
     /// The UIDs cached for a folder (to compare with the server's).
     pub fn known_uids(&self, folder_id: FolderId) -> Result<Vec<u32>> {
         let mut st = self.conn.prepare("SELECT uid FROM messages WHERE folder_id=?1")?;

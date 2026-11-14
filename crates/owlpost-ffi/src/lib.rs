@@ -172,15 +172,37 @@ pub struct SyncResult {
     pub error: Option<String>,
 }
 
+/// How far a running sync has got: which account, and how many of its
+/// folders are done, for the caption by the spinner.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct SyncStatus {
+    /// The account being synced.
+    pub email: String,
+    /// The folder being synced now.
+    pub folder: String,
+    /// Folders finished so far in this account.
+    pub done: u32,
+    /// Folders in this account.
+    pub total: u32,
+}
+
 /// The mail on this phone: one database, every account in it.
 #[derive(uniffi::Object)]
 pub struct Mail {
     /// rusqlite connections can't be shared between threads, so calls take
     /// turns on this one; network work opens its own (see [`Mail::worker`]).
     store: Mutex<Store>,
+    /// Where the running sync is; `None` between syncs. Its own lock, so
+    /// the app can ask while the sync holds everything else.
+    progress: Mutex<Option<SyncStatus>>,
 }
 
 impl Mail {
+    fn set_progress(&self, p: Option<SyncStatus>) {
+        // A poisoned lock only means a panic elsewhere; the value is fine.
+        *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = p;
+    }
+
     fn store(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
         // A panic mid-call poisons the lock; the database itself is still
         // consistent (SQLite transactions), so carry on with it.
@@ -217,7 +239,7 @@ impl Mail {
             return Err(fail("OwlPost's folders can't change while it's running"));
         }
         let store = Store::open_default()?;
-        Ok(Arc::new(Self { store: Mutex::new(store) }))
+        Ok(Arc::new(Self { store: Mutex::new(store), progress: Mutex::new(None) }))
     }
 
     /// A database at `path` holding only the demo accounts: for SwiftUI
@@ -226,7 +248,7 @@ impl Mail {
     pub fn open_demo(path: String) -> Result<Arc<Self>> {
         let store = Store::open(std::path::Path::new(&path))?;
         demo::seed(&store)?;
-        Ok(Arc::new(Self { store: Mutex::new(store) }))
+        Ok(Arc::new(Self { store: Mutex::new(store), progress: Mutex::new(None) }))
     }
 
     /// Every account, in the order they were added.
@@ -324,13 +346,29 @@ impl Mail {
             None => store.accounts()?,
         };
         let _ = snooze_sync::wake_due(&store);
-        Ok(accounts
+        let results = accounts
             .into_iter()
-            .map(|a| match engine::sync_account(&store, &a, |_| {}) {
-                Ok(n) => SyncResult { email: a.email, new_messages: n.try_into().unwrap_or(u32::MAX), error: None },
-                Err(e) => SyncResult { email: a.email, new_messages: 0, error: Some(format!("{e:#}")) },
+            .map(|a| {
+                let report = |p: engine::SyncProgress| {
+                    if let engine::SyncProgress::Folder { name, done, total, .. } = p {
+                        let n = |x: usize| x.try_into().unwrap_or(u32::MAX);
+                        self.set_progress(Some(SyncStatus { email: a.email.clone(), folder: name, done: n(done), total: n(total) }));
+                    }
+                };
+                match engine::sync_account(&store, &a, report) {
+                    Ok(n) => SyncResult { email: a.email, new_messages: n.try_into().unwrap_or(u32::MAX), error: None },
+                    Err(e) => SyncResult { email: a.email, new_messages: 0, error: Some(format!("{e:#}")) },
+                }
             })
-            .collect())
+            .collect();
+        self.set_progress(None);
+        Ok(results)
+    }
+
+    /// How far the running sync has got, or `None` if none is running.
+    /// Doesn't wait for the sync: ask as often as you like.
+    pub fn sync_progress(&self) -> Option<SyncStatus> {
+        self.progress.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Mark a conversation read or unread, here and on the server.

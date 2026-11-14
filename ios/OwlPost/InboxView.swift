@@ -92,6 +92,13 @@ struct InboxView: View {
                 HStack {
                     if model.syncing {
                         ProgressView()
+                        if let s = model.syncStatus, s.total > 1 {
+                            // Folder 84 of 110: a long first sync shows it's moving.
+                            Text("\(min(s.done + 1, s.total))/\(s.total)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .accessibilityLabel("Syncing folder \(min(s.done + 1, s.total)) of \(s.total)")
+                        }
                     }
                     Button { model.newMessage() } label: { Image(systemName: "square.and.pencil") }
                         .accessibilityLabel("New Message")
