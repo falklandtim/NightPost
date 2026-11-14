@@ -844,6 +844,36 @@ impl Store {
         Ok(())
     }
 
+    /// The `WHERE` words that pick one mailbox's messages for [`Store::threads`].
+    fn view_filter(view: &MailboxView, sql: &mut String, args: &mut Vec<Box<dyn rusqlite::ToSql>>) {
+        match view {
+            MailboxView::Folder(id) => {
+                sql.push_str(" AND m.folder_id = ? ");
+                args.push(Box::new(*id));
+            }
+            MailboxView::Everything => {}
+            MailboxView::Unified(FolderRole::Starred) => {
+                sql.push_str(" AND m.starred = 1 ");
+            }
+            // Gmail has no Archive folder: archived mail is what's in All
+            // Mail but not the Inbox. Accounts with a real Archive (iCloud)
+            // use that alone, so their All Mail (if any) isn't doubled up.
+            MailboxView::Unified(FolderRole::Archive) => {
+                sql.push_str(
+                    " AND (f.role = 'archive'
+                       OR (f.role = 'all'
+                           AND NOT EXISTS (SELECT 1 FROM folders fa WHERE fa.account_id = m.account_id AND fa.role = 'archive')
+                           AND NOT EXISTS (SELECT 1 FROM messages mi JOIN folders fi ON fi.id = mi.folder_id
+                                           WHERE mi.account_id = m.account_id AND mi.thread_key = m.thread_key AND fi.role = 'inbox'))) ",
+                );
+            }
+            MailboxView::Unified(role) => {
+                sql.push_str(" AND f.role = ? ");
+                args.push(Box::new(role.as_str().to_string()));
+            }
+        }
+    }
+
     /// Thread rows for the list view.
     ///
     /// * `query` – free text, matched against subject, sender and body.
@@ -858,20 +888,7 @@ impl Store {
              WHERE 1=1 ",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        match view {
-            MailboxView::Folder(id) => {
-                sql.push_str(" AND m.folder_id = ? ");
-                args.push(Box::new(*id));
-            }
-            MailboxView::Everything => {}
-            MailboxView::Unified(FolderRole::Starred) => {
-                sql.push_str(" AND m.starred = 1 ");
-            }
-            MailboxView::Unified(role) => {
-                sql.push_str(" AND f.role = ? ");
-                args.push(Box::new(role.as_str().to_string()));
-            }
-        }
+        Self::view_filter(view, &mut sql, &mut args);
         if !query.trim().is_empty() {
             for word in query.split_whitespace() {
                 let (field, term) = match word.split_once(':') {
@@ -1207,6 +1224,46 @@ mod tests {
         assert!(mine.iter().all(|c| !c.email.eq_ignore_ascii_case(&me)));
         // Sam is someone Alex wrote to, so sorts well even by first name.
         assert!(s.suggest_contacts("sam", 5).unwrap().iter().any(|c| c.email == "sam@northwind.demo"));
+    }
+
+    /// Real Gmail flags All Mail `\All` and has no Archive folder (unlike
+    /// the demo, which calls All Mail its Archive): Archive must still show
+    /// what's been archived, and not what's in the Inbox.
+    #[test]
+    fn gmail_archive_is_all_mail_minus_the_inbox() {
+        let s = tmp();
+        demo::seed(&s).unwrap();
+        let mut gmail = s.accounts().unwrap()[1].clone();
+        gmail.email = "real-gmail@example.com".into();
+        gmail.id = s.add_account(&gmail).unwrap();
+        let inbox = s.upsert_folder(gmail.id, "INBOX", FolderRole::Inbox).unwrap();
+        let all = s.upsert_folder(gmail.id, "[Gmail]/All Mail", FolderRole::All).unwrap();
+        let template = s.threads(&MailboxView::Unified(FolderRole::Inbox), "", 1).unwrap()[0].clone();
+        let template = s.thread_messages(template.account_id, &template.thread_key).unwrap()[0].clone();
+        let add = |id: &str, subject: &str, folder: FolderId, uid: u32| {
+            let mut m = template.clone();
+            m.account_id = gmail.id;
+            m.folder_id = folder;
+            m.uid = uid;
+            m.message_id = id.into();
+            m.subject = subject.into();
+            m.in_reply_to = String::new();
+            m.references = vec![];
+            m.thread_key = s.resolve_thread_key(gmail.id, id, "", &[]).unwrap();
+            s.insert_message(&m).unwrap();
+        };
+        // Still in the Inbox: a copy in both.
+        add("waiting@x", "Still in the inbox", inbox, 1);
+        add("waiting@x", "Still in the inbox", all, 1);
+        // Archived: only in All Mail.
+        add("done@x", "Archived already", all, 2);
+
+        let archive = s.threads(&MailboxView::Unified(FolderRole::Archive), "", 100).unwrap();
+        let mine: Vec<&str> = archive.iter().filter(|t| t.account_id == gmail.id).map(|t| t.subject.as_str()).collect();
+        assert_eq!(mine, ["Archived already"]);
+        // The iCloud-style account's real Archive still shows.
+        let icloud = s.accounts().unwrap()[0].id;
+        assert!(archive.iter().any(|t| t.account_id == icloud));
     }
 
     #[test]
