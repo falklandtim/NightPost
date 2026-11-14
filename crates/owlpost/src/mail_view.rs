@@ -70,14 +70,7 @@ fn host_list(hosts: &[String]) -> String {
     }
 }
 
-/// The Content Security Policy for the page and every email in it.
-pub fn csp(nonce: &str, remote: bool) -> String {
-    let net = if remote { " https: http:" } else { "" };
-    format!(
-        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'{net}; img-src data: cid:{net}; font-src data:{net}; \
-         frame-src 'self' about: data:; form-action 'none'; base-uri 'none'"
-    )
-}
+pub use owlpost_core::mail_html::csp;
 
 /// Plain text as HTML: escaped, links made clickable, quoted lines folded.
 pub fn text_html(text: &str) -> String {
@@ -229,12 +222,7 @@ pub fn document(page: &Page, col: &Colors) -> String {
                 } else {
                     "body{color:#1d1d1f;}".to_string()
                 };
-                let inner = format!(
-                    "<meta charset=utf-8><meta http-equiv=\"Content-Security-Policy\" content=\"{}\"><base target=\"_top\">\
-                     <style>html,body{{margin:0;padding:0;}} body{{font:14px/1.45 -apple-system,system-ui,sans-serif;word-wrap:break-word;}} img{{max-width:100%;height:auto;}} {colours}</style>{}",
-                    escape(&policy),
-                    html
-                );
+                let inner = owlpost_core::mail_html::email_frame(html, &policy, &colours, false);
                 body.push_str(&format!(
                     "<div class=\"html{}\"><iframe sandbox=\"allow-same-origin allow-popups allow-top-navigation-by-user-activation\" srcdoc=\"{}\"></iframe></div>",
                     if dark && !recolor { " paper" } else { "" },

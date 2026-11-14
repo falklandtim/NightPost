@@ -24,10 +24,14 @@ use std::sync::{Arc, Mutex};
 
 uniffi::setup_scaffolding!();
 
+mod compose;
 mod folders;
 mod google;
+mod reader;
+pub use compose::{ComposeKind, ContactSuggestion, Draft};
 pub use folders::{FolderInfo, FolderKind};
 pub use google::GoogleSignIn;
+pub use reader::{InlineImage, MessagePage};
 
 /// What went wrong, in words to show the user.
 #[derive(Debug, uniffi::Error)]

@@ -15,8 +15,18 @@ struct InboxView: View {
         @Bindable var model = model
         List {
             ForEach(model.rows, id: \.self) { t in
-                NavigationLink(value: t) {
-                    ThreadRowView(row: t, account: model.account(t.accountId), showAccount: model.accounts.count > 1)
+                Group {
+                    if isDrafts {
+                        // A draft opens in the composer, to carry on writing.
+                        Button { Task { await model.openDraft(t) } } label: {
+                            ThreadRowView(row: t, account: model.account(t.accountId), showAccount: model.accounts.count > 1)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        NavigationLink(value: t) {
+                            ThreadRowView(row: t, account: model.account(t.accountId), showAccount: model.accounts.count > 1)
+                        }
+                    }
                 }
                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
                     if model.mailbox == .snoozed {
@@ -79,8 +89,12 @@ struct InboxView: View {
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
-                if model.syncing {
-                    ProgressView()
+                HStack {
+                    if model.syncing {
+                        ProgressView()
+                    }
+                    Button { model.newMessage() } label: { Image(systemName: "square.and.pencil") }
+                        .accessibilityLabel("New Message")
                 }
             }
         }
@@ -104,11 +118,16 @@ struct InboxView: View {
         .task { debugShow() }
     }
 
+    /// Drafts (unified, or an account's Drafts folder) open in the composer.
+    private var isDrafts: Bool {
+        model.folder.map { $0.kind == .drafts } ?? (model.mailbox == .drafts)
+    }
+
     @State private var debugOpen: ThreadRow?
     @State private var debugShown = false
 
     /// Debug builds only: `-show thread` opens the longest conversation and
-    /// `-show snooze` the snooze sheet (`-show settings`, Settings; `-show add`, Add Account; `-show folders`, Folders) once the list loads, for screenshots
+    /// `-show snooze` the snooze sheet (`-show settings`, Settings; `-show add`, Add Account; `-show folders`, Folders; `-show compose`, a reply; `-show new`, a new message; `-show html`, an HTML email) once the list loads, for screenshots
     /// from the simulator (where nothing can tap).
     private func debugShow() {
         #if DEBUG
@@ -122,6 +141,15 @@ struct InboxView: View {
         case "settings": settingsOpen = true
         case "add": debugAdd = true
         case "folders": foldersOpen = true
+        case "compose": Task { await model.startCompose(model.messages(t).last?.id ?? 0, .reply) }
+        case "new": model.newMessage()
+        case "html":
+            Task {
+                for r in model.rows where await model.messages(r).contains(where: { $0.hasHtml }) {
+                    debugOpen = r
+                    return
+                }
+            }
         default: break
         }
         #endif

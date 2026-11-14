@@ -213,3 +213,128 @@ fn a_folder_lists_its_conversations() {
 fn inbox_rows_for(mail: &Mail, account_id: i64) -> usize {
     inbox(mail).iter().filter(|r| r.account_id == account_id).count()
 }
+
+/// Downloads in these tests go to a scratch cache, not the real one.
+fn scratch_cache() {
+    std::env::set_var("OWLPOST_CACHE", std::env::temp_dir().join(format!("owlpost-ffi-cache-{}", std::process::id())));
+}
+
+fn message_ids(mail: &Mail, row: &ThreadRow) -> Vec<MessageInfo> {
+    mail.messages(row.account_id, row.thread_key.clone()).unwrap()
+}
+
+fn draft(account_id: i64, to: &str, html: &str) -> Draft {
+    Draft {
+        account_id,
+        to: to.into(),
+        cc: String::new(),
+        bcc: String::new(),
+        subject: "Phone test".into(),
+        html: html.into(),
+        in_reply_to: None,
+        references: vec![],
+        attachments: vec![],
+        replaces: None,
+    }
+}
+
+#[test]
+fn html_email_gets_a_safe_page() {
+    let (mail, _) = demo();
+    let html = inbox(&mail).into_iter().flat_map(|r| message_ids(&mail, &r)).find(|m| m.has_html).expect("the demo has an HTML newsletter");
+    let page = mail.message_page(html.id, false).unwrap().unwrap();
+    assert!(page.html.contains("Content-Security-Policy") && page.html.contains("default-src 'none'"));
+    assert!(page.html.contains("width=device-width") && page.html.contains("<base target=\"_top\">"));
+    let open = mail.message_page(html.id, true).unwrap().unwrap();
+    assert!(open.html.contains("img-src data: cid: https: http:") && !open.remote_hidden);
+    let text = inbox(&mail).into_iter().flat_map(|r| message_ids(&mail, &r)).find(|m| !m.has_html).unwrap();
+    assert_eq!(mail.message_page(text.id, false).unwrap(), None, "plain text has no page");
+    assert!(mail.message_page(999_999, false).is_err());
+}
+
+#[test]
+fn trackers_and_remote_pictures_are_held_back() {
+    let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: Hi\r\nMessage-ID: <t1@example.com>\r\nContent-Type: text/html\r\n\r\n<p>Hi</p><img src=\"https://cdn.example.com/a.jpg\" width=600><img src=\"https://track.example.net/open.gif\" width=1 height=1>";
+    let m = owlpost_core::parse::parse_message(raw, 1, 1, 1).unwrap();
+    let page = reader::page(&m, false).unwrap();
+    assert!(page.remote_hidden);
+    assert_eq!(page.trackers, vec!["track.example.net".to_string()]);
+    assert!(!page.html.contains("track.example.net"), "the pixel is gone");
+    assert!(page.html.contains("img-src data: cid:;"), "nothing remote loads");
+}
+
+#[test]
+fn replies_and_forwards_are_set_up() {
+    scratch_cache();
+    let (mail, _) = demo();
+    let row = inbox(&mail).into_iter().find(|r| !message_ids(&mail, r).last().unwrap().from_email.is_empty()).unwrap();
+    let last = message_ids(&mail, &row).pop().unwrap();
+    let r = mail.start_compose(last.id, ComposeKind::Reply).unwrap();
+    assert!(r.to.contains(&last.from_email), "{}", r.to);
+    assert!(r.subject.to_lowercase().starts_with("re:"));
+    assert!(r.in_reply_to.is_some() && !r.references.is_empty());
+    assert!(r.html.starts_with("<div><br></div>") && r.html.contains("wrote:"), "an empty line above the quote");
+    assert!(r.attachments.is_empty());
+
+    let f = mail.start_compose(last.id, ComposeKind::Forward).unwrap();
+    assert!(f.to.is_empty() && f.subject.starts_with("Fwd: ") && f.in_reply_to.is_none());
+    assert!(f.html.contains("Forwarded message"));
+
+    let with_files = inbox(&mail).into_iter().flat_map(|r| message_ids(&mail, &r)).find(|m| !m.attachments.is_empty()).expect("a demo email with attachments");
+    let f = mail.start_compose(with_files.id, ComposeKind::Forward).unwrap();
+    assert_eq!(f.attachments.len(), with_files.attachments.len(), "forwards keep the attachments");
+    assert!(f.attachments.iter().all(|p| std::path::Path::new(p).is_file()));
+}
+
+#[test]
+fn drafts_save_replace_and_send() {
+    let (mail, _) = demo();
+    let acc = mail.accounts().unwrap()[0].clone();
+    let drafts = |mail: &Mail| mail.threads(Mailbox::Drafts, String::new(), 500).unwrap().into_iter().filter(|r| r.subject == "Phone test").count();
+    let before = drafts(&mail);
+    let mut d = draft(acc.id, "", "<div>First go</div>");
+    let id = mail.save_draft(d.clone()).unwrap();
+    assert_eq!(drafts(&mail), before + 1, "saved with no one to send to yet");
+    d.replaces = Some(id);
+    d.html = "<div>Second go, <b>bold</b></div>".into();
+    let id2 = mail.save_draft(d.clone()).unwrap();
+    assert_ne!(id, id2);
+    assert_eq!(drafts(&mail), before + 1, "the new draft replaces the old");
+
+    d.replaces = Some(id2);
+    let MailError::Failed { message } = mail.send(d.clone()).unwrap_err();
+    assert!(message.contains("add someone"), "{message}");
+    d.to = "Ann <ann@example.com>".into();
+    mail.send(d).unwrap();
+    assert_eq!(drafts(&mail), before, "sending removes the draft");
+    let sent = mail.threads(Mailbox::Sent, String::new(), 200).unwrap();
+    let mine = sent.iter().find(|r| r.subject == "Phone test").expect("in Sent");
+    let msg = message_ids(&mail, mine).pop().unwrap();
+    assert!(msg.body_text.contains("Second go, bold"), "a plain-text version goes too: {}", msg.body_text);
+    assert!(msg.has_html);
+}
+
+#[test]
+fn bad_addresses_and_huge_messages_are_refused() {
+    let d = draft(1, "Ann <ann@example.com>, not an address", "<p>x</p>");
+    assert!(compose::outgoing(&d).unwrap_err().to_string().contains("isn't an email address"));
+    let mut d = draft(1, "ann@example.com", "<p>Hello <i>there</i></p>");
+    let out = compose::outgoing(&d).unwrap();
+    assert!(out.body.contains("Hello there") && out.html.as_deref().unwrap().contains("<i>there</i>"));
+    let big = std::env::temp_dir().join(format!("owlpost-ffi-big-{}.bin", std::process::id()));
+    std::fs::write(&big, vec![0u8; 26 * 1024 * 1024]).unwrap();
+    d.attachments = vec![big.to_string_lossy().into_owned()];
+    assert!(compose::outgoing(&d).unwrap_err().to_string().contains("over 25 MB"));
+    let _ = std::fs::remove_file(big);
+    d.attachments = vec!["/no/such/file.pdf".into()];
+    assert!(compose::outgoing(&d).is_err());
+}
+
+#[test]
+fn addresses_are_suggested() {
+    let (mail, _) = demo();
+    let someone = inbox(&mail)[0].latest_email.clone();
+    let found = mail.suggest_contacts(someone[..3].to_string()).unwrap();
+    assert!(found.iter().any(|c| c.email == someone), "{someone} in {found:?}");
+    assert!(mail.suggest_contacts("a".into()).unwrap().is_empty(), "one letter is too few");
+}

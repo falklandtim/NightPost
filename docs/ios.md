@@ -32,6 +32,8 @@ ios/google-client-id.txt  the iOS OAuth client ID (not committed)
    - `sync(accountId?)`: new mail, plus snoozes, pins and tabs from the server;
    - `setRead`, `setStarred`, `setPinned`, `archive`, `trash`, `snooze(until)`, `unsnooze`;
    - `folders(accountId)`: an account's folders as the desktop sidebar lists them (standard first, then its own as a tree, with depth and parent), and `folderThreads(folderId, query, limit)`: one folder's conversations;
+   - reading: `messagePage(messageId, remoteImages)`, an HTML email's page (or nothing for plain text); `inlineImage(messageId, cid)`, a picture sent inside an email; `attachmentFile(messageId, index)`, an attachment as a file;
+   - writing: `startCompose(messageId, kind)` (reply, reply all, forward with its attachments), `openDraft`, `saveDraft`, `deleteDraft`, `send`, and `suggestContacts(prefix)`; a `Draft` carries the editor's HTML, the addresses as typed and attachments as files;
    - `startGoogleSignIn(clientId, loginHint)` and `finishGoogleSignIn(signIn, redirect)` (see *Sign in with Google* below).
    
    Errors come to Swift as `MailError.Failed(message)`, in words to show. Tested in Rust against the demo accounts, and from a Swift program on the Mac (open, list, read, snooze, an error).
@@ -49,6 +51,9 @@ ios/google-client-id.txt  the iOS OAuth client ID (not committed)
 7. **App icon** (2026-11-14): the desktop's owl, filled square for iOS (which rounds the corners itself), in `ios/OwlPost/Assets.xcassets`. **The list fills in during a sync**, every 3 seconds, so a long first sync doesn't show an empty Inbox until the end.
 
 8. **Folders** (☰ → Folders): each account's own folders and Gmail labels, standard ones first, then the account's own as a tree; a parent folds its subfolders away and, folded, counts their unread mail too. Tapping one shows its conversations in the main list, with the same swipes; picking a list from the ☰ menu goes back to the unified lists. OwlPost's hidden folders are left out, as on the desktop.
+
+9. **HTML email** (2026-11-14): each email's HTML in a web view inside its card, built by the same core code as the desktop's page (`owlpost_core::mail_html`): tracking pixels stripped and named, a strict Content Security Policy, remote images hidden until **Load images**. The web view runs none of the email's JavaScript. Wide newsletters are scaled to fit. Pictures sent inside an email (`cid:`) are fetched through the core. Web links open in Safari; `mailto:` links open the composer. Attachments open in Quick Look (share or save to Files from there). Emails show on white paper, in dark mode too.
+10. **Writing** (2026-11-14): the ✎ button (new), the reply arrow in a conversation (tap for Reply; hold for Reply All and Forward), a draft in Drafts, or a `mailto:` link. Native From, To, Cc, Bcc and Subject fields, with suggestions from mail you've had and the iPhone's contacts (iOS asks first). The body is a formatted editor: bold, italic, underline, lists and links. 📎 attaches from Photos (sent as JPEG) or Files; a forward keeps the original's attachments (the desktop doesn't yet). Cancel asks whether to save the draft to the server's Drafts folder, where the Mac sees it. Sending goes through the core's SMTP and files a copy in Sent. Over 25 MB is refused before sending.
 
 ## Sign in with Google
 
@@ -68,7 +73,9 @@ To set it up (done for timson.co on 2026-11-14):
 4. **In the simulator** (it runs inside Xcode 27; there's no separate Simulator app): pick an iPhone at the top of the window and press ⌘R. *Try the Demo* opens the made-up accounts; *Add an Account* works with real ones. With a mouse or trackpad: click and drag a row sideways to swipe, drag the list down to sync. Light or dark: ☰ → Settings → Appearance (⇧⌘A doesn't switch the embedded simulator).
 5. **After changing Rust code**, run `scripts/ios-rust.sh` again before ⌘R. Swift changes only need ⌘R.
 
-Debug launch options (*Edit Scheme > Run > Arguments*, or `xcrun simctl launch <device> co.timson.OwlPost …`): `-demo` starts in the demo accounts; `-show thread|snooze|settings|add` opens that screen once the list loads, for screenshots.
+Debug launch options (*Edit Scheme > Run > Arguments*, or `xcrun simctl launch <device> co.timson.OwlPost …`): `-demo` starts in the demo accounts; `-show thread|snooze|settings|add|folders|compose|new|html` opens that screen once the list loads, for screenshots. `-churn` reloads the list every second, as a long sync does.
+
+UI tests (`ios/OwlPostUITests`, demo accounts only) tap and type in the composer as a finger would: `xcodebuild test -project ios/OwlPost.xcodeproj -scheme OwlPostUITests -destination 'id=<simulator>'`, or ⌘U in Xcode with that scheme.
 
 ## Adding your accounts
 
@@ -97,11 +104,11 @@ Not on the phone. It still compiles there, but the bridge never calls it, so the
 ## Next
 
 1. **Run it on Tim's phone** with his real accounts (Tim, by hand): adding iCloud, sync, archive and snooze, and that a snooze or pin made on the phone shows on the Mac.
-2. **HTML email**: move the page builder (`document()`, `strip_trackers()`, `csp()`) from `crates/owlpost/src/mail_view.rs` into the core so the phone's WKWebView gets the same sandbox and tracker blocking. Then attachments.
+2. **Reading and writing on real accounts** (Tim, by hand): HTML email, pictures inside emails, attachments, replies, drafts showing on the Mac, and sending.
 3. **Sign in with Google on a real account** (Tim, by hand): built 2026-11-14, not yet tried with a real Google account.
 4. **Background refresh** (`BGAppRefreshTask`): iOS wakes the app every 15 minutes to a few hours to call `sync`.
 5. **Undo** after archive or snooze, as on the desktop (⌘Z there; a toast with Undo here).
-6. **Compose and reply**, saving drafts and sending through the core's SMTP.
+6. **Composer extras**: signatures (they live on the Mac for now), pictures pasted into the body, autosaving while you write, Undo Send.
 
 ## What carries over from the desktop
 

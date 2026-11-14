@@ -1,6 +1,9 @@
-// One conversation: each email as a card, oldest first, in plain text.
-// HTML email comes later, in a sandboxed WKWebView (see docs/ios.md).
+// One conversation: each email as a card, oldest first. HTML email shows
+// in a sandboxed web view (MessageBodyView), plain text as text.
+// Attachments open in Quick Look, where they can be shared or saved to
+// Files. Reply, Reply All and Forward answer the newest email.
 
+import QuickLook
 import SwiftUI
 
 struct ThreadView: View {
@@ -35,6 +38,16 @@ struct ThreadView: View {
             ToolbarItemGroup(placement: .bottomBar) {
                 Button { act { await model.archive(row) } } label: { Label("Archive", systemImage: "archivebox") }
                 Spacer()
+                Menu {
+                    Button { compose(.reply) } label: { Label("Reply", systemImage: "arrowshape.turn.up.left") }
+                    Button { compose(.replyAll) } label: { Label("Reply All", systemImage: "arrowshape.turn.up.left.2") }
+                    Button { compose(.forward) } label: { Label("Forward", systemImage: "arrowshape.turn.up.right") }
+                } label: {
+                    Label("Reply", systemImage: "arrowshape.turn.up.left")
+                } primaryAction: {
+                    compose(.reply)
+                }
+                Spacer()
                 Button { snoozing = true } label: { Label("Snooze", systemImage: "clock") }
                 Spacer()
                 Button {
@@ -65,6 +78,11 @@ struct ThreadView: View {
         }
     }
 
+    private func compose(_ kind: ComposeKind) {
+        guard let last = messages.last else { return }
+        Task { await model.startCompose(last.id, kind) }
+    }
+
     /// Do something that takes the conversation out of the list, and go back.
     private func act(_ work: @escaping () async -> Void) {
         dismiss()
@@ -73,8 +91,11 @@ struct ThreadView: View {
 }
 
 struct MessageCard: View {
+    @Environment(MailModel.self) private var model
     let message: MessageInfo
     @State private var collapsed: Bool
+    @State private var preview: URL?
+    @State private var fetching: Int?
 
     init(message: MessageInfo, collapsed: Bool) {
         self.message = message
@@ -83,50 +104,76 @@ struct MessageCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 10) {
-                Avatar(name: message.fromName, email: message.fromEmail, size: 32)
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text(message.fromName.isEmpty ? message.fromEmail : message.fromName)
-                            .font(.subheadline.weight(.semibold))
-                            .lineLimit(1)
-                        Spacer()
-                        Text(shortDate(message.date))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    if collapsed {
-                        Text(firstLine(message.bodyText))
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    } else if !message.recipients.isEmpty {
-                        Text("to " + message.recipients.joined(separator: ", "))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                }
-            }
+            header
             if !collapsed {
-                Text(message.bodyText)
-                    .font(.body)
-                    .textSelection(.enabled)
-                if message.hasHtml && message.bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Text("This email is HTML only. Formatted email isn't shown on the phone yet.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                if message.hasHtml {
+                    MessageBodyView(message: message)
+                } else {
+                    Text(message.bodyText)
+                        .font(.body)
+                        .textSelection(.enabled)
                 }
-                ForEach(message.attachments, id: \.self) { a in
-                    Label("\(a.filename) · \(ByteCountFormatter.string(fromByteCount: Int64(a.size), countStyle: .file))", systemImage: "paperclip")
+                ForEach(Array(message.attachments.enumerated()), id: \.offset) { i, a in
+                    Button { open(i) } label: {
+                        HStack {
+                            Image(systemName: "paperclip")
+                            Text(a.filename).lineLimit(1)
+                            Text(ByteCountFormatter.string(fromByteCount: Int64(a.size), countStyle: .file)).foregroundStyle(.secondary)
+                            Spacer()
+                            if fetching == i { ProgressView().controlSize(.small) }
+                        }
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .padding(8)
+                        .background(.background.tertiary, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(fetching != nil)
                 }
             }
         }
         .padding(12)
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
         .padding(.horizontal)
+        .quickLookPreview($preview)
+    }
+
+    /// Download (the first time) and show attachment `i`.
+    private func open(_ i: Int) {
+        fetching = i
+        Task {
+            preview = await model.attachmentFile(message.id, index: i)
+            fetching = nil
+        }
+    }
+
+    /// Who, when, to whom; tap to fold or unfold. Only the header folds, so
+    /// a tap on a link in the email never does.
+    private var header: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Avatar(name: message.fromName, email: message.fromEmail, size: 32)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(message.fromName.isEmpty ? message.fromEmail : message.fromName)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                    Spacer()
+                    Text(shortDate(message.date))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if collapsed {
+                    Text(firstLine(message.bodyText))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else if !message.recipients.isEmpty {
+                    Text("to " + message.recipients.joined(separator: ", "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture {
             withAnimation(.snappy) { collapsed.toggle() }

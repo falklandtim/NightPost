@@ -10,15 +10,31 @@
 		0A0000000000000000000011 /* build/OwlPostCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0A0000000000000000000002 /* build/OwlPostCore.xcframework */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		0A0000000000000000000081 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0A0000000000000000000040 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0A0000000000000000000041;
+			remoteInfo = OwlPost;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		0A0000000000000000000001 /* OwlPost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OwlPost.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		0A0000000000000000000002 /* build/OwlPostCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = build/OwlPostCore.xcframework; sourceTree = "<group>"; };
+		0A0000000000000000000071 /* OwlPostUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OwlPostUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		0A0000000000000000000003 /* OwlPost */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = OwlPost;
+			sourceTree = "<group>";
+		};
+		0A0000000000000000000004 /* OwlPostUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = OwlPostUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -32,6 +48,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		0A0000000000000000000024 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -39,6 +62,7 @@
 			isa = PBXGroup;
 			children = (
 				0A0000000000000000000003 /* OwlPost */,
+				0A0000000000000000000004 /* OwlPostUITests */,
 				0A0000000000000000000032 /* Frameworks */,
 				0A0000000000000000000033 /* Products */,
 			);
@@ -56,6 +80,7 @@
 			isa = PBXGroup;
 			children = (
 				0A0000000000000000000001 /* OwlPost.app */,
+				0A0000000000000000000071 /* OwlPostUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -83,6 +108,27 @@
 			productReference = 0A0000000000000000000001 /* OwlPost.app */;
 			productType = "com.apple.product-type.application";
 		};
+		0A0000000000000000000042 /* OwlPostUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0A0000000000000000000053 /* Build configuration list for PBXNativeTarget "OwlPostUITests" */;
+			buildPhases = (
+				0A0000000000000000000025 /* Sources */,
+				0A0000000000000000000024 /* Frameworks */,
+				0A0000000000000000000026 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0A0000000000000000000082 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				0A0000000000000000000004 /* OwlPostUITests */,
+			);
+			name = OwlPostUITests;
+			productName = OwlPostUITests;
+			productReference = 0A0000000000000000000071 /* OwlPostUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -108,12 +154,20 @@
 			projectRoot = "";
 			targets = (
 				0A0000000000000000000041 /* OwlPost */,
+				0A0000000000000000000042 /* OwlPostUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		0A0000000000000000000023 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0A0000000000000000000026 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -130,7 +184,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		0A0000000000000000000025 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		0A0000000000000000000082 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0A0000000000000000000041 /* OwlPost */;
+			targetProxy = 0A0000000000000000000081 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		0A0000000000000000000061 /* Debug */ = {
@@ -176,6 +245,8 @@
 				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = OwlPost;
+				INFOPLIST_KEY_NSContactsUsageDescription = "OwlPost suggests addresses from your contacts as you write. They stay on this iPhone.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "OwlPost attaches the photos you pick to your email.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
@@ -204,6 +275,8 @@
 				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = OwlPost;
+				INFOPLIST_KEY_NSContactsUsageDescription = "OwlPost suggests addresses from your contacts as you write. They stay on this iPhone.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "OwlPost attaches the photos you pick to your email.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
@@ -219,6 +292,38 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		0A0000000000000000000065 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = co.timson.OwlPostUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_TARGET_NAME = OwlPost;
+			};
+			name = Debug;
+		};
+		0A0000000000000000000066 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = co.timson.OwlPostUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_TARGET_NAME = OwlPost;
 			};
 			name = Release;
 		};
@@ -239,6 +344,15 @@
 			buildConfigurations = (
 				0A0000000000000000000063 /* Debug */,
 				0A0000000000000000000064 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		0A0000000000000000000053 /* Build configuration list for PBXNativeTarget "OwlPostUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0A0000000000000000000065 /* Debug */,
+				0A0000000000000000000066 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

@@ -25,6 +25,7 @@ owlpost (binary)
         ├── idle.rs        push mail (IMAP IDLE)
         ├── snooze_sync.rs the state kept on each server (snoozes, pins, tabs)
         ├── smtp.rs, oauth.rs, credentials.rs, parse.rs, category.rs
+        ├── mail_html.rs   reading and writing HTML: the email page's policy, quotes, drafts made safe to edit
         ├── mcp.rs         the MCP server
         └── theme.rs       Mailspring-compatible themes
 

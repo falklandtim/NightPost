@@ -4,6 +4,7 @@ use crate::attachments::{human_size, Attached, ImageSize};
 use crate::style::{self, Colors};
 use eframe::egui::{self, Key, RichText};
 use owlpost_core::smtp::OutgoingMessage;
+use owlpost_core::mail_html::{editor_html, email_document, quote_html};
 use owlpost_core::{Account, AccountId, Contact, Message, Signature, Store};
 use std::collections::HashMap;
 
@@ -278,7 +279,7 @@ impl Composer {
             m.body_text
         );
         c.show_tail = true;
-        c.quote_html = forward_html(m);
+        c.quote_html = owlpost_core::mail_html::forward_html(m, &style::long_date(m.date));
         c.title = "Forward".into();
         c
     }
@@ -1022,139 +1023,6 @@ fn signature_html(sig: &Signature) -> String {
     }
 }
 
-/// HTML that's safe to put in the editor: the body of a document, without
-/// scripts, styles, frames or event handlers. (The editor's security policy
-/// blocks scripts anyway; this keeps a draft from restyling the window.)
-fn editor_html(html: &str) -> String {
-    let mut out = owlpost_core::parse::clean_signature_html(html);
-    for tag in ["iframe", "object", "embed", "form"] {
-        let lower = out.to_ascii_lowercase();
-        if let Some(i) = lower.find(&format!("<{tag}")) {
-            let end = lower[i..].find(&format!("</{tag}>")).map(|e| i + e + tag.len() + 3).or_else(|| lower[i..].find('>').map(|e| i + e + 1)).unwrap_or(out.len());
-            out.replace_range(i..end, "");
-        }
-    }
-    strip_event_handlers(&out)
-}
-
-/// Remove `on…="…"` attributes and `javascript:` links.
-fn strip_event_handlers(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let b = html.as_bytes();
-    let mut i = 0;
-    let mut in_tag = false;
-    while i < b.len() {
-        let c = b[i];
-        if c == b'<' {
-            in_tag = true;
-        } else if c == b'>' {
-            in_tag = false;
-        }
-        // An attribute starting with "on" after whitespace, inside a tag.
-        if in_tag && c.is_ascii_whitespace() && b.get(i + 1).is_some_and(|x| x.eq_ignore_ascii_case(&b'o')) && b.get(i + 2).is_some_and(|x| x.eq_ignore_ascii_case(&b'n')) {
-            let mut j = i + 3;
-            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
-                j += 1;
-            }
-            let mut k = j;
-            while k < b.len() && b[k].is_ascii_whitespace() {
-                k += 1;
-            }
-            if k < b.len() && b[k] == b'=' && j > i + 3 {
-                k += 1;
-                while k < b.len() && b[k].is_ascii_whitespace() {
-                    k += 1;
-                }
-                let end = match b.get(k) {
-                    Some(q @ (b'"' | b'\'')) => html[k + 1..].find(*q as char).map(|e| k + 1 + e + 1).unwrap_or(b.len()),
-                    _ => html[k..].find(|ch: char| ch.is_ascii_whitespace() || ch == '>').map(|e| k + e).unwrap_or(b.len()),
-                };
-                i = end;
-                continue;
-            }
-        }
-        out.push(c as char);
-        i += 1;
-    }
-    // Byte-wise copy above is only right for ASCII; redo safely if needed.
-    let out = if html.is_ascii() { out } else { strip_event_handlers_utf8(html) };
-    out.replace("javascript:", "")
-}
-
-fn strip_event_handlers_utf8(html: &str) -> String {
-    // Same rules, working on chars so multi-byte text survives.
-    let chars: Vec<char> = html.chars().collect();
-    let mut out = String::with_capacity(html.len());
-    let mut i = 0;
-    let mut in_tag = false;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '<' {
-            in_tag = true;
-        } else if c == '>' {
-            in_tag = false;
-        }
-        if in_tag && c.is_whitespace() && chars.get(i + 1).is_some_and(|x| x.eq_ignore_ascii_case(&'o')) && chars.get(i + 2).is_some_and(|x| x.eq_ignore_ascii_case(&'n')) {
-            let mut j = i + 3;
-            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '-') {
-                j += 1;
-            }
-            let mut k = j;
-            while k < chars.len() && chars[k].is_whitespace() {
-                k += 1;
-            }
-            if k < chars.len() && chars[k] == '=' && j > i + 3 {
-                k += 1;
-                while k < chars.len() && chars[k].is_whitespace() {
-                    k += 1;
-                }
-                i = match chars.get(k) {
-                    Some(&q @ ('"' | '\'')) => chars[k + 1..].iter().position(|&x| x == q).map(|e| k + 1 + e + 1).unwrap_or(chars.len()),
-                    _ => chars[k..].iter().position(|x| x.is_whitespace() || *x == '>').map(|e| k + e).unwrap_or(chars.len()),
-                };
-                continue;
-            }
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-/// The quoted message under a reply (as text: someone else's HTML never
-/// goes into the editor).
-fn quote_html(m: &Message) -> String {
-    let when = m.date.with_timezone(&chrono::Local).format("%a, %e %b %Y at %H:%M");
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-    format!(
-        "<div class=\"owlpost-quote\"><div>On {when}, {} wrote:</div><blockquote type=\"cite\">{}</blockquote></div>",
-        esc(&m.from.display()),
-        owlpost_core::smtp::text_to_html(m.body_text.trim_end())
-    )
-}
-
-/// The forwarded message under a forward.
-fn forward_html(m: &Message) -> String {
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-    format!(
-        "<div class=\"owlpost-quote\"><div>---------- Forwarded message ---------</div><div>From: {}</div><div>Date: {}</div><div>Subject: {}</div><div>To: {}</div><br>{}</div>",
-        esc(&m.from.to_header()),
-        esc(&style::long_date(m.date)),
-        esc(&m.subject),
-        esc(&Contact::join(&m.to)),
-        owlpost_core::smtp::text_to_html(m.body_text.trim_end())
-    )
-}
-
-/// The editor's HTML as a whole email.
-fn email_document(inner: &str) -> String {
-    format!(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
-<style>blockquote{{margin:6px 0 6px 2px;padding-left:12px;border-left:3px solid #d0d4da;color:#555}}img{{max-width:100%;height:auto}}</style></head>\
-<body><div class=\"owlpost-body\" style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45\">{inner}</div></body></html>"
-    )
-}
-
 /// A one-off token for the editor page's script.
 fn nonce() -> String {
     use std::hash::{BuildHasher, Hasher};
@@ -1453,24 +1321,5 @@ pub fn route_web_events() {
             crate::web_host::HostEvent::CloseRequested(id) => (id, WebMsg::Close),
         };
         WEB_INBOX.with(|q| q.borrow_mut().entry(id).or_default().push(msg));
-    }
-}
-
-#[cfg(test)]
-mod web_tests {
-    use super::*;
-
-    #[test]
-    fn editor_html_is_defanged() {
-        let h = editor_html(r#"<html><head><style>body{color:red}</style></head><body><p onclick="x()" class=a>Hi</p><img src=x onerror=alert(1)><a href="javascript:evil()">l</a><script>bad()</script><iframe src=x></iframe></body></html>"#);
-        assert!(!h.contains("onclick") && !h.contains("onerror") && !h.contains("javascript:") && !h.contains("<script") && !h.contains("<iframe") && !h.contains("color:red"), "{h}");
-        assert!(h.contains("<p class=a>Hi</p>"), "{h}");
-        assert_eq!(editor_html("<p onmouseover='x'>Kia ōra</p>"), "<p>Kia ōra</p>");
-    }
-
-    #[test]
-    fn email_document_wraps_the_editor() {
-        let d = email_document("<b>Hi</b>");
-        assert!(d.starts_with("<!DOCTYPE html>") && d.contains("<b>Hi</b>") && d.contains("owlpost-body"));
     }
 }

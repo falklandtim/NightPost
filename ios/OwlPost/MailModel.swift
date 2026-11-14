@@ -56,6 +56,18 @@ final class MailModel {
             mail = try await background { try Mail.openDemo(path: path) }
             isDemo = true
             await reload()
+            #if DEBUG
+            // UI tests: reload as a long sync does, to check screens
+            // survive the list changing underneath them.
+            if ProcessInfo.processInfo.arguments.contains("-churn") {
+                Task {
+                    while true {
+                        try? await Task.sleep(for: .seconds(1))
+                        await reload()
+                    }
+                }
+            }
+            #endif
         } catch {
             show(error)
         }
@@ -252,6 +264,113 @@ final class MailModel {
         }
     }
 
+    // MARK: Reading
+
+    /// An email's HTML page, or `nil` for plain text (or on error, shown).
+    func messagePage(_ id: Int64, remote: Bool) async -> MessagePage? {
+        guard let mail else { return nil }
+        do {
+            return try await background { try mail.messagePage(messageId: id, remoteImages: remote) }
+        } catch {
+            show(error)
+            return nil
+        }
+    }
+
+    /// A picture sent inside an email; `nil` if it can't be had (the web
+    /// view shows it missing, which is no reason for an alert).
+    func inlineImage(_ id: Int64, cid: String) async -> InlineImage? {
+        guard let mail else { return nil }
+        return try? await background { try mail.inlineImage(messageId: id, cid: cid) }
+    }
+
+    /// An attachment as a file on the phone, downloading it the first time.
+    func attachmentFile(_ id: Int64, index: Int) async -> URL? {
+        guard let mail else { return nil }
+        do {
+            let path = try await background { try mail.attachmentFile(messageId: id, index: UInt32(index)) }
+            return URL(fileURLWithPath: path)
+        } catch {
+            show(error)
+            return nil
+        }
+    }
+
+    // MARK: Writing
+
+    /// The composer showing now, if any.
+    var composing: ComposeRequest?
+
+    /// A new message from the first account (the demo's, in the demo).
+    func newMessage(to: String = "", cc: String = "", subject: String = "", body: String = "") {
+        guard let account = accounts.first else { return }
+        let html = body.isEmpty ? "<div><br></div>" : body.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "<div>\($0.isEmpty ? "<br>" : escapeHTML(String($0)))</div>" }.joined()
+        composing = ComposeRequest(draft: Draft(accountId: account.id, to: to, cc: cc, bcc: "", subject: subject, html: html,
+                                                inReplyTo: nil, references: [], attachments: [], replaces: nil))
+    }
+
+    /// A mailto: link tapped in an email.
+    func composeMailto(_ url: URL) {
+        let parts = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let query = { (name: String) in parts?.queryItems?.first { $0.name.lowercased() == name }?.value ?? "" }
+        let to = (parts?.path.removingPercentEncoding ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        newMessage(to: (to + [query("to")]).filter { !$0.isEmpty }.joined(separator: ", "), cc: query("cc"), subject: query("subject"), body: query("body"))
+    }
+
+    /// Reply, reply all or forward the email `id`.
+    func startCompose(_ id: Int64, _ kind: ComposeKind) async {
+        guard let mail else { return }
+        do {
+            let d = try await background { try mail.startCompose(messageId: id, kind: kind) }
+            composing = ComposeRequest(draft: d)
+        } catch {
+            show(error)
+        }
+    }
+
+    /// Carry on writing a saved draft (the newest email in `row`).
+    func openDraft(_ row: ThreadRow) async {
+        guard let mail, let last = await messages(row).last else { return }
+        do {
+            let d = try await background { try mail.openDraft(messageId: last.id) }
+            composing = ComposeRequest(draft: d)
+        } catch {
+            show(error)
+        }
+    }
+
+    /// Save to the server's Drafts; returns the saved draft's id. Throws,
+    /// so the composer can say what went wrong while it's still open.
+    func saveDraft(_ d: Draft) async throws -> Int64 {
+        guard let mail else { throw MailError.Failed(message: "OwlPost isn't open yet") }
+        let id = try await background { try mail.saveDraft(draft: d) }
+        Task { await reload() }
+        return id
+    }
+
+    func send(_ d: Draft) async throws {
+        guard let mail else { throw MailError.Failed(message: "OwlPost isn't open yet") }
+        try await background { try mail.send(draft: d) }
+        Task { await reload() }
+    }
+
+    func deleteDraft(_ id: Int64) async {
+        await act { try $0.deleteDraft(messageId: id) }
+    }
+
+    /// People to suggest for an address field: from mail you've had, then
+    /// the iPhone's contacts (if you've allowed it).
+    func suggestions(_ prefix: String) async -> [ContactSuggestion] {
+        guard let mail else { return [] }
+        let fromMail = (try? await background { try mail.suggestContacts(prefix: prefix) }) ?? []
+        // The demo's people are made up: don't ask for the phone's contacts
+        // (or mix real ones in) just to try it.
+        let fromPhone = isDemo ? [] : await PhoneContacts.shared.search(prefix)
+        var seen = Set<String>()
+        return (fromMail + fromPhone).filter { seen.insert($0.email.lowercased()).inserted }.prefix(8).map { $0 }
+    }
+
     // MARK: Helpers
 
     private func drop(_ t: ThreadRow) {
@@ -282,6 +401,16 @@ final class MailModel {
             error = e.localizedDescription
         }
     }
+}
+
+/// A composer to show: a draft and an identity for the sheet.
+struct ComposeRequest: Identifiable {
+    let id = UUID()
+    var draft: Draft
+}
+
+func escapeHTML(_ s: String) -> String {
+    s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;").replacingOccurrences(of: ">", with: "&gt;")
 }
 
 /// Run blocking core work off the main thread.

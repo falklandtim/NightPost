@@ -9,6 +9,7 @@ pub mod email_view;
 pub mod engine;
 pub mod html_clean;
 pub mod idle;
+pub mod mail_html;
 pub mod mcp;
 pub mod oauth;
 pub mod models;

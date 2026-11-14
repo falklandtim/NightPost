@@ -25,6 +25,7 @@ struct RootView: View {
     @AppStorage(Appearance.key) private var appearance: Appearance = .system
 
     var body: some View {
+        @Bindable var model = model
         Group {
             if !model.started {
                 ProgressView()
@@ -37,6 +38,12 @@ struct RootView: View {
             }
         }
         .preferredColorScheme(appearance.scheme)
+        // The composer, from anywhere: a reply, a draft, a mailto: link.
+        .sheet(item: $model.composing) { request in
+            ComposeView(request: request)
+                .environment(model)
+                .preferredColorScheme(appearance.scheme)
+        }
         .alert("Something went wrong", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
