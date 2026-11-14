@@ -6,10 +6,10 @@
 //! still sync on the regular timer.
 
 use crate::models::{Account, Security};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use imap::extensions::idle::{SetReadTimeout, WaitOutcome};
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 
 /// How long to wait in one IDLE before re-issuing it. RFC 2177 says at most
@@ -62,14 +62,7 @@ pub fn connect(account: &Account) -> Result<IdleSession> {
         return Err(anyhow!("push needs a TLS (port 993) connection"));
     }
     let s = &account.imap;
-    let addr = (s.host.as_str(), s.port)
-        .to_socket_addrs()
-        .with_context(|| format!("looking up {}", s.host))?
-        .next()
-        .ok_or_else(|| anyhow!("couldn't find {}", s.host))?;
-    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(20)).with_context(|| format!("connecting to {}:{}", s.host, s.port))?;
-    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
-    tcp.set_write_timeout(Some(IO_TIMEOUT))?;
+    let tcp = crate::engine::open_tcp(s)?;
     let tls = native_tls::TlsConnector::builder().build()?.connect(&s.host, tcp).map_err(|e| anyhow!("TLS with {}: {e}", s.host))?;
     let mut client = imap::Client::new(Guarded(tls));
     client.read_greeting()?;

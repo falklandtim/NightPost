@@ -29,12 +29,43 @@ pub fn connect(account: &Account) -> Result<Session> {
 fn open_client(account: &Account) -> Result<imap::Client<native_tls::TlsStream<TcpStream>>> {
     let tls = native_tls::TlsConnector::builder().build()?;
     let s = &account.imap;
-    match s.security {
-        Security::Tls => imap::connect((s.host.as_str(), s.port), &s.host, &tls),
-        Security::StartTls => imap::connect_starttls((s.host.as_str(), s.port), &s.host, &tls),
-        Security::None => return Err(anyhow!("unencrypted IMAP is not supported")),
+    if s.security == Security::None {
+        return Err(anyhow!("unencrypted IMAP is not supported"));
     }
-    .with_context(|| format!("connecting to {}:{}", s.host, s.port))
+    // Not imap::connect: it opens the socket with no timeouts, and a
+    // connection that died quietly (a phone going to the background, Wi-Fi
+    // changing) then blocked a sync for ever, spinner and all.
+    let tcp = open_tcp(s)?;
+    let client = match s.security {
+        Security::StartTls => {
+            let mut plain = imap::Client::new(tcp);
+            plain.read_greeting()?;
+            plain.secure(&s.host, &tls)?
+        }
+        _ => {
+            let stream = tls.connect(&s.host, tcp).map_err(|e| anyhow!("TLS with {}: {e}", s.host))?;
+            let mut client = imap::Client::new(stream);
+            client.read_greeting()?;
+            client
+        }
+    };
+    Ok(client)
+}
+
+/// A TCP connection to `server` that gives up rather than hang: 20 seconds
+/// to connect, and [`crate::idle::IO_TIMEOUT`] for any one read or write.
+pub(crate) fn open_tcp(server: &ServerConfig) -> Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let addr = (server.host.as_str(), server.port)
+        .to_socket_addrs()
+        .with_context(|| format!("looking up {}", server.host))?
+        .next()
+        .ok_or_else(|| anyhow!("couldn't find {}", server.host))?;
+    let tcp = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(20))
+        .with_context(|| format!("connecting to {}:{}", server.host, server.port))?;
+    tcp.set_read_timeout(Some(crate::idle::IO_TIMEOUT))?;
+    tcp.set_write_timeout(Some(crate::idle::IO_TIMEOUT))?;
+    Ok(tcp)
 }
 
 /// Connect with a password (account setup checks one before saving it).
@@ -144,7 +175,14 @@ fn sync_all_folders(store: &Store, account: &Account, mut progress: impl FnMut(S
     let mut failed = 0;
     for (i, f) in folders.iter().enumerate() {
         progress(SyncProgress::Folder { account_id: account.id, name: f.name.clone(), done: i, total });
-        match sync_folder(store, &mut session, account, f) {
+        let (result, connected) = retry_on_new_connection(&mut session, |s| sync_folder(store, s, account, f), |s| s.noop().is_ok(), || connect(account));
+        if !connected {
+            // No way back to the server: say so once, not once per folder.
+            failed += total - i;
+            store.note(Some(account.id), Level::Warn, format!("Lost the connection; {} folders left for the next sync", total - i));
+            break;
+        }
+        match result {
             Ok(n) => {
                 new_total += n;
                 if n > 0 {
@@ -194,6 +232,30 @@ fn uids_to_fetch(server: &HashSet<u32>, known: &HashSet<u32>, last_uid: u32) -> 
         new.truncate(INITIAL_WINDOW);
     }
     new
+}
+
+/// Run `attempt` on the connection. If it fails and the connection has
+/// died (a phone changing networks or going to the background, a server
+/// timeout), connect again and try once more. Without this, one dropped
+/// connection failed every folder after it, including the snoozed mail's.
+/// Returns the result and whether there's still a working connection.
+fn retry_on_new_connection<S, T>(
+    session: &mut S,
+    mut attempt: impl FnMut(&mut S) -> Result<T>,
+    alive: impl FnOnce(&mut S) -> bool,
+    reconnect: impl FnOnce() -> Result<S>,
+) -> (Result<T>, bool) {
+    let first = attempt(session);
+    if first.is_ok() || alive(session) {
+        return (first, true);
+    }
+    match reconnect() {
+        Ok(fresh) => {
+            *session = fresh;
+            (attempt(session), true)
+        }
+        Err(e) => (Err(e.context("reconnecting")), false),
+    }
 }
 
 fn sync_folder(store: &Store, session: &mut Session, account: &Account, folder: &Folder) -> Result<usize> {
@@ -1021,6 +1083,63 @@ mod tests {
     }
 
     use super::*;
+
+    /// Sync connections time out instead of waiting for ever on a server
+    /// that has gone quiet.
+    #[test]
+    fn sync_connections_have_timeouts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = ServerConfig { host: "127.0.0.1".into(), port: listener.local_addr().unwrap().port(), security: Security::Tls };
+        let tcp = open_tcp(&server).unwrap();
+        assert_eq!(tcp.read_timeout().unwrap(), Some(crate::idle::IO_TIMEOUT));
+        assert_eq!(tcp.write_timeout().unwrap(), Some(crate::idle::IO_TIMEOUT));
+    }
+
+    /// A stand-in connection: `dead` once the server has hung up.
+    struct Fake {
+        dead: bool,
+        generation: u32,
+    }
+
+    #[test]
+    fn a_dropped_connection_is_replaced_and_the_folder_retried() {
+        let mut s = Fake { dead: false, generation: 1 };
+        let mut tries = 0;
+        let (r, connected) = retry_on_new_connection(
+            &mut s,
+            |s| {
+                tries += 1;
+                if s.generation == 1 {
+                    s.dead = true;
+                    Err(anyhow!("Connection Lost"))
+                } else {
+                    Ok(7)
+                }
+            },
+            |s| !s.dead,
+            || Ok(Fake { dead: false, generation: 2 }),
+        );
+        assert_eq!((r.unwrap(), connected, tries, s.generation), (7, true, 2, 2));
+    }
+
+    #[test]
+    fn a_folder_error_on_a_live_connection_isnt_retried() {
+        let mut s = Fake { dead: false, generation: 1 };
+        let mut reconnected = false;
+        let (r, connected) = retry_on_new_connection(&mut s, |_| Err::<u32, _>(anyhow!("NO no such mailbox")), |s| !s.dead, || {
+            reconnected = true;
+            Ok(Fake { dead: false, generation: 2 })
+        });
+        assert!(r.is_err() && connected && !reconnected);
+    }
+
+    #[test]
+    fn no_way_back_stops_the_sync() {
+        let mut s = Fake { dead: true, generation: 1 };
+        let (r, connected) = retry_on_new_connection(&mut s, |_| Err::<u32, _>(anyhow!("Connection Lost")), |s| !s.dead, || Err(anyhow!("offline")));
+        assert!(!connected);
+        assert!(format!("{:#}", r.unwrap_err()).contains("reconnecting"));
+    }
 
     #[test]
     fn only_new_mail_is_fetched_after_the_first_sync() {
