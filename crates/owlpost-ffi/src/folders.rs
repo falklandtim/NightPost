@@ -61,7 +61,7 @@ fn kind(role: FolderRole) -> FolderKind {
 }
 
 /// Standard folders in role order, then the rest in tree order.
-fn folder_list(folders: Vec<Folder>) -> Vec<FolderInfo> {
+pub(crate) fn folder_list(folders: Vec<Folder>) -> Vec<FolderInfo> {
     let (system, mut others): (Vec<Folder>, Vec<Folder>) =
         folders.into_iter().filter(|f| !snooze_sync::is_internal_folder(&f.path)).partition(|f| f.role != FolderRole::Other);
     // By levels, not by the raw path: "A B" would otherwise sort between

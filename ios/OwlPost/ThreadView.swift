@@ -1,7 +1,8 @@
 // One conversation: each email as a card, oldest first. HTML email shows
 // in a sandboxed web view (MessageBodyView), plain text as text.
 // Attachments open in Quick Look, where they can be shared or saved to
-// Files. Reply, Reply All and Forward answer the newest email.
+// Files. Reply, Reply All and Forward answer the newest email. The folder
+// button files it (MoveSheet): a folder, labels, an Inbox tab.
 
 import QuickLook
 import SwiftUI
@@ -14,6 +15,7 @@ struct ThreadView: View {
     @State private var starred: Bool
     @State private var pinned: Bool
     @State private var snoozing = false
+    @State private var moving = false
 
     init(row: ThreadRow) {
         self.row = row
@@ -37,6 +39,8 @@ struct ThreadView: View {
         .toolbar {
             ToolbarItemGroup(placement: .bottomBar) {
                 Button { act { await model.archive(row) } } label: { Label("Archive", systemImage: "archivebox") }
+                Spacer()
+                Button { moving = true } label: { Label("Move or Label", systemImage: "folder") }
                 Spacer()
                 Menu {
                     Button { compose(.reply) } label: { Label("Reply", systemImage: "arrowshape.turn.up.left") }
@@ -69,6 +73,10 @@ struct ThreadView: View {
                 act { await model.snooze(row, until: date) }
             }
             .presentationDetents([.medium])
+        }
+        .sheet(isPresented: $moving) {
+            // A move takes the conversation out of the list: go back to it.
+            MoveSheet(row: row) { dismiss() }
         }
         .task {
             messages = await model.messages(row)

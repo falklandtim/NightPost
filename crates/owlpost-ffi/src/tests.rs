@@ -346,3 +346,71 @@ fn sync_progress_is_clear_between_syncs() {
     mail.sync(None).unwrap();
     assert_eq!(mail.sync_progress(), None, "a finished sync leaves no progress behind");
 }
+
+#[test]
+fn moving_and_labelling() {
+    let (mail, _) = demo();
+    let row = inbox(&mail)[0].clone();
+    let (a, k) = (row.account_id, row.thread_key.clone());
+    let clients = mail.create_folder(a, "Clients".into()).unwrap();
+    assert_eq!((clients.name.as_str(), clients.kind), ("Clients", FolderKind::Other));
+    assert_eq!(mail.create_folder(a, "clients".into()).unwrap().id, clients.id, "an existing folder is reused");
+
+    mail.set_label(a, k.clone(), clients.id, true).unwrap();
+    assert!(mail.filing(a, k.clone()).unwrap().in_folders.contains(&clients.id));
+    assert!(inbox(&mail).iter().any(|r| r.thread_key == k), "a label leaves it in the Inbox");
+    mail.set_label(a, k.clone(), clients.id, false).unwrap();
+    assert!(!mail.filing(a, k.clone()).unwrap().in_folders.contains(&clients.id));
+
+    mail.move_to_folder(a, k.clone(), clients.id, None).unwrap();
+    assert!(!inbox(&mail).iter().any(|r| r.thread_key == k), "a move takes it out of the Inbox");
+    assert!(mail.folder_threads(clients.id, String::new(), 50).unwrap().iter().any(|r| r.thread_key == k));
+
+    // Another account's folder, or one that's gone, is an error.
+    let other = mail.accounts().unwrap().into_iter().find(|x| x.id != a).unwrap();
+    let theirs = mail.folders(other.id).unwrap()[0].id;
+    assert!(mail.move_to_folder(a, k.clone(), theirs, None).is_err());
+    assert!(mail.set_label(a, k, 9999, true).is_err());
+}
+
+#[test]
+fn inbox_tabs_and_sorting() {
+    let (mail, _) = demo();
+    let names = |m: &Mail| m.inbox_tabs(None).unwrap().into_iter().map(|t| t.name).collect::<Vec<_>>();
+    assert_eq!(names(&mail), ["All", "Primary", "Promotions", "Social"]);
+    let tabs = mail.inbox_tabs(None).unwrap();
+    assert_eq!(tabs[0].unread as usize, mail.threads(Mailbox::Inbox, "is:unread".into(), 500).unwrap().len());
+
+    let invoices = mail.new_tab("Invoices".into()).unwrap();
+    assert_eq!(mail.new_tab("invoices".into()).unwrap(), invoices, "the tab already called that");
+    let sixteen = mail.new_tab("16".into()).unwrap();
+    assert_ne!(sixteen, invoices, "a tab named like a number is still its own tab");
+    // Your own tabs come after the built-in ones (two made in the same
+    // second may come in either order).
+    let tabs = mail.inbox_tabs(None).unwrap();
+    assert_eq!(names(&mail)[..4], ["All", "Primary", "Promotions", "Social"]);
+    let mut own: Vec<&str> = tabs[4..].iter().map(|t| t.name.as_str()).collect();
+    own.sort();
+    assert_eq!(own, ["16", "Invoices"]);
+    assert!(tabs[4..].iter().all(|t| t.own) && !tabs[..4].iter().any(|t| t.own));
+
+    let row = inbox(&mail)[0].clone();
+    let (a, k) = (row.account_id, row.thread_key.clone());
+    mail.put_in_tab(a, k.clone(), Some(invoices)).unwrap();
+    let f = mail.filing(a, k.clone()).unwrap();
+    assert_eq!((f.tab, f.by_hand), (invoices, true));
+    let listed = mail.threads(Mailbox::Inbox, format!("category:{invoices}"), 50).unwrap();
+    assert_eq!(listed.iter().map(|r| &r.thread_key).collect::<Vec<_>>(), [&k]);
+    mail.put_in_tab(a, k.clone(), None).unwrap();
+    assert!(!mail.filing(a, k.clone()).unwrap().by_hand);
+
+    let sender = f.sender.expect("someone else wrote in it");
+    assert!(!mail.accounts().unwrap().iter().any(|x| x.email.eq_ignore_ascii_case(&sender)), "never one of your own addresses");
+    mail.sort_sender(sender.clone(), Some(owlpost_core::category::SOCIAL)).unwrap();
+    assert_eq!(mail.filing(a, k.clone()).unwrap().sender_tab, Some(owlpost_core::category::SOCIAL));
+    assert!(mail.sort_sender("nobody".into(), None).is_err());
+
+    mail.remove_tab(invoices).unwrap();
+    assert_eq!(names(&mail), ["All", "Primary", "Promotions", "Social", "16"]);
+    assert!(mail.remove_tab(owlpost_core::category::PROMOTIONS).is_err(), "built-in tabs stay");
+}

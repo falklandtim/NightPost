@@ -144,7 +144,7 @@ Each change merges with what's on the server, and for any one conversation the n
 
 ## Plans
 
-- iPhone app: see [docs/ios.md](docs/ios.md). A first version builds (`ios/`): Sign in with Google for Gmail and Workspace, app passwords for other accounts, the unified list with swipes, each account's folders, HTML email with tracker blocking and attachments, a composer (formatting, links, attachments from Photos or Files, drafts on the server, contacts suggestions), snooze and pin that sync with the computers, and a folder count by the spinner while it syncs. Not yet run on a phone.
+- iPhone app: see [docs/ios.md](docs/ios.md). A first version builds (`ios/`): Sign in with Google for Gmail and Workspace, app passwords for other accounts, the unified list with swipes, each account's folders, HTML email with tracker blocking and attachments, a composer (formatting, links, attachments from Photos or Files, drafts on the server, contacts suggestions), snooze and pin that sync with the computers, moving and labelling from a Move sheet, Inbox tabs with sender rules that sync too, and a folder count by the spinner while it syncs. Not yet run on a phone.
 
 ## Known issues
 

@@ -34,6 +34,7 @@ ios/google-client-id.txt  the iOS OAuth client ID (not committed)
    - `folders(accountId)`: an account's folders as the desktop sidebar lists them (standard first, then its own as a tree, with depth and parent), and `folderThreads(folderId, query, limit)`: one folder's conversations;
    - reading: `messagePage(messageId, remoteImages)`, an HTML email's page (or nothing for plain text); `inlineImage(messageId, cid)`, a picture sent inside an email; `attachmentFile(messageId, index)`, an attachment as a file;
    - writing: `startCompose(messageId, kind)` (reply, reply all, forward with its attachments), `openDraft`, `saveDraft`, `deleteDraft`, `send`, and `suggestContacts(prefix)`; a `Draft` carries the editor's HTML, the addresses as typed and attachments as files;
+   - filing: `inboxTabs(folderId?)` with unread counts, `filing(accountId, threadKey)` (folders, labels, tab and sender for the Move sheet), `moveToFolder`, `setLabel`, `createFolder`, `putInTab`, `sortSender`, `newTab`, `removeTab`;
    - `startGoogleSignIn(clientId, loginHint)` and `finishGoogleSignIn(signIn, redirect)` (see *Sign in with Google* below).
    
    Errors come to Swift as `MailError.Failed(message)`, in words to show. Tested in Rust against the demo accounts, and from a Swift program on the Mac (open, list, read, snooze, an error).
@@ -55,6 +56,8 @@ ios/google-client-id.txt  the iOS OAuth client ID (not committed)
 9. **HTML email** (2026-11-14): each email's HTML in a web view inside its card, built by the same core code as the desktop's page (`owlpost_core::mail_html`): tracking pixels stripped and named, a strict Content Security Policy, remote images hidden until **Load images**. The web view runs none of the email's JavaScript. Wide newsletters are scaled to fit. Pictures sent inside an email (`cid:`) are fetched through the core. Web links open in Safari; `mailto:` links open the composer. Attachments open in Quick Look (share or save to Files from there). Emails show on white paper, in dark mode too.
 10. **Writing** (2026-11-14): the ✎ button (new), the reply arrow in a conversation (tap for Reply; hold for Reply All and Forward), a draft in Drafts, or a `mailto:` link. Native From, To, Cc, Bcc and Subject fields, with suggestions from mail you've had and the iPhone's contacts (iOS asks first). The body is a formatted editor: bold, italic, underline, lists and links. 📎 attaches from Photos (sent as JPEG) or Files; a forward keeps the original's attachments (the desktop doesn't yet). Cancel asks whether to save the draft to the server's Drafts folder, where the Mac sees it. Sending goes through the core's SMTP and files a copy in Sent. Over 25 MB is refused before sending.
 
+11. **Filing** (2026-11-15): press and hold a conversation in the list, or the folder button in a conversation, for the Move sheet: move it to a folder (searchable, or a new one), add or take off Gmail labels, put it in an Inbox tab, and choose which tab its sender's mail always goes to. Above the Inbox, a row of tabs (All, Primary, Promotions, Social and your own, each with its unread count) filters the list; a new tab can be made from the Move sheet, and pressing and holding your own tab removes it. Tabs and sorting rules sync with the computers through "OwlPost Sync". Pinned conversations sit in their own section, which can be hidden. Seen in the simulator with the demo accounts only.
+
 ## Sign in with Google
 
 The phone uses its own OAuth client, an **iOS** client in the same Google Cloud project as the desktop's (so the same name, *Internal* audience and Gmail permission). A Desktop client can't be used: Google only returns a Desktop client's sign-in to a local web server, and it has a secret.
@@ -73,9 +76,9 @@ To set it up (done for timson.co on 2026-11-14):
 4. **In the simulator** (it runs inside Xcode 27; there's no separate Simulator app): pick an iPhone at the top of the window and press ⌘R. *Try the Demo* opens the made-up accounts; *Add an Account* works with real ones. With a mouse or trackpad: click and drag a row sideways to swipe, drag the list down to sync. Light or dark: ☰ → Settings → Appearance (⇧⌘A doesn't switch the embedded simulator).
 5. **After changing Rust code**, run `scripts/ios-rust.sh` again before ⌘R. Swift changes only need ⌘R.
 
-Debug launch options (*Edit Scheme > Run > Arguments*, or `xcrun simctl launch <device> co.timson.OwlPost …`): `-demo` starts in the demo accounts; `-show thread|snooze|settings|add|folders|compose|new|html` opens that screen once the list loads, for screenshots. `-churn` reloads the list every second, as a long sync does. `-syncing` shows the sync spinner with a folder count.
+Debug launch options (*Edit Scheme > Run > Arguments*, or `xcrun simctl launch <device> co.timson.OwlPost …`): `-demo` starts in the demo accounts; `-show thread|snooze|settings|add|folders|compose|new|move|html` opens that screen once the list loads, for screenshots. `-churn` reloads the list every second, as a long sync does. `-syncing` shows the sync spinner with a folder count.
 
-UI tests (`ios/OwlPostUITests`, demo accounts only) tap and type in the composer as a finger would: `xcodebuild test -project ios/OwlPost.xcodeproj -scheme OwlPostUITests -destination 'id=<simulator>'`, or ⌘U in Xcode with that scheme.
+UI tests (`ios/OwlPostUITests`, demo accounts only) tap and type in the composer, and file conversations from the Move sheet and tabs, as a finger would: `xcodebuild test -project ios/OwlPost.xcodeproj -scheme OwlPostUITests -destination 'id=<simulator>'`, or ⌘U in Xcode with that scheme.
 
 ## Adding your accounts
 
@@ -104,11 +107,12 @@ Not on the phone. It still compiles there, but the bridge never calls it, so the
 ## Next
 
 1. **Run it on Tim's phone** with his real accounts (Tim, by hand): adding iCloud, sync, archive and snooze, and that a snooze or pin made on the phone shows on the Mac.
-2. **Reading and writing on real accounts** (Tim, by hand): HTML email, pictures inside emails, attachments, replies, drafts showing on the Mac, and sending.
-3. **Sign in with Google on a real account** (Tim, by hand): built 2026-11-14, not yet tried with a real Google account.
-4. **Background refresh** (`BGAppRefreshTask`): iOS wakes the app every 15 minutes to a few hours to call `sync`.
-5. **Undo** after archive or snooze, as on the desktop (⌘Z there; a toast with Undo here).
-6. **Composer extras**: signatures (they live on the Mac for now), pictures pasted into the body, autosaving while you write, Undo Send.
+2. **Filing on real accounts** (Tim, by hand): a move, a Gmail label, a new tab and a sender rule on the phone, then check each shows on the Mac.
+3. **Reading and writing on real accounts** (Tim, by hand): HTML email, pictures inside emails, attachments, replies, drafts showing on the Mac, and sending.
+4. **Sign in with Google on a real account** (Tim, by hand): built 2026-11-14, not yet tried with a real Google account.
+5. **Background refresh** (`BGAppRefreshTask`): iOS wakes the app every 15 minutes to a few hours to call `sync`.
+6. **Undo** after archive or snooze, as on the desktop (⌘Z there; a toast with Undo here).
+7. **Composer extras**: signatures (they live on the Mac for now), pictures pasted into the body, autosaving while you write, Undo Send.
 
 ## What carries over from the desktop
 

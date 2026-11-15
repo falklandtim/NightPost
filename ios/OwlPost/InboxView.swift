@@ -1,6 +1,8 @@
 // The message list: every account together (or one account's folder,
 // picked in Folders), with swipes as on the desktop (right to archive,
-// left to snooze), pull to refresh and search.
+// left to snooze), pull to refresh and search. Over an Inbox, the tabs
+// (TabStrip); pinned conversations in a section that can be hidden; press
+// and hold a conversation to move or label it (MoveSheet).
 
 import SwiftUI
 
@@ -10,51 +12,31 @@ struct InboxView: View {
     @State private var settingsOpen = false
     @State private var foldersOpen = false
     @State private var debugAdd = false
+    @State private var moving: ThreadRow?
+    /// Kept on this phone, like the desktop's Hide on each computer.
+    @AppStorage("hidePinned") private var hidePinned = false
 
     var body: some View {
         @Bindable var model = model
         List {
-            ForEach(model.rows, id: \.self) { t in
-                Group {
-                    if isDrafts {
-                        // A draft opens in the composer, to carry on writing.
-                        Button { Task { await model.openDraft(t) } } label: {
-                            ThreadRowView(row: t, account: model.account(t.accountId), showAccount: model.accounts.count > 1)
-                        }
-                        .buttonStyle(.plain)
-                    } else {
-                        NavigationLink(value: t) {
-                            ThreadRowView(row: t, account: model.account(t.accountId), showAccount: model.accounts.count > 1)
-                        }
+            if !pinned.isEmpty {
+                Section {
+                    if !hidePinned {
+                        ForEach(pinned, id: \.self) { t in row(t) }
                     }
+                } header: {
+                    PinnedHeader(count: pinned.count, hidden: $hidePinned)
                 }
-                .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                    if model.mailbox == .snoozed {
-                        Button { Task { await model.unsnooze(t) } } label: { Label("Unsnooze", systemImage: "tray.and.arrow.down") }
-                            .tint(.blue)
-                    } else {
-                        Button { Task { await model.archive(t) } } label: { Label("Archive", systemImage: "archivebox") }
-                            .tint(.green)
-                    }
-                    Button { Task { await model.setRead(t, t.unread) } } label: {
-                        Label(t.unread ? "Read" : "Unread", systemImage: t.unread ? "envelope.open" : "envelope.badge")
-                    }
-                    .tint(.blue)
-                }
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    Button { snoozing = t } label: { Label("Snooze", systemImage: "clock") }
-                        .tint(.orange)
-                    Button(role: .destructive) { Task { await model.trash(t) } } label: { Label("Trash", systemImage: "trash") }
-                    Button { Task { await model.setPinned(t, !t.pinned) } } label: { Label(t.pinned ? "Unpin" : "Pin", systemImage: t.pinned ? "pin.slash" : "pin") }
-                        .tint(.yellow)
-                }
-                .listRowBackground(t.pinned ? Color.yellow.opacity(0.10) : nil)
+            }
+            Section {
+                ForEach(unpinned, id: \.self) { t in row(t) }
             }
         }
+        .modifier(TopBar(shown: model.tabsShown && !model.tabs.isEmpty) { TabStrip() })
         .listStyle(.plain)
         .overlay {
             if model.rows.isEmpty && model.started {
-                EmptyListView(mailbox: model.mailbox, inFolder: model.folder != nil, searching: !model.search.isEmpty)
+                EmptyListView(mailbox: model.mailbox, inFolder: model.folder != nil, inTab: model.tabsShown && model.tab != nil, searching: !model.search.isEmpty)
             }
         }
         .navigationTitle(model.title)
@@ -113,6 +95,9 @@ struct InboxView: View {
             }
             .presentationDetents([.medium])
         }
+        .sheet(item: $moving) { t in
+            MoveSheet(row: t)
+        }
         .sheet(isPresented: $settingsOpen) {
             SettingsView()
         }
@@ -125,6 +110,61 @@ struct InboxView: View {
         .task { debugShow() }
     }
 
+    /// Pinned conversations get a section of their own, which can be
+    /// hidden, as on the desktop; not in Snoozed, which sorts by wake time.
+    private var pinned: [ThreadRow] {
+        model.mailbox == .snoozed && model.folder == nil ? [] : model.rows.filter(\.pinned)
+    }
+
+    private var unpinned: [ThreadRow] {
+        pinned.isEmpty ? model.rows : model.rows.filter { !$0.pinned }
+    }
+
+    private func row(_ t: ThreadRow) -> some View {
+        Group {
+            if isDrafts {
+                // A draft opens in the composer, to carry on writing.
+                Button { Task { await model.openDraft(t) } } label: {
+                    ThreadRowView(row: t, account: model.account(t.accountId), showAccount: model.accounts.count > 1)
+                }
+                .buttonStyle(.plain)
+            } else {
+                NavigationLink(value: t) {
+                    ThreadRowView(row: t, account: model.account(t.accountId), showAccount: model.accounts.count > 1)
+                }
+            }
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            if model.mailbox == .snoozed {
+                Button { Task { await model.unsnooze(t) } } label: { Label("Unsnooze", systemImage: "tray.and.arrow.down") }
+                    .tint(.blue)
+            } else {
+                Button { Task { await model.archive(t) } } label: { Label("Archive", systemImage: "archivebox") }
+                    .tint(.green)
+            }
+            Button { Task { await model.setRead(t, t.unread) } } label: {
+                Label(t.unread ? "Read" : "Unread", systemImage: t.unread ? "envelope.open" : "envelope.badge")
+            }
+            .tint(.blue)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button { snoozing = t } label: { Label("Snooze", systemImage: "clock") }
+                .tint(.orange)
+            Button(role: .destructive) { Task { await model.trash(t) } } label: { Label("Trash", systemImage: "trash") }
+            Button { Task { await model.setPinned(t, !t.pinned) } } label: { Label(t.pinned ? "Unpin" : "Pin", systemImage: t.pinned ? "pin.slash" : "pin") }
+                .tint(.yellow)
+        }
+        .contextMenu {
+            if !isDrafts {
+                Button { moving = t } label: { Label("Move or Label…", systemImage: "folder") }
+                Button { Task { await model.setPinned(t, !t.pinned) } } label: { Label(t.pinned ? "Unpin" : "Pin", systemImage: t.pinned ? "pin.slash" : "pin") }
+                Button { Task { await model.setStarred(t, !t.starred) } } label: { Label(t.starred ? "Unstar" : "Star", systemImage: t.starred ? "star.slash" : "star") }
+                Button { Task { await model.setRead(t, t.unread) } } label: { Label(t.unread ? "Mark as Read" : "Mark as Unread", systemImage: t.unread ? "envelope.open" : "envelope.badge") }
+            }
+        }
+        .listRowBackground(t.pinned ? Color.yellow.opacity(0.10) : nil)
+    }
+
     /// Drafts (unified, or an account's Drafts folder) open in the composer.
     private var isDrafts: Bool {
         model.folder.map { $0.kind == .drafts } ?? (model.mailbox == .drafts)
@@ -134,7 +174,7 @@ struct InboxView: View {
     @State private var debugShown = false
 
     /// Debug builds only: `-show thread` opens the longest conversation and
-    /// `-show snooze` the snooze sheet (`-show settings`, Settings; `-show add`, Add Account; `-show folders`, Folders; `-show compose`, a reply; `-show new`, a new message; `-show html`, an HTML email) once the list loads, for screenshots
+    /// `-show snooze` the snooze sheet (`-show settings`, Settings; `-show add`, Add Account; `-show folders`, Folders; `-show compose`, a reply; `-show new`, a new message; `-show move`, the Move sheet; `-show html`, an HTML email) once the list loads, for screenshots
     /// from the simulator (where nothing can tap).
     private func debugShow() {
         #if DEBUG
@@ -150,6 +190,7 @@ struct InboxView: View {
         case "folders": foldersOpen = true
         case "compose": Task { await model.startCompose(model.messages(t).last?.id ?? 0, .reply) }
         case "new": model.newMessage()
+        case "move": moving = t
         case "html":
             Task {
                 for r in model.rows where await model.messages(r).contains(where: { $0.hasHtml }) {
@@ -225,14 +266,65 @@ struct ThreadRowView: View {
     }
 }
 
+/// A bar pinned under the navigation bar. On iOS 26 it joins the
+/// navigation bar's glass (a plain inset there is blurred over, title and
+/// all); before that, an inset with the bar's own background.
+struct TopBar<Bar: View>: ViewModifier {
+    let shown: Bool
+    @ViewBuilder let bar: () -> Bar
+
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) {
+            content.safeAreaBar(edge: .top, spacing: 0) {
+                if shown { bar() }
+            }
+        } else {
+            content.safeAreaInset(edge: .top, spacing: 0) {
+                if shown { bar().background(.bar) }
+            }
+        }
+    }
+}
+
+/// "Pinned", with Hide or Show. Hidden, it says how many are tucked away.
+struct PinnedHeader: View {
+    let count: Int
+    @Binding var hidden: Bool
+
+    var body: some View {
+        HStack {
+            Label(hidden ? "Pinned (\(count))" : "Pinned", systemImage: "pin.fill")
+                .labelStyle(.titleAndIcon)
+            Spacer()
+            Button(hidden ? "Show" : "Hide") {
+                withAnimation { hidden.toggle() }
+            }
+            .font(.footnote.weight(.semibold))
+            // In a List a button needs its own style to get its own taps,
+            // and a bigger target than the word.
+            .buttonStyle(.borderless)
+            .padding(.vertical, 6)
+            .padding(.leading, 16)
+            .contentShape(Rectangle())
+            .accessibilityLabel(hidden ? "Show pinned" : "Hide pinned")
+        }
+        // The whole heading toggles too.
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation { hidden.toggle() } }
+    }
+}
+
 struct EmptyListView: View {
     let mailbox: Mailbox
     var inFolder = false
+    var inTab = false
     let searching: Bool
 
     var body: some View {
         if searching {
             ContentUnavailableView.search
+        } else if inTab {
+            ContentUnavailableView("Nothing here right now", systemImage: "tray")
         } else if inFolder {
             ContentUnavailableView("No conversations here", systemImage: "folder")
         } else {

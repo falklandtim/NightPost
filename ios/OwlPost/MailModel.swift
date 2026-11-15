@@ -21,6 +21,11 @@ final class MailModel {
     /// across every account.
     var folder: FolderInfo?
     var search = ""
+    /// The Inbox tab showing (a category number); `nil` is All.
+    var tab: UInt8?
+    /// The tabs above the Inbox, with unread counts; empty when the list
+    /// isn't an Inbox (see `tabsShown`).
+    private(set) var tabs: [InboxTab] = []
     var error: String?
     private(set) var syncing = false
     /// How far the running sync has got (folder 12 of 110), for the
@@ -93,20 +98,27 @@ final class MailModel {
 
     func reload() async {
         guard let mail else { return }
-        let (box, folder, query) = (mailbox, folder, search)
+        let (box, folder, search, shown) = (mailbox, folder, search, tabsShown)
+        let wanted = shown ? tab : nil
         do {
-            let (a, r) = try await background {
+            let (a, t, used, r) = try await background {
+                let tabs = shown ? try mail.inboxTabs(folderId: folder?.id) : []
+                // The tab was removed (perhaps on another device): show All.
+                let used = tabs.contains(where: { $0.category == wanted }) ? wanted : nil
+                let query = used.map { "\(search) category:\($0)" } ?? search
                 let rows = if let folder {
                     try mail.folderThreads(folderId: folder.id, query: query, limit: 300)
                 } else {
                     try mail.threads(mailbox: box, query: query, limit: 300)
                 }
-                return (try mail.accounts(), rows)
+                return (try mail.accounts(), tabs, used, rows)
             }
             accounts = a
             // Another list may have been picked meanwhile; keep the newest.
-            if box == mailbox && folder == self.folder && query == search {
+            if box == mailbox && folder == self.folder && search == self.search && shown == tabsShown && wanted == (shown ? tab : nil) {
                 rows = r
+                tabs = t
+                if shown { tab = used }
             }
         } catch {
             // The folder went (removed on the server, or its account
@@ -119,6 +131,19 @@ final class MailModel {
             }
             show(error)
         }
+    }
+
+    /// Tabs show over an Inbox (every account's, or one account's Inbox
+    /// folder), and not while searching, as on the desktop.
+    var tabsShown: Bool {
+        search.isEmpty && (folder.map { $0.kind == .inbox } ?? (mailbox == .inbox))
+    }
+
+    /// Show one tab (`nil`: All).
+    func pick(tab c: UInt8?) async {
+        guard c != tab else { return }
+        tab = c
+        await reload()
     }
 
     /// Fetch new mail for every account.
@@ -269,6 +294,76 @@ final class MailModel {
     func setPinned(_ t: ThreadRow, _ pinned: Bool) async {
         change(t) { $0.pinned = pinned }
         await act { try $0.setPinned(accountId: t.accountId, threadKey: t.threadKey, pinned: pinned) }
+    }
+
+    // MARK: Filing: folders, labels and tabs
+
+    /// Where a conversation is filed, and the choices, for the Move sheet.
+    func filing(_ t: ThreadRow) async -> Filing? {
+        guard let mail else { return nil }
+        do {
+            return try await background { try mail.filing(accountId: t.accountId, threadKey: t.threadKey) }
+        } catch {
+            show(error)
+            return nil
+        }
+    }
+
+    /// Move a conversation into a folder (on Gmail, a label, out of the
+    /// Inbox). In a folder, only out of that folder, as on the desktop.
+    func move(_ t: ThreadRow, to f: FolderInfo) async {
+        guard f.id != folder?.id else { return }
+        drop(t)
+        let from = folder?.id
+        await act { try $0.moveToFolder(accountId: t.accountId, threadKey: t.threadKey, folderId: f.id, fromFolderId: from) }
+    }
+
+    /// Add a label, or take it off.
+    func setLabel(_ t: ThreadRow, _ f: FolderInfo, on: Bool) async {
+        // Taking off the label being looked at takes it out of this list.
+        if !on && f.id == folder?.id { drop(t) }
+        await act { try $0.setLabel(accountId: t.accountId, threadKey: t.threadKey, folderId: f.id, on: on) }
+    }
+
+    /// Make a folder (a label on Gmail), or find the one called that.
+    func createFolder(_ accountId: Int64, _ name: String) async -> FolderInfo? {
+        guard let mail else { return nil }
+        do {
+            return try await background { try mail.createFolder(accountId: accountId, name: name) }
+        } catch {
+            show(error)
+            return nil
+        }
+    }
+
+    /// Put a conversation in a tab (`nil`: sort it like the rest).
+    func putInTab(_ t: ThreadRow, _ c: UInt8?) async {
+        if tabsShown, let tab, tab != c { drop(t) }
+        await act { try $0.putInTab(accountId: t.accountId, threadKey: t.threadKey, category: c) }
+    }
+
+    /// Always put a sender's mail in a tab (`nil`: sort it automatically).
+    func sortSender(_ email: String, _ c: UInt8?) async {
+        await act { try $0.sortSender(email: email, category: c) }
+    }
+
+    /// Make one of your own tabs; returns its number.
+    func newTab(_ name: String) async -> UInt8? {
+        guard let mail else { return nil }
+        do {
+            let c = try await background { try mail.newTab(name: name) }
+            await reload()
+            return c
+        } catch {
+            show(error)
+            return nil
+        }
+    }
+
+    /// Remove one of your own tabs; its mail goes back to the others.
+    func removeTab(_ c: UInt8) async {
+        if tab == c { tab = nil }
+        await act { try $0.removeTab(category: c) }
     }
 
     func messages(_ t: ThreadRow) async -> [MessageInfo] {
