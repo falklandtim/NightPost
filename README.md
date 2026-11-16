@@ -98,6 +98,8 @@ Otherwise, both providers accept an **app password** in place of your normal pas
 | Gmail | Turn on 2-Step Verification, then visit myaccount.google.com/apppasswords. Make sure IMAP is enabled in Gmail settings. | `imap.gmail.com:993` TLS · `smtp.gmail.com:465` TLS |
 | iCloud | account.apple.com → Sign-In and Security → App-Specific Passwords. Use your full `@icloud.com` address. | `imap.mail.me.com:993` TLS · `smtp.mail.me.com:587` STARTTLS |
 
+Other servers must use SSL/TLS or STARTTLS, so your password is always encrypted on the way. The one exception is sending to a server on this computer (`localhost` or `127.0.0.1`, such as Proton Bridge), where **None** is offered for SMTP.
+
 ## MCP server
 
 `nightpost mcp` speaks the Model Context Protocol over stdio and shares the app's database and accounts.

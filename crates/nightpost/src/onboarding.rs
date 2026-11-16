@@ -251,8 +251,8 @@ impl AccountSetup {
                     ui.label("Username");
                     ui.add(egui::TextEdit::singleline(&mut self.username).desired_width(200.0));
                     ui.end_row();
-                    server_row(ui, "IMAP", &mut self.imap, "imap");
-                    server_row(ui, "SMTP", &mut self.smtp, "smtp");
+                    server_row(ui, "IMAP", &mut self.imap, "imap", false);
+                    server_row(ui, "SMTP", &mut self.smtp, "smtp", true);
                 });
             }
         });
@@ -278,7 +278,9 @@ impl AccountSetup {
     }
 }
 
-fn server_row(ui: &mut egui::Ui, label: &str, s: &mut ServerConfig, id: &str) {
+/// One server's host, port and security. `plain_allowed`: whether "None"
+/// may be offered (sending only, and only to this computer).
+fn server_row(ui: &mut egui::Ui, label: &str, s: &mut ServerConfig, id: &str, plain_allowed: bool) {
     ui.label(label);
     ui.add(egui::TextEdit::singleline(&mut s.host).desired_width(200.0).hint_text("host"));
     let mut port = s.port.to_string();
@@ -287,9 +289,18 @@ fn server_row(ui: &mut egui::Ui, label: &str, s: &mut ServerConfig, id: &str) {
             s.port = p;
         }
     }
+    // "None" only for sending to a server on this computer (a local bridge):
+    // anywhere else it would show the password on the network, and IMAP
+    // never accepts it (nightpost_core::smtp::check_security, engine::open_client).
+    let plain_ok = plain_allowed && nightpost_core::smtp::is_local_host(&s.host);
+    if s.security == Security::None && !plain_ok {
+        s.security = Security::StartTls;
+    }
     egui::ComboBox::from_id_salt(id).selected_text(s.security.label()).show_ui(ui, |ui| {
         for sec in [Security::Tls, Security::StartTls, Security::None] {
-            ui.selectable_value(&mut s.security, sec, sec.label());
+            if sec != Security::None || plain_ok {
+                ui.selectable_value(&mut s.security, sec, sec.label());
+            }
         }
     });
     ui.end_row();

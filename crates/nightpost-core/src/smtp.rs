@@ -52,6 +52,25 @@ impl OutgoingAttachment {
     }
 }
 
+/// Is `host` this computer (`localhost`, or a loopback address)?
+pub fn is_local_host(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    h.eq_ignore_ascii_case("localhost") || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Refuse to send unencrypted, which would show the password to anyone on
+/// the network, except to a server on this computer (a local relay or
+/// bridge, such as Proton Bridge). IMAP refuses unencrypted outright.
+pub fn check_security(s: &crate::models::ServerConfig) -> Result<()> {
+    if s.security == Security::None && !is_local_host(&s.host) {
+        anyhow::bail!(
+            "NightPost won't send without encryption: it would show your password on the network. \
+             Remove this account in Preferences → Accounts and add it again with SSL/TLS or STARTTLS for sending."
+        );
+    }
+    Ok(())
+}
+
 /// Most providers (Gmail, iCloud) refuse messages over about 25 MB, and
 /// attachments grow by a third when encoded for sending.
 pub const SIZE_LIMIT: usize = 25 * 1024 * 1024;
@@ -290,8 +309,9 @@ pub fn send(account: &Account, password: &str, out: &OutgoingMessage) -> Result<
             .collect::<Result<Vec<_>, _>>()?;
         lettre::address::Envelope::new(Some(from), rcpts)?
     };
-    let creds = Credentials::new(account.username.clone(), password.to_string());
     let s = &account.smtp;
+    check_security(s)?;
+    let creds = Credentials::new(account.username.clone(), password.to_string());
     let transport = match s.security {
         Security::Tls => SmtpTransport::relay(&s.host)?,
         Security::StartTls => SmtpTransport::starttls_relay(&s.host)?,
@@ -329,6 +349,19 @@ pub fn quote(original: &crate::models::Message) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unencrypted_sending_only_to_this_computer() {
+        let cfg = |host: &str, security| crate::models::ServerConfig { host: host.into(), port: 25, security };
+        let e = check_security(&cfg("smtp.example.com", Security::None)).unwrap_err().to_string();
+        assert!(e.contains("SSL/TLS or STARTTLS"), "{e}");
+        for local in ["127.0.0.1", "localhost", "LOCALHOST", "::1", "[::1]", "127.0.0.2"] {
+            assert!(check_security(&cfg(local, Security::None)).is_ok(), "{local}");
+        }
+        assert!(check_security(&cfg("smtp.example.com", Security::Tls)).is_ok());
+        assert!(check_security(&cfg("smtp.example.com", Security::StartTls)).is_ok());
+        assert!(!is_local_host("127.0.0.1.example.com") && !is_local_host("localhost.example.com"));
+    }
+
     use super::*;
 
     #[test]
