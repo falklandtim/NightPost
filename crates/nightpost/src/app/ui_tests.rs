@@ -905,6 +905,12 @@ fn open_received_attachment() {
     assert_eq!(cached.len(), 1);
     assert_eq!(cached[0].file_name(), "receipt.pdf");
     assert!(std::fs::read(cached[0].path()).unwrap().starts_with(b"%PDF"));
+    // Marked as downloaded from the internet, so Gatekeeper checks it.
+    #[cfg(target_os = "macos")]
+    {
+        let q = std::process::Command::new("/usr/bin/xattr").args(["-p", "com.apple.quarantine"]).arg(cached[0].path()).output().unwrap();
+        assert!(String::from_utf8_lossy(&q.stdout).contains("NightPost"), "not quarantined");
+    }
     // Right-click offers the save options.
     h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: true, modifiers: Default::default() });
     h.run_steps(1);
@@ -913,6 +919,33 @@ fn open_received_attachment() {
     assert!(h.query_by_label("Save to Downloads").is_some() && h.query_by_label("Save As…").is_some());
     save(&mut h, "attachment-menu");
     let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// An archive (or program, script…) isn't opened straight away: the app
+/// asks first, and opens it only on "Open Anyway".
+#[test]
+fn risky_attachment_asks_before_opening() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = harness(theme::MOONLIT_LIGHT);
+    h.run_steps(3);
+    let idx = h.state().rows.iter().position(|r| r.t.subject.contains("receipt")).unwrap();
+    h.state_mut().select(idx);
+    h.run_steps(3);
+    // The demo's receipt, renamed: a stand-in for a zip from a stranger.
+    for m in h.state_mut().open.as_mut().unwrap().messages.iter_mut() {
+        for a in m.attachments.iter_mut() {
+            a.filename = "invoice.zip".into();
+        }
+    }
+    h.run_steps(2);
+    h.get_by_label("invoice.zip").click();
+    h.run_steps(2);
+    assert!(h.state().downloading.is_empty(), "opened without asking");
+    assert!(h.query_by_label("Open Anyway").is_some(), "no confirmation");
+    save(&mut h, "attachment-risky");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Open Anyway").is_none() && h.state().downloading.is_empty());
 }
 
 #[test]

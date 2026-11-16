@@ -451,6 +451,45 @@ impl NightPostApp {
         }
     }
 
+    /// "Open Anyway?" for an attachment that could run something: a program,
+    /// script, installer, archive or document with macros. Cancel is the
+    /// default (Escape or Enter).
+    pub(super) fn risky_open_dialog(&mut self, ctx: &egui::Context) {
+        let Some((m, index)) = &self.risky_open else { return };
+        let name = m.attachments.get(*index).map(|a| a.filename.clone()).unwrap_or_default();
+        let kind = nightpost_core::file_safety::risky_kind(&name).unwrap_or("file");
+        let article = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+        let col = self.colors.clone();
+        let mut open: Option<bool> = None;
+        egui::Modal::new(egui::Id::new("risky-open")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(RichText::new(format!("Open \u{201c}{name}\u{201d}?")).size(17.0).strong().color(col.heading));
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("It's {article} {kind}. Files from email can be harmful. Open it only if you were expecting it.")).color(col.subtle));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Cancel").clicked() {
+                        open = Some(false);
+                    }
+                    if ui.button("Open Anyway").clicked() {
+                        open = Some(true);
+                    }
+                });
+            });
+            if ui.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter)) {
+                open = Some(false);
+            }
+        });
+        if let Some(yes) = open {
+            if let Some((m, index)) = self.risky_open.take() {
+                if yes {
+                    self.fetch_attachment(m, index, crate::worker::AttachmentDo::Open);
+                }
+            }
+        }
+    }
+
     /// The drag in progress: a label under the pointer, and the drop on release.
     pub(super) fn drag_overlay(&mut self, ctx: &egui::Context) {
         let Some(keys) = &self.dragging else { return };

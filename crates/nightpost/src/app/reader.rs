@@ -248,6 +248,11 @@ impl NightPostApp {
     pub(super) fn attachment(&mut self, m: Message, index: usize, what: AttachmentClick) {
         let Some(a) = m.attachments.get(index) else { return };
         let what = match what {
+            // A program, script or archive: ask first (see `risky_open_dialog`).
+            AttachmentClick::Open if nightpost_core::file_safety::risky_extension(&a.filename) => {
+                self.risky_open = Some((m, index));
+                return;
+            }
             AttachmentClick::Open => AttachmentDo::Open,
             AttachmentClick::SaveToDownloads => AttachmentDo::SaveToDownloads,
             AttachmentClick::SaveAs => {
@@ -259,6 +264,11 @@ impl NightPostApp {
                 AttachmentDo::SaveTo(path)
             }
         };
+        self.fetch_attachment(m, index, what);
+    }
+
+    /// Download (or reuse) an attachment on the worker, then do `what`.
+    pub(super) fn fetch_attachment(&mut self, m: Message, index: usize, what: AttachmentDo) {
         if self.downloading.insert((m.id, index)) {
             self.worker.send(Cmd::Attachment(Box::new(m), index, what));
         }

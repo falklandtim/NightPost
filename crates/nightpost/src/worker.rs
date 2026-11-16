@@ -544,6 +544,7 @@ fn attachment(store: &Store, m: &Message, index: usize, what: AttachmentDo) -> a
         }
         AttachmentDo::SaveTo(dest) => {
             std::fs::copy(&path, &dest)?;
+            nightpost_core::file_safety::quarantine(&dest);
             Ok(Some(format!("Saved {}", dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())))
         }
         AttachmentDo::SaveToDownloads => {
@@ -552,6 +553,7 @@ fn attachment(store: &Store, m: &Message, index: usize, what: AttachmentDo) -> a
                 .ok_or_else(|| anyhow::anyhow!("couldn't find your Downloads folder"))?;
             let dest = unused_path(&dir, &engine::safe_filename(&m.attachments[index].filename));
             std::fs::copy(&path, &dest)?;
+            nightpost_core::file_safety::quarantine(&dest);
             let _ = open_file(&dest, true);
             Ok(Some(format!("Saved {} to Downloads", dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())))
         }

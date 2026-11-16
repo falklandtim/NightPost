@@ -1003,6 +1003,8 @@ pub fn attachment_file_in(cache: &std::path::Path, store: &Store, account: &Acco
     let dir = cache.join(format!("{:016x}-{index}", h.finish()));
     let path = dir.join(safe_filename(&meta.filename));
     if path.is_file() {
+        // Copies cached before quarantining began get the mark too.
+        crate::file_safety::quarantine(&path);
         return Ok(path);
     }
     let data = if account.demo { demo_attachment(&meta.filename) } else { download_attachment(store, account, m, index)? };
@@ -1011,6 +1013,7 @@ pub fn attachment_file_in(cache: &std::path::Path, store: &Store, account: &Acco
     let tmp = dir.join(format!(".{}.part", std::process::id()));
     std::fs::write(&tmp, &data)?;
     std::fs::rename(&tmp, &path)?;
+    crate::file_safety::quarantine(&path);
     Ok(path)
 }
 

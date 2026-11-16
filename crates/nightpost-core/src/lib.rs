@@ -7,6 +7,7 @@ pub mod credentials;
 pub mod demo;
 pub mod email_view;
 pub mod engine;
+pub mod file_safety;
 pub mod html_clean;
 pub mod idle;
 pub mod mail_html;

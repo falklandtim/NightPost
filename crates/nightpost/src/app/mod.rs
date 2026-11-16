@@ -398,6 +398,8 @@ pub struct NightPostApp {
     tabs: Vec<(u8, String, i64)>,
     /// The "New tab" dialog, while it's open.
     new_tab: Option<NewTab>,
+    /// An attachment that could run something, waiting for "Open Anyway".
+    risky_open: Option<(Message, usize)>,
     /// The New folder / Delete folder dialog, while it's open.
     folder_dialog: Option<FolderDialog>,
     /// Recolour HTML emails to match a dark theme.
@@ -589,6 +591,7 @@ impl NightPostApp {
             category: ALL_TAB,
             tabs: Vec::new(),
             new_tab: None,
+            risky_open: None,
             folder_dialog: None,
             web_rect: None,
             remote_images: HashSet::new(),
@@ -943,6 +946,7 @@ impl NightPostApp {
         self.reader(ctx);
         self.windows(ctx);
         self.new_tab_dialog(ctx);
+        self.risky_open_dialog(ctx);
         self.folder_dialog_ui(ctx);
         self.keys_sheet(ctx);
         self.activity_sheet(ctx);

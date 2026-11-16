@@ -53,6 +53,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <dict>
     <key>NSAllowsArbitraryLoadsInWebContent</key><true/>
   </dict>
+  <!-- Attachments come from strangers: mark every file NightPost writes as
+       downloaded from the internet, so Gatekeeper checks it (and anything
+       unzipped from it) before it runs. -->
+  <key>LSFileQuarantineEnabled</key><true/>
   <key>NSContactsUsageDescription</key><string>NightPost shows the photos of people in your Contacts next to their emails.</string>
 </dict>
 </plist>
