@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 quick=0
 [[ "${1:-}" == "--quick" ]] && quick=1
 
-tests="-" ; clippy="-" ; rustdoc="-"
+tests="-" ; clippy="-" ; rustdoc="-" ; advisories="-" ; future="-" ; updates="-"
 if [[ $quick == 0 ]]; then
     echo "== cargo test --workspace"
     out=$(cargo test --workspace 2>&1)
@@ -32,9 +32,34 @@ if [[ $quick == 0 ]]; then
     rustdoc=$(grep -E "^warning" <<<"$out" | grep -vE "generated [0-9]+ warning|future version of Rust" | wc -l | tr -d ' ')
     grep -A1 -E "^warning" <<<"$out" | grep -vE "generated [0-9]+ warning|future version of Rust|^--$" | sed 's/^/  /'
     echo
+    # Dependencies (AGENTS.md section 6). These need the network.
+    echo "== cargo audit (security advisories)"
+    if cargo audit --version >/dev/null 2>&1; then
+        out=$(cargo audit 2>&1)
+        # Vulnerabilities count, plus warnings such as "unmaintained".
+        advisories=$(grep -E "^Crate:" <<<"$out" | wc -l | tr -d ' ')
+        grep -E "^(Crate|Version|Title|ID|Warning):" <<<"$out" | sed 's/^/  /'
+        [[ "$advisories" == 0 ]] && echo "  none"
+    else
+        advisories="not installed"
+        echo "  cargo-audit isn't installed: cargo install cargo-audit"
+    fi
+    echo
+    echo "== Future-incompatibility warnings"
+    out=$(cargo report future-incompatibilities 2>&1)
+    # "The package `imap-proto v0.10.2` currently triggers ..."
+    future=$(grep -oE "package \`[a-z0-9_-]+ v[^\`]+\`" <<<"$out" | sort -u | wc -l | tr -d ' ')
+    grep -oE "package \`[a-z0-9_-]+ v[^\`]+\`" <<<"$out" | sort -u | sed 's/^package /  /'
+    [[ "$future" == 0 ]] && echo "  none"
+    echo
+    echo "== Compatible updates waiting (cargo update --dry-run)"
+    out=$(cargo update --dry-run 2>&1)
+    updates=$(grep -cE "^\s+Updating [a-z0-9_-]+ v" <<<"$out" | tr -d ' ')
+    grep -E "^\s+Updating [a-z0-9_-]+ v" <<<"$out" | sed 's/^ */  /'
+    echo
 fi
 
-TESTS="$tests" CLIPPY="$clippy" RUSTDOC="$rustdoc" python3 - <<'PY'
+TESTS="$tests" CLIPPY="$clippy" RUSTDOC="$rustdoc" ADVISORIES="$advisories" FUTURE="$future" UPDATES="$updates" python3 - <<'PY'
 import os, re, subprocess
 
 FILE_LIMIT, FN_LIMIT = 1500, 100
@@ -140,6 +165,9 @@ summary = [
     ("unsafe without SAFETY", f"{unsafe_bare} of {unsafe_total}"),
     ("unwrap/expect/panic outside tests", len(panics)),
     ("TODO/FIXME", todos),
+    ("Security advisories (cargo audit)", os.environ["ADVISORIES"]),
+    ("Crates with future-incompat warnings", os.environ["FUTURE"]),
+    ("Compatible updates waiting", os.environ["UPDATES"]),
 ]
 print("== Summary")
 for k, v in summary:

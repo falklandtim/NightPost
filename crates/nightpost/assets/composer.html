@@ -1,0 +1,466 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-/*NONCE*/'; style-src 'unsafe-inline'; img-src data: https: http:; font-src data:">
+<title>Compose</title>
+<style>
+:root {
+  --bg: #ffffff; --bg2: #f4f5f7; --text: #1d1f24; --subtle: #6b7280; --border: #d9dce1;
+  --accent: #3b82f6; --accent-text: #ffffff; --hover: rgba(0,0,0,0.06); --danger: #d93025;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Cantarell, "Noto Sans", Ubuntu, Helvetica, Arial, sans-serif; }
+body { display: flex; flex-direction: column; }
+.fields { padding: 10px 16px 0; }
+.row { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); min-height: 36px; position: relative; }
+.row label { width: 64px; color: var(--subtle); flex: none; }
+.row input, .row select { flex: 1; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; padding: 8px 0; min-width: 0; }
+.row select { padding: 6px 0; }
+/* Drawn by the page, not the toolkit: GTK's light menus were unreadable on dark pages. */
+select { -webkit-appearance: none; appearance: none; background-color: var(--bg); color: var(--text);
+  background-image: linear-gradient(45deg, transparent 50%, var(--subtle) 50%), linear-gradient(135deg, var(--subtle) 50%, transparent 50%);
+  background-position: calc(100% - 12px) 50%, calc(100% - 7px) 50%; background-size: 5px 5px; background-repeat: no-repeat; padding-right: 20px !important; }
+select option { background: var(--bg); color: var(--text); }
+.row .link { color: var(--subtle); cursor: pointer; user-select: none; font-size: 13px; }
+.row .link:hover { color: var(--text); }
+.hidden { display: none !important; }
+.suggest { position: absolute; left: 74px; top: 100%; z-index: 20; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.18); min-width: 320px; max-width: 520px; padding: 4px; }
+.suggest div { padding: 6px 10px; border-radius: 6px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.suggest div.on, .suggest div:hover { background: var(--accent); color: var(--accent-text); }
+.suggest small { opacity: .7; margin-left: 6px; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; padding: 6px 12px; border-bottom: 1px solid var(--border); background: var(--bg2); }
+.toolbar button, .toolbar select { height: 30px; min-width: 30px; border: 0; border-radius: 6px; background: transparent; color: var(--text);
+  font: inherit; cursor: pointer; padding: 0 7px; }
+.toolbar select { padding: 0 2px; }
+.toolbar #font { width: 92px; } .toolbar #size { width: 70px; }
+.toolbar button:hover, .toolbar select:hover { background: var(--hover); }
+.toolbar button.on { background: var(--hover); box-shadow: inset 0 0 0 1px var(--border); }
+.toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 5px; }
+.toolbar svg { width: 16px; height: 16px; vertical-align: middle; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.pop { position: absolute; z-index: 30; background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.2); padding: 10px; }
+.swatches { display: grid; grid-template-columns: repeat(8, 22px); gap: 6px; }
+.swatches span { width: 22px; height: 22px; border-radius: 5px; cursor: pointer; border: 1px solid rgba(0,0,0,.15); }
+.pop .title { font-size: 12px; color: var(--subtle); margin: 0 0 6px; }
+.pop input[type=url], .pop input[type=text] { width: 300px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+.pop .buttons { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; }
+.btn { height: 30px; padding: 0 14px; border-radius: 15px; border: 1px solid var(--border); background: var(--bg2); color: var(--text); font: inherit; cursor: pointer; }
+.btn:hover { filter: brightness(.96); }
+.btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+.btn:disabled { opacity: .5; cursor: default; }
+#editor { flex: 1; overflow: auto; padding: 16px 18px 24px; outline: none; line-height: 1.45; cursor: text; }
+#editor:empty::before { content: attr(data-placeholder); color: var(--subtle); }
+#editor blockquote { margin: 6px 0 6px 2px; padding-left: 12px; border-left: 3px solid var(--border); color: var(--subtle); }
+#editor img { max-width: 100%; height: auto; }
+#editor a { color: var(--accent); }
+.nightpost-signature { margin-top: 14px; }
+.nightpost-signature[contenteditable=false] { cursor: default; }
+.nightpost-quote { margin-top: 18px; color: var(--subtle); }
+.attachments { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 16px; border-top: 1px solid var(--border); }
+.chip { display: flex; align-items: center; gap: 8px; padding: 4px 8px 4px 4px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); max-width: 280px; }
+.chip img { width: 34px; height: 34px; object-fit: cover; border-radius: 5px; }
+.chip .ico { width: 34px; height: 34px; border-radius: 5px; background: var(--hover); display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--subtle); text-transform: uppercase; }
+.chip .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip small { color: var(--subtle); display: block; }
+.chip .x { cursor: pointer; color: var(--subtle); padding: 0 4px; font-size: 16px; }
+.chip .x:hover { color: var(--danger); }
+.footer { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); background: var(--bg2); }
+.footer .grow { flex: 1; }
+.footer .status { color: var(--subtle); font-size: 12px; }
+.footer select { height: 30px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; padding: 0 6px; }
+.footer .why { color: var(--danger); font-size: 12px; }
+.drop { position: fixed; inset: 0; background: rgba(59,130,246,.12); border: 3px dashed var(--accent); display: none; align-items: center; justify-content: center;
+  font-size: 18px; color: var(--accent); z-index: 50; pointer-events: none; }
+body.dragging .drop { display: flex; }
+</style>
+</head>
+<body>
+<div class="fields">
+  <div class="row"><label>From</label><select id="from"></select></div>
+  <div class="row"><label>To</label><input id="to" autocomplete="off" spellcheck="false"><span class="link" id="showcc">Cc Bcc</span></div>
+  <div class="row hidden" id="ccrow"><label>Cc</label><input id="cc" autocomplete="off" spellcheck="false"></div>
+  <div class="row hidden" id="bccrow"><label>Bcc</label><input id="bcc" autocomplete="off" spellcheck="false"></div>
+  <div class="row"><label>Subject</label><input id="subject" autocomplete="off"></div>
+</div>
+<div class="toolbar" id="toolbar">
+  <select id="font" title="Font">
+    <option value="">Font</option>
+    <option value='-apple-system, BlinkMacSystemFont, "Segoe UI", Cantarell, "Noto Sans", Helvetica, Arial, sans-serif'>Sans serif</option>
+    <option value='Georgia, "Times New Roman", "Liberation Serif", serif'>Serif</option>
+    <option value='Helvetica, Arial, "Liberation Sans", sans-serif'>Helvetica / Arial</option>
+    <option value='Georgia, "DejaVu Serif", serif'>Georgia</option>
+    <option value='"Times New Roman", Times, "Liberation Serif", serif'>Times</option>
+    <option value='Verdana, "DejaVu Sans", sans-serif'>Verdana</option>
+    <option value='"Trebuchet MS", "Fira Sans", sans-serif'>Trebuchet</option>
+    <option value='Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace'>Fixed width</option>
+  </select>
+  <select id="size" title="Text size">
+    <option value="">Size</option>
+    <option value="2">Small</option>
+    <option value="3">Normal</option>
+    <option value="4">Large</option>
+    <option value="6">Huge</option>
+  </select>
+  <span class="sep"></span>
+  <button data-cmd="bold" title="Bold (⌘B)"><b>B</b></button>
+  <button data-cmd="italic" title="Italic (⌘I)"><i>I</i></button>
+  <button data-cmd="underline" title="Underline (⌘U)"><u>U</u></button>
+  <button data-cmd="strikeThrough" title="Strikethrough"><s>S</s></button>
+  <button id="color" title="Text colour"><svg viewBox="0 0 24 24"><path d="M6 18 12 4l6 14M8.5 12h7"/><path d="M4 21h16" stroke-width="3" id="colorbar" style="stroke:#d93025"/></svg></button>
+  <button id="highlight" title="Highlight"><svg viewBox="0 0 24 24"><path d="m9 15 7-7 3 3-7 7H9z"/><path d="M4 21h16" stroke-width="3" id="hlbar" style="stroke:#fde047"/></svg></button>
+  <span class="sep"></span>
+  <button id="link" title="Link (⌘K)"><svg viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></svg></button>
+  <button id="image" title="Insert picture"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></svg></button>
+  <span class="sep"></span>
+  <button data-cmd="insertUnorderedList" title="Bulleted list"><svg viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1"/><circle cx="4.5" cy="12" r="1"/><circle cx="4.5" cy="18" r="1"/></svg></button>
+  <button data-cmd="insertOrderedList" title="Numbered list"><svg viewBox="0 0 24 24"><path d="M10 6h10M10 12h10M10 18h10M4 5h1v4M4 9h2M4 15h2l-2 3h2"/></svg></button>
+  <button id="quote" title="Quote"><svg viewBox="0 0 24 24"><path d="M7 7h4v4H8c0 2 1 3 3 3M15 7h4v4h-3c0 2 1 3 3 3"/></svg></button>
+  <span class="sep"></span>
+  <button data-cmd="justifyLeft" title="Align left"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 10h10M4 14h16M4 18h10"/></svg></button>
+  <button data-cmd="justifyCenter" title="Centre"><svg viewBox="0 0 24 24"><path d="M4 6h16M7 10h10M4 14h16M7 18h10"/></svg></button>
+  <button data-cmd="justifyRight" title="Align right"><svg viewBox="0 0 24 24"><path d="M4 6h16M10 10h10M4 14h16M10 18h10"/></svg></button>
+  <span class="sep"></span>
+  <button data-cmd="removeFormat" title="Clear formatting"><svg viewBox="0 0 24 24"><path d="M6 5h12M12 5l-3 14M4 20 20 4"/></svg></button>
+</div>
+<div id="editor" contenteditable="true" spellcheck="true" data-placeholder="Write your message…"></div>
+<div class="attachments hidden" id="attachments"></div>
+<div class="footer">
+  <button class="btn" id="discard" title="Delete this draft">Discard</button>
+  <button class="btn" id="attach" title="Attach files — or drag them onto this window">Attach</button>
+  <select id="imagesize" class="hidden" title="Size of attached photos">
+    <option value="actual">Actual size</option><option value="large">Large (2048 px)</option>
+    <option value="medium">Medium (1280 px)</option><option value="small">Small (640 px)</option>
+  </select>
+  <span class="grow"></span>
+  <span class="status" id="status"></span>
+  <span class="why" id="why"></span>
+  <select id="signature" title="Signature"></select>
+  <button class="btn primary" id="send" title="Send (⌘↩)">Send</button>
+</div>
+<div class="drop">Drop files to attach them</div>
+<script nonce="/*NONCE*/">
+"use strict";
+const INIT = /*INIT*/{};
+const $ = (id) => document.getElementById(id);
+const post = (m) => { try { window.ipc.postMessage(JSON.stringify(m)); } catch (e) { console.log(e); } };
+const editor = $("editor");
+const COLORS = ["#000000","#434343","#666666","#999999","#cccccc","#ffffff","#d93025","#e8710a",
+  "#f9ab00","#188038","#1a73e8","#9334e6","#c5221f","#b06000","#137333","#174ea6",
+  "#fce8e6","#fef7e0","#e6f4ea","#e8f0fe","#f3e8fd","#fde047","#a7f3d0","#bfdbfe"];
+
+// ---------- set up from Rust ----------
+function applyColors(c) {
+  if (!c) return;
+  const r = document.documentElement.style;
+  for (const [k, v] of Object.entries(c)) r.setProperty("--" + k, v);
+}
+function fill(sel, items, value) {
+  sel.innerHTML = "";
+  for (const it of items) {
+    const o = document.createElement("option");
+    o.value = String(it.id); o.textContent = it.label;
+    sel.appendChild(o);
+  }
+  sel.value = value == null ? "" : String(value);
+}
+function init(s) {
+  applyColors(s.colors);
+  fill($("from"), s.accounts, s.account);
+  $("to").value = s.to || ""; $("cc").value = s.cc || ""; $("bcc").value = s.bcc || "";
+  if (s.cc || s.bcc) showCc();
+  $("subject").value = s.subject || "";
+  editor.innerHTML = s.html || "";
+  fill($("signature"), [{ id: "", label: "No signature" }].concat(s.signatures || []), s.signature);
+  if (s.signatureHtml != null && !editor.querySelector(".nightpost-signature")) setSignature(s.signatureHtml);
+  lockSignature();
+  $("imagesize").value = s.imageSize || "actual";
+  setAttachments(s.attachments || [], s.hasPhotos);
+  setTimeout(() => (s.focusBody ? focusBody() : $("to").focus()), 30);
+  sendState();
+}
+
+// ---------- the signature block ----------
+function lockSignature() {
+  const sig = editor.querySelector(".nightpost-signature");
+  if (sig) sig.setAttribute("contenteditable", "false");
+}
+function setSignature(html) {
+  let sig = editor.querySelector(".nightpost-signature");
+  if (!html) { if (sig) sig.remove(); changed(); return; }
+  if (!sig) {
+    sig = document.createElement("div");
+    sig.className = "nightpost-signature";
+    const quote = editor.querySelector(".nightpost-quote");
+    // Signature sits above any quoted text, after what you write.
+    if (quote) editor.insertBefore(sig, quote); else editor.appendChild(sig);
+    if (!sig.previousSibling) editor.insertBefore(document.createElement("div"), sig).appendChild(document.createElement("br"));
+  }
+  sig.innerHTML = html;
+  lockSignature();
+  changed();
+}
+function focusBody() {
+  editor.focus();
+  // Caret at the start of what you write (above the signature and quote).
+  const first = editor.firstChild;
+  const r = document.createRange();
+  if (first && !(first.classList && (first.classList.contains("nightpost-signature") || first.classList.contains("nightpost-quote")))) {
+    r.setStart(first, 0);
+  } else {
+    const line = document.createElement("div");
+    line.appendChild(document.createElement("br"));
+    editor.insertBefore(line, first);
+    r.setStart(line, 0);
+  }
+  r.collapse(true);
+  const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+}
+
+// ---------- state to Rust ----------
+let timer = null;
+function cleanHtml() {
+  const c = editor.cloneNode(true);
+  c.querySelectorAll("[contenteditable]").forEach((n) => n.removeAttribute("contenteditable"));
+  return c.innerHTML;
+}
+// What you wrote, without the signature and quoted text (to tell an
+// empty message from one with content).
+function typedText() {
+  const c = editor.cloneNode(true);
+  c.querySelectorAll(".nightpost-signature, .nightpost-quote").forEach((n) => n.remove());
+  return (c.innerText || "").trim() || (c.querySelector("img") ? "[picture]" : "");
+}
+function state() {
+  return { t: "state", from: $("from").value, to: $("to").value, cc: $("cc").value, bcc: $("bcc").value,
+    subject: $("subject").value, html: cleanHtml(), text: editor.innerText, typed: typedText() };
+}
+function changed() { clearTimeout(timer); timer = setTimeout(() => post(state()), 250); }
+function flush() { clearTimeout(timer); post(state()); }
+for (const id of ["to", "cc", "bcc", "subject"]) $(id).addEventListener("input", changed);
+$("from").addEventListener("change", () => { post({ t: "from", id: $("from").value }); changed(); });
+editor.addEventListener("input", changed);
+
+// ---------- toolbar ----------
+document.execCommand("styleWithCSS", false, true);
+document.execCommand("defaultParagraphSeparator", false, "div");
+function exec(cmd, val) { editor.focus(); document.execCommand(cmd, false, val); changed(); refreshToolbar(); }
+document.querySelectorAll("[data-cmd]").forEach((b) => {
+  b.addEventListener("mousedown", (e) => e.preventDefault());
+  b.addEventListener("click", () => exec(b.dataset.cmd));
+});
+$("font").addEventListener("change", (e) => { if (e.target.value) exec("fontName", e.target.value); e.target.value = ""; });
+$("size").addEventListener("change", (e) => { if (e.target.value) exec("fontSize", e.target.value); e.target.value = ""; });
+$("quote").addEventListener("mousedown", (e) => e.preventDefault());
+$("quote").addEventListener("click", () => {
+  const inQuote = closest("BLOCKQUOTE");
+  exec("formatBlock", inQuote ? "div" : "blockquote");
+});
+function closest(tag) {
+  const s = window.getSelection();
+  let n = s.rangeCount ? s.getRangeAt(0).startContainer : null;
+  while (n && n !== editor) { if (n.nodeName === tag) return n; n = n.parentNode; }
+  return null;
+}
+function refreshToolbar() {
+  document.querySelectorAll("[data-cmd]").forEach((b) => {
+    let on = false;
+    try { on = document.queryCommandState(b.dataset.cmd); } catch (_) {}
+    b.classList.toggle("on", !!on && b.dataset.cmd !== "removeFormat");
+  });
+  $("quote").classList.toggle("on", !!closest("BLOCKQUOTE"));
+}
+document.addEventListener("selectionchange", refreshToolbar);
+
+// Saved selection, so popovers can act on what was selected.
+let saved = null;
+function keepSelection() { const s = window.getSelection(); saved = s.rangeCount ? s.getRangeAt(0).cloneRange() : null; }
+function restoreSelection() { if (!saved) return; editor.focus(); const s = window.getSelection(); s.removeAllRanges(); s.addRange(saved); }
+let popEl = null;
+function closePop() { if (popEl) { popEl.remove(); popEl = null; } }
+function openPop(anchor, build) {
+  closePop(); keepSelection();
+  popEl = document.createElement("div"); popEl.className = "pop";
+  build(popEl);
+  document.body.appendChild(popEl);
+  const r = anchor.getBoundingClientRect();
+  popEl.style.left = Math.min(r.left, window.innerWidth - popEl.offsetWidth - 8) + "px";
+  popEl.style.top = (r.bottom + 4) + "px";
+}
+document.addEventListener("mousedown", (e) => { if (popEl && !popEl.contains(e.target) && !e.target.closest(".toolbar")) closePop(); });
+function swatchPop(anchor, title, cmd, bar) {
+  openPop(anchor, (p) => {
+    p.innerHTML = '<p class="title">' + title + '</p><div class="swatches"></div>';
+    const g = p.querySelector(".swatches");
+    for (const c of COLORS) {
+      const s = document.createElement("span"); s.style.background = c; s.title = c;
+      s.addEventListener("mousedown", (e) => e.preventDefault());
+      s.addEventListener("click", () => { restoreSelection(); exec(cmd, c); $(bar).style.stroke = c; closePop(); });
+      g.appendChild(s);
+    }
+  });
+}
+for (const id of ["color", "highlight", "link", "image"]) $(id).addEventListener("mousedown", (e) => e.preventDefault());
+$("color").addEventListener("click", (e) => swatchPop(e.currentTarget, "Text colour", "foreColor", "colorbar"));
+$("highlight").addEventListener("click", (e) => swatchPop(e.currentTarget, "Highlight", "hiliteColor", "hlbar"));
+function linkPop() {
+  const a = closest("A");
+  openPop($("link"), (p) => {
+    p.innerHTML = '<p class="title">Link address</p><input type="url" placeholder="https://"><div class="buttons">' +
+      (a ? '<button class="btn" data-x="remove">Remove link</button>' : "") +
+      '<button class="btn" data-x="cancel">Cancel</button><button class="btn primary" data-x="ok">Apply</button></div>';
+    const input = p.querySelector("input");
+    input.value = a ? a.getAttribute("href") : "";
+    const apply = () => {
+      let url = input.value.trim();
+      if (url && !/^[a-z][a-z0-9+.-]*:/i.test(url)) url = (url.includes("@") && !url.includes("/") ? "mailto:" : "https://") + url;
+      restoreSelection();
+      if (a) { if (url) { a.setAttribute("href", url); changed(); } }
+      else if (url) {
+        const s = window.getSelection();
+        if (s.isCollapsed) exec("insertHTML", '<a href="' + url.replace(/"/g, "&quot;") + '">' + escapeHtml(input.value.trim()) + "</a>");
+        else exec("createLink", url);
+      }
+      closePop();
+    };
+    p.querySelector('[data-x="ok"]').addEventListener("click", apply);
+    p.querySelector('[data-x="cancel"]').addEventListener("click", closePop);
+    const rm = p.querySelector('[data-x="remove"]');
+    if (rm) rm.addEventListener("click", () => { restoreSelection(); const r = document.createRange(); r.selectNodeContents(a);
+      const s = window.getSelection(); s.removeAllRanges(); s.addRange(r); exec("unlink"); closePop(); });
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); apply(); } if (e.key === "Escape") closePop(); });
+    setTimeout(() => input.focus(), 0);
+  });
+}
+$("link").addEventListener("click", linkPop);
+$("image").addEventListener("click", () => { keepSelection(); post({ t: "insertImage" }); });
+function escapeHtml(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function insertImage(url) {
+  restoreSelection();
+  exec("insertHTML", '<img src="' + url + '" style="max-width:100%">');
+}
+
+// Pasted pictures go into the text; pasted styled text keeps simple formatting.
+editor.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData ? e.clipboardData.files : [])].filter((f) => f.type.startsWith("image/"));
+  if (files.length) {
+    e.preventDefault();
+    for (const f of files) readAsDataUrl(f).then((u) => exec("insertHTML", '<img src="' + u + '" style="max-width:100%">'));
+  }
+});
+function readAsDataUrl(f) { return new Promise((ok) => { const r = new FileReader(); r.onload = () => ok(r.result); r.readAsDataURL(f); }); }
+
+// ---------- dropping files: pictures onto the text go in it; anything else attaches ----------
+let dragDepth = 0;
+document.addEventListener("dragenter", (e) => { if (hasFiles(e)) { dragDepth++; document.body.classList.add("dragging"); } });
+document.addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); } });
+document.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
+document.addEventListener("drop", async (e) => {
+  dragDepth = 0; document.body.classList.remove("dragging");
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  const files = [...e.dataTransfer.files];
+  const intoText = editor.contains(e.target);
+  const attach = [];
+  for (const f of files) {
+    if (intoText && f.type.startsWith("image/") && f.size < 8 * 1024 * 1024) {
+      const u = await readAsDataUrl(f);
+      exec("insertHTML", '<img src="' + u + '" style="max-width:100%">');
+    } else {
+      const u = await readAsDataUrl(f);
+      attach.push({ name: f.name, data: u.slice(u.indexOf(",") + 1) });
+    }
+  }
+  if (attach.length) post({ t: "files", files: attach });
+});
+function hasFiles(e) { return e.dataTransfer && [...e.dataTransfer.types].includes("Files"); }
+
+// ---------- attachments ----------
+function setAttachments(list, photos) {
+  const box = $("attachments");
+  box.innerHTML = "";
+  box.classList.toggle("hidden", !list.length);
+  list.forEach((a, i) => {
+    const c = document.createElement("div"); c.className = "chip";
+    const ext = (a.name.split(".").pop() || "").slice(0, 4);
+    c.innerHTML = (a.thumb ? '<img src="' + a.thumb + '">' : '<div class="ico">' + escapeHtml(ext) + "</div>") +
+      '<div class="name"><span></span><small></small></div><span class="x" title="Remove">×</span>';
+    c.querySelector(".name span").textContent = a.name;
+    c.querySelector("small").textContent = a.size;
+    c.querySelector(".x").addEventListener("click", () => post({ t: "remove", index: i }));
+    box.appendChild(c);
+  });
+  $("imagesize").classList.toggle("hidden", !photos);
+}
+$("attach").addEventListener("click", () => post({ t: "attach" }));
+$("imagesize").addEventListener("change", (e) => post({ t: "imageSize", value: e.target.value }));
+$("signature").addEventListener("change", (e) => post({ t: "signature", id: e.target.value }));
+
+// ---------- send, save, discard, close ----------
+let blocked = null;
+function sendState(why) { blocked = why || null; $("send").disabled = !!blocked; $("why").textContent = blocked || ""; }
+function setStatus(t) { $("status").textContent = t || ""; }
+function send() { if (blocked) return; flush(); post({ t: "send" }); }
+$("send").addEventListener("click", send);
+$("discard").addEventListener("click", () => post({ t: "discard" }));
+document.addEventListener("keydown", (e) => {
+  const mod = e.metaKey || e.ctrlKey;
+  if (mod && e.key === "Enter") { e.preventDefault(); send(); }
+  else if (mod && (e.key === "s" || e.key === "S")) { e.preventDefault(); flush(); post({ t: "save" }); }
+  else if (mod && (e.key === "w" || e.key === "W")) { e.preventDefault(); flush(); post({ t: "close" }); }
+  else if (mod && (e.key === "k" || e.key === "K")) { e.preventDefault(); linkPop(); }
+  else if (e.key === "Escape" && popEl) { closePop(); }
+});
+
+// ---------- Cc / Bcc and address suggestions ----------
+function showCc() { $("ccrow").classList.remove("hidden"); $("bccrow").classList.remove("hidden"); $("showcc").classList.add("hidden"); }
+$("showcc").addEventListener("click", () => { showCc(); $("cc").focus(); });
+let sugg = { field: null, items: [], on: 0, el: null };
+function token(input) { const v = input.value; const i = v.lastIndexOf(","); return v.slice(i + 1).trim(); }
+for (const id of ["to", "cc", "bcc"]) {
+  const input = $(id);
+  input.addEventListener("input", () => { const t = token(input); if (t.length >= 1) post({ t: "suggest", field: id, prefix: t }); else hideSuggest(); });
+  input.addEventListener("keydown", (e) => {
+    if (!sugg.el || sugg.field !== id) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); sugg.on = (sugg.on + 1) % sugg.items.length; drawSuggest(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); sugg.on = (sugg.on + sugg.items.length - 1) % sugg.items.length; drawSuggest(); }
+    else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); pick(sugg.items[sugg.on]); }
+    else if (e.key === "Escape") hideSuggest();
+  });
+  input.addEventListener("blur", () => setTimeout(hideSuggest, 150));
+}
+function suggest(field, items) {
+  hideSuggest();
+  if (!items.length || document.activeElement !== $(field)) return;
+  sugg = { field, items, on: 0, el: document.createElement("div") };
+  sugg.el.className = "suggest";
+  $(field).parentNode.appendChild(sugg.el);
+  drawSuggest();
+}
+function drawSuggest() {
+  sugg.el.innerHTML = "";
+  sugg.items.forEach((it, i) => {
+    const d = document.createElement("div"); if (i === sugg.on) d.className = "on";
+    d.textContent = it.name || it.email;
+    if (it.name) { const s = document.createElement("small"); s.textContent = it.email; d.appendChild(s); }
+    d.addEventListener("mousedown", (e) => { e.preventDefault(); pick(it); });
+    sugg.el.appendChild(d);
+  });
+}
+function pick(it) {
+  const input = $(sugg.field);
+  const v = input.value; const i = v.lastIndexOf(",");
+  const head = i >= 0 ? v.slice(0, i + 1) + " " : "";
+  input.value = head + (it.name ? '"' + it.name.replace(/"/g, "") + '" <' + it.email + ">" : it.email) + ", ";
+  hideSuggest(); changed();
+}
+function hideSuggest() { if (sugg.el) sugg.el.remove(); sugg = { field: null, items: [], on: 0, el: null }; }
+
+window.np = { init, setSignature, setAttachments, setStatus, sendState, suggest, insertImage, applyColors, flush };
+init(INIT);
+post({ t: "ready" });
+</script>
+</body>
+</html>

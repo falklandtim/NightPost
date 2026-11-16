@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create a self-signed code-signing certificate, "OwlPost Local Signing", in
+# Create a self-signed code-signing certificate, "NightPost Local Signing", in
 # your login keychain. scripts/bundle-macos.sh signs with it when it exists.
 #
 # Why: the Keychain only lets the app that saved a password read it back,
@@ -13,8 +13,14 @@
 #   scripts/make-signing-cert.sh
 set -euo pipefail
 
-NAME="OwlPost Local Signing"
+NAME="NightPost Local Signing"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+
+# A certificate made before the rename does the same job; bundle-macos.sh uses it.
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "OwlPost Local Signing"; then
+  echo "\"OwlPost Local Signing\" is already in your login keychain, and bundle-macos.sh signs with it. Nothing to do."
+  exit 0
+fi
 
 if security find-certificate -c "$NAME" "$KEYCHAIN" >/dev/null 2>&1; then
   echo "\"$NAME\" is already in your login keychain."
@@ -45,12 +51,12 @@ CNF
 # A throwaway password: the .p12 only exists until it is imported.
 PASS=$("$OPENSSL" rand -hex 16)
 "$OPENSSL" pkcs12 -export -inkey "$WORK/key.pem" -in "$WORK/cert.pem" -name "$NAME" \
-  -out "$WORK/owlpost.p12" -passout "pass:$PASS"
+  -out "$WORK/nightpost.p12" -passout "pass:$PASS"
 
 # Only codesign may use the private key without asking.
-security import "$WORK/owlpost.p12" -k "$KEYCHAIN" -P "$PASS" -T /usr/bin/codesign >/dev/null
+security import "$WORK/nightpost.p12" -k "$KEYCHAIN" -P "$PASS" -T /usr/bin/codesign >/dev/null
 echo "Trusting the certificate for code signing (macOS asks for your password)…"
 security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$WORK/cert.pem"
 
 security find-identity -v -p codesigning | grep "$NAME"
-echo "Done. scripts/bundle-macos.sh will now sign OwlPost with \"$NAME\"."
+echo "Done. scripts/bundle-macos.sh will now sign NightPost with \"$NAME\"."

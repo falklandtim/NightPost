@@ -1,6 +1,6 @@
 # Code audit
 
-How we check that OwlPost's code stays readable, documented and safe, and what each audit found. The rules being checked are in [AGENTS.md](../AGENTS.md).
+How we check that NightPost's code stays readable, documented and safe, and what each audit found. The rules being checked are in [AGENTS.md](../AGENTS.md).
 
 ## When
 
@@ -24,7 +24,8 @@ How we check that OwlPost's code stays readable, documented and safe, and what e
 7. **README:** the script lists the commits since the last audit. Each user-visible one is described in the README, and nothing in the README is out of date (check "Not yet implemented" and "Known issues" especially).
 8. **Architecture:** if a thread, process, module, table or synced record was added, `docs/architecture.md` says so.
 9. **Mac and Linux:** each new feature works on both, or the README says it's Mac-only.
-10. **Record it:** add a dated entry to the log below: the summary numbers, what was fixed, and what's left. The script uses the newest date to list commits for step 7.
+10. **Dependencies and platforms** ([AGENTS.md](../AGENTS.md) section 6): no security advisories and no future-incompatibility warnings (both in the script's output; install `cargo-audit` once with `cargo install cargo-audit`). Run `cargo update`, the full checks, the Linux build and `scripts/ios-rust.sh`, and commit it as "Update dependencies". Note any major versions waiting, whether a newer stable Rust is out, and any new macOS, iOS, Xcode or Fedora release that needs trying.
+11. **Record it:** add a dated entry to the log below: the summary numbers, what was fixed, and what's left. The script uses the newest date to list commits for step 7.
 
 ## Grades
 

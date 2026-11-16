@@ -1,8 +1,0 @@
-{
-  "name": "owlpost-light",
-  "displayName": "Light",
-  "theme": "ui",
-  "version": "1.0.0",
-  "description": "The default OwlPost theme. Uses Mailspring's ui-variables names, so it doubles as the base every Mailspring theme overrides.",
-  "license": "GPL-3.0"
-}

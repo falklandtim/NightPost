@@ -16,7 +16,7 @@
 
 # iPhone app build output: remade by scripts/ios-rust.sh and Xcode
 /ios/build/
-/ios/OwlPost/Generated/
+/ios/NightPost/Generated/
 /ios/DerivedData/
 # The iOS Google OAuth client ID, built into the app by scripts/ios-rust.sh
 /ios/google-client-id.txt

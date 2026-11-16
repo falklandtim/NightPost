@@ -1,0 +1,8 @@
+# The Rust compiler every machine builds NightPost with (Mac, laptop, Fedora,
+# and the iPhone build). rustup reads this and installs it on the first build.
+# Move it up on purpose, in its own commit, after the full checks pass on Mac
+# and Linux and the iPhone build works: see AGENTS.md, "Dependencies, Rust and
+# operating systems".
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

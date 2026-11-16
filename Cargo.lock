@@ -3438,6 +3438,77 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nightpost"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "block2 0.6.2",
+ "chrono",
+ "crossbeam-channel",
+ "directories",
+ "eframe",
+ "egui_extras",
+ "egui_kittest",
+ "env_logger",
+ "gtk",
+ "image",
+ "javascriptcore-rs",
+ "log",
+ "nightpost-core",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-contacts 0.3.2",
+ "objc2-foundation 0.3.2",
+ "raw-window-handle",
+ "resvg",
+ "rfd",
+ "serde_json",
+ "ureq",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "webkit2gtk",
+ "wry",
+]
+
+[[package]]
+name = "nightpost-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "directories",
+ "form_urlencoded",
+ "getrandom 0.2.17",
+ "html2text",
+ "image",
+ "imap",
+ "keyring",
+ "lettre",
+ "log",
+ "mail-parser",
+ "native-tls",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq",
+]
+
+[[package]]
+name = "nightpost-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "getrandom 0.2.17",
+ "nightpost-core",
+ "uniffi",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4014,77 +4085,6 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
-]
-
-[[package]]
-name = "owlpost"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "block2 0.6.2",
- "chrono",
- "crossbeam-channel",
- "directories",
- "eframe",
- "egui_extras",
- "egui_kittest",
- "env_logger",
- "gtk",
- "image",
- "javascriptcore-rs",
- "log",
- "objc2 0.6.5",
- "objc2-app-kit 0.3.2",
- "objc2-contacts 0.3.2",
- "objc2-foundation 0.3.2",
- "owlpost-core",
- "raw-window-handle",
- "resvg",
- "rfd",
- "serde_json",
- "ureq",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "webkit2gtk",
- "wry",
-]
-
-[[package]]
-name = "owlpost-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "directories",
- "form_urlencoded",
- "getrandom 0.2.17",
- "html2text",
- "image",
- "imap",
- "keyring",
- "lettre",
- "log",
- "mail-parser",
- "native-tls",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "ureq",
-]
-
-[[package]]
-name = "owlpost-ffi"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "getrandom 0.2.17",
- "owlpost-core",
- "uniffi",
 ]
 
 [[package]]
