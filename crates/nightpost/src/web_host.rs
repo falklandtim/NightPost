@@ -106,6 +106,25 @@ pub fn on_gtk_thread(f: impl FnOnce() + Send + 'static) -> bool {
     true
 }
 
+/// A web window's rule for where its page may go: its own page (the first
+/// load, `about:blank`, since pages are loaded as HTML) and nothing after.
+/// Links in the composer are for the email, not for following, and a
+/// stray drop or redirect must never replace the draft. (Dropped files are
+/// handled by the page's own script, which cancels the navigation.)
+#[derive(Default)]
+pub(crate) struct FirstLoadOnly(std::cell::Cell<bool>);
+
+impl FirstLoadOnly {
+    /// May the page go to `url`?
+    pub(crate) fn allow(&self, url: &str) -> bool {
+        if self.0.replace(true) {
+            log::info!("a web window refused to navigate away from its page");
+            return false;
+        }
+        url.starts_with("about:")
+    }
+}
+
 /// A JavaScript string literal for `s`.
 pub fn js_string(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
@@ -199,7 +218,10 @@ mod imp {
                 child: false,
                 background: egui::Color32::from_rgb(r, g, b),
                 on_message: Box::new(move |body| events::push(HostEvent::Message(id, body))),
-                on_navigate: None,
+                on_navigate: Some({
+                    let rule = super::FirstLoadOnly::default();
+                    Box::new(move |url, _| rule.allow(&url))
+                }),
             },
         );
         // The page fills the window and follows its size.
@@ -393,6 +415,25 @@ mod imp {
             anyhow::bail!("WebKit refused the page's message handler");
         }
         let webview = WebView::builder().user_content_manager(&content).build();
+        // Its own page, then nowhere (super::FirstLoadOnly); new windows never.
+        let rule = super::FirstLoadOnly::default();
+        webview.connect_decide_policy(move |_, decision, kind| {
+            let allow = match kind {
+                webkit6::PolicyDecisionType::NavigationAction => decision
+                    .downcast_ref::<webkit6::NavigationPolicyDecision>()
+                    .and_then(|d| d.navigation_action())
+                    .and_then(|a| a.request())
+                    .and_then(|r| r.uri())
+                    .is_some_and(|u| rule.allow(&u)),
+                webkit6::PolicyDecisionType::NewWindowAction => false,
+                // Responses (what a load turned out to be): WebKit decides.
+                _ => return false,
+            };
+            if !allow {
+                decision.ignore();
+            }
+            !allow
+        });
         let (r, g, b) = spec.background;
         webview.set_background_color(&gdk::RGBA::new(f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0));
         spell_check(&webview);
@@ -618,6 +659,24 @@ mod imp {
 }
 
 #[cfg(test)]
+mod rule_tests {
+    use super::FirstLoadOnly;
+
+    /// The composer's page loads once; links, drops and redirects after
+    /// that go nowhere.
+    #[test]
+    fn composer_follows_nothing_after_its_page() {
+        let rule = FirstLoadOnly::default();
+        assert!(rule.allow("about:blank"));
+        for later in ["https://example.com/", "file:///Users/x/.ssh/id_ed25519", "about:blank", "data:text/html,hi"] {
+            assert!(!rule.allow(later), "{later}");
+        }
+        // The first load must be the app's own page.
+        assert!(!FirstLoadOnly::default().allow("https://example.com/"));
+    }
+}
+
+#[cfg(test)]
 #[cfg(target_os = "linux")]
 mod tests {
     use super::*;
@@ -678,6 +737,11 @@ mod tests {
             assert!(Instant::now() < end, "the composer page never answered");
         };
         assert!(state.contains("Hi there") && state.contains("kowhai@demo"), "{state}");
+        // It follows no link: after trying to leave, it's still the composer.
+        eval(42, "location.href='https://example.com/'");
+        std::thread::sleep(Duration::from_millis(500));
+        eval(42, "flush()");
+        assert!(wait_for(42, "Hello from GTK 4", Duration::from_secs(5)).is_some(), "the composer page was replaced");
         close(42);
     }
 }
