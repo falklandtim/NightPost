@@ -1070,24 +1070,15 @@ mod tests {
         }
     }
 
+    /// The tracker tests live with `strip_trackers`, in `nightpost-core`'s
+    /// `html_clean.rs`; this is the banner's list of hosts.
     #[test]
-    fn tracking_pixels_are_removed() {
-        // Marketo (Repco), Loops (Ollama), Mailchimp, SendGrid; and images to keep.
-        let html = r#"<td><img src="https://info.example.com/images/logo.png" width="170" style="width:170px" alt="Logo" />
-<img width="660" style="display:inline-block; width:660px;" src="https://info.example.com/images/Header Mobile.jpg" alt="x">
-<img style="display:none; max-height:0" src="https://info.example.com/images/mobile-only.jpg" alt="mobile">
-<img src="https://go.repco.example/trk?t=1&mid=abc" width="1" height="1" style="display:none !important;" alt="" />
-<img alt="" src="https://c.vialoops.example/CI0/0100/xyz=452" style="display: none; width: 1px; height: 1px;">
-<IMG SRC='https://shop.us1.list-manage.com/track/open.php?u=1&id=2' height=1 width=1>
-<img src="https://u123.ct.sendgrid.net/wf/open?upn=abc" alt="" style="height:1px !important;width:1px !important;border-width:0 !important"></td>"#;
-        let (clean, hosts) = strip_trackers(html);
-        assert_eq!(hosts, ["go.repco.example", "c.vialoops.example", "shop.us1.list-manage.com", "u123.ct.sendgrid.net"]);
-        assert!(clean.contains("logo.png") && clean.contains("Header Mobile.jpg") && clean.contains("mobile-only.jpg"));
-        assert!(!clean.contains("trk?") && !clean.contains("CI0") && !clean.contains("track/open") && !clean.contains("wf/open"));
-        assert!(clean.starts_with("<td>") && clean.ends_with("</td>"));
-        assert_eq!(host_list(&hosts), "go.repco.example, c.vialoops.example and 2 more");
-        // Nothing to do: returned unchanged.
-        assert_eq!(strip_trackers("<p>Hi <b>there</b></p>"), ("<p>Hi <b>there</b></p>".to_string(), vec![]));
+    fn blocked_hosts_are_listed() {
+        let hosts = |n: usize| (1..=n).map(|i| format!("t{i}.example")).collect::<Vec<_>>();
+        assert_eq!(host_list(&hosts(0)), "");
+        assert_eq!(host_list(&hosts(1)), "t1.example");
+        assert_eq!(host_list(&hosts(2)), "t1.example and t2.example");
+        assert_eq!(host_list(&hosts(4)), "t1.example, t2.example and 2 more");
     }
 
     #[test]
@@ -1160,6 +1151,5 @@ mod tests {
         assert!(matches!(key_events("e", false).as_slice(), [egui::Event::Text(t)] if t == "e"));
         assert!(matches!(key_events("z", true).as_slice(), [egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers, .. }, _] if modifiers.command));
         assert!(matches!(key_events("ArrowDown", false).as_slice(), [egui::Event::Key { key: egui::Key::ArrowDown, .. }, _]));
-        assert!(has_remote_content("<img src=\"https://x/y.png\">") && !has_remote_content("<a href=\"https://x\">x</a>"));
     }
 }
