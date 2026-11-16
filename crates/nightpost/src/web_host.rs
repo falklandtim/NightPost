@@ -1,8 +1,8 @@
 //! Windows holding a web page (the formatted composer), outside egui.
 //!
 //! The same HTML runs everywhere, each in the system's own web engine:
-//! WebKit in a native window on macOS (through wry), WebKitGTK 6.0 in a
-//! GTK 4 window on Linux (directly: wry only supports GTK 3). A GTK window
+//! WKWebView in a native window on macOS (`mac_web.rs`), WebKitGTK 6.0 in a
+//! GTK 4 window on Linux. A GTK window
 //! is its own toplevel, so this works on Wayland as well as
 //! X11 (an egui window can only host a web view under X11).
 //!
@@ -145,19 +145,18 @@ mod events {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{events, HostEvent, WindowSpec};
+    use crate::mac_web;
     use eframe::egui;
     use objc2::rc::Retained;
     use objc2::{MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{NSBackingStoreType, NSWindow, NSWindowStyleMask};
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
-    use raw_window_handle::{AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
-    use std::ptr::NonNull;
 
     struct Win {
         window: Retained<NSWindow>,
-        webview: wry::WebView,
+        web: mac_web::View,
         /// Hidden on purpose (Undo Send); not a close.
         hidden: bool,
     }
@@ -165,17 +164,6 @@ mod imp {
     thread_local! {
         static WINS: RefCell<HashMap<u64, Win>> = RefCell::new(HashMap::new());
         static READY: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// A window's content view, as the handle wry builds into.
-    struct ViewHandle(NonNull<std::ffi::c_void>);
-
-    impl HasWindowHandle for ViewHandle {
-        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-            let raw = RawWindowHandle::AppKit(AppKitWindowHandle::new(self.0));
-            // SAFETY: the view outlives the builder call that borrows it.
-            Ok(unsafe { WindowHandle::borrow_raw(raw) })
-        }
     }
 
     pub(super) fn init(ctx: &egui::Context) -> bool {
@@ -203,16 +191,22 @@ mod imp {
         window.setTitle(&NSString::from_str(&spec.title));
         window.setMinSize(NSSize::new(520.0, 380.0));
         window.center();
-        let view = window.contentView().ok_or_else(|| anyhow::anyhow!("window has no content view"))?;
-        let handle = ViewHandle(NonNull::from(&*view).cast());
         let (r, g, b) = spec.background;
-        let webview = wry::WebViewBuilder::new()
-            .with_html(spec.html)
-            .with_background_color((r, g, b, 255))
-            .with_ipc_handler(move |req| events::push(HostEvent::Message(id, req.into_body())))
-            .build(&handle)?;
+        let web = mac_web::View::new(
+            mtm,
+            rect,
+            mac_web::Options {
+                child: false,
+                background: egui::Color32::from_rgb(r, g, b),
+                on_message: Box::new(move |body| events::push(HostEvent::Message(id, body))),
+                on_navigate: None,
+            },
+        );
+        // The page fills the window and follows its size.
+        window.setContentView(Some(&web.view));
+        web.load_html(&spec.html);
         window.makeKeyAndOrderFront(None);
-        WINS.with(|w| w.borrow_mut().insert(id, Win { window, webview, hidden: false }));
+        WINS.with(|w| w.borrow_mut().insert(id, Win { window, web, hidden: false }));
         Ok(())
     }
 
@@ -225,9 +219,7 @@ mod imp {
     }
 
     pub(super) fn eval(id: u64, js: String) {
-        with(id, |w| {
-            let _ = w.webview.evaluate_script(&js);
-        })
+        with(id, |w| w.web.eval(&js))
     }
 
     pub(super) fn set_title(id: u64, title: String) {

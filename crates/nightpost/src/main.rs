@@ -9,6 +9,8 @@ mod html_view;
 mod mail_view;
 mod icons;
 mod logging;
+#[cfg(target_os = "macos")]
+mod mac_web;
 mod onboarding;
 mod prefs;
 mod style;

@@ -18,6 +18,7 @@ nightpost (binary)
 ├── composer.rs        compose / reply / forward windows
 ├── web_host.rs        native windows holding a web page (the formatted composer)
 ├── mail_view.rs       HTML email in the reading pane (WebKit / WebKitGTK)
+├── mac_web.rs         macOS: WKWebView set up for those two (messages, links, background)
 ├── prefs.rs, onboarding.rs, avatars.rs, contacts.rs, attachments.rs, …
 └── uses nightpost-core
         ├── store/         SQLite: accounts, folders, mail, snoozes, pins, tabs

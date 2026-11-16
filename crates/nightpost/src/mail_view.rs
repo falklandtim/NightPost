@@ -497,14 +497,20 @@ pub use fallback::MailView;
 #[cfg(target_os = "macos")]
 mod native {
     use super::{parse_action, ViewEvent};
-    use crossbeam_channel::{Receiver, Sender};
+    use crate::mac_web;
+    use crossbeam_channel::Receiver;
     use eframe::egui;
-    use wry::dpi::{LogicalPosition, LogicalSize};
-    use wry::raw_window_handle::HasWindowHandle;
+    use objc2::rc::Retained;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSAutoresizingMaskOptions, NSView};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     /// The web view, laid over the reading pane.
     pub struct MailView {
-        view: wry::WebView,
+        web: mac_web::View,
+        /// egui's own view, which the web view sits in.
+        parent: Retained<NSView>,
         rx: Receiver<ViewEvent>,
         /// Identifies the page now loaded, to reload only when it changes.
         loaded: u64,
@@ -514,42 +520,45 @@ mod native {
 
     impl MailView {
         pub fn new(window: &impl HasWindowHandle, bg: egui::Color32) -> Option<Self> {
+            let mtm = MainThreadMarker::new()?;
+            let RawWindowHandle::AppKit(handle) = window.window_handle().ok()?.as_raw() else { return None };
+            // SAFETY: the handle's view is egui's live NSView, which outlives
+            // this pane (both belong to the main window); retaining keeps it so.
+            let parent = unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }?;
             let (tx, rx) = crossbeam_channel::unbounded::<ViewEvent>();
-            let (nav, ipc, popup): (Sender<_>, Sender<_>, Sender<_>) = (tx.clone(), tx.clone(), tx);
-            let view = wry::WebViewBuilder::new()
-                .with_bounds(wry::Rect { position: LogicalPosition::new(0.0, 0.0).into(), size: LogicalSize::new(1.0, 1.0).into() })
-                .with_visible(false)
-                .with_background_color((bg.r(), bg.g(), bg.b(), 255))
-                .with_accept_first_mouse(true)
-                .with_focused(false)
-                .with_navigation_handler(move |url| {
-                    // Our own page loads; everything else is ours to handle.
-                    if url.starts_with("about:") || url.starts_with("data:") {
-                        return true;
-                    }
-                    let ev = parse_action(&url).unwrap_or(ViewEvent::OpenLink(url));
-                    let _ = nav.send(ev);
-                    false
-                })
-                .with_new_window_req_handler(move |url, _| {
-                    let _ = popup.send(parse_action(&url).unwrap_or(ViewEvent::OpenLink(url)));
-                    wry::NewWindowResponse::Deny
-                })
-                .with_ipc_handler(move |req| {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(req.body()) {
-                        if v.get("ready").is_some() {
-                            log::info!("mail view ready: email frame heights {}, email scripts ran: {}", v["ready"], v["scripted"]);
+            let nav = tx.clone();
+            let web = mac_web::View::new(
+                mtm,
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
+                mac_web::Options {
+                    child: true,
+                    background: bg,
+                    on_message: Box::new(move |body| {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if v.get("ready").is_some() {
+                                log::info!("mail view ready: email frame heights {}, email scripts ran: {}", v["ready"], v["scripted"]);
+                            }
+                            if let Some(k) = v["key"].as_str() {
+                                let _ = tx.send(ViewEvent::Key(k.to_string(), v["meta"].as_bool().unwrap_or(false)));
+                            }
                         }
-                        if let Some(k) = v["key"].as_str() {
-                            let _ = ipc.send(ViewEvent::Key(k.to_string(), v["meta"].as_bool().unwrap_or(false)));
+                    }),
+                    on_navigate: Some(Box::new(move |url| {
+                        // Our own page loads; everything else is ours to handle.
+                        if url.starts_with("about:") || url.starts_with("data:") {
+                            return true;
                         }
-                    }
-                })
-                .build_as_child(window)
-                .map_err(|e| log::warn!("couldn't create the mail web view: {e}"))
-                .ok()?;
+                        let _ = nav.send(parse_action(&url).unwrap_or(ViewEvent::OpenLink(url)));
+                        false
+                    })),
+                },
+            );
+            web.view.setHidden(true);
+            // Keeps its distance from the top when the window's height changes.
+            web.view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
+            parent.addSubview(&web.view);
             log::debug!("mail view: web view created");
-            Some(Self { view, rx, loaded: 0, visible: false, bounds: egui::Rect::NOTHING })
+            Some(Self { web, parent, rx, loaded: 0, visible: false, bounds: egui::Rect::NOTHING })
         }
 
         /// Show `html` over `rect` (in window points). Reloads only when
@@ -557,37 +566,44 @@ mod native {
         pub fn show(&mut self, _ctx: &egui::Context, rect: egui::Rect, zoom: f32, key: u64, html: impl FnOnce() -> String) {
             if rect != self.bounds {
                 self.bounds = rect;
-                let _ = self.view.set_bounds(wry::Rect {
-                    position: LogicalPosition::new((rect.left() * zoom) as f64, (rect.top() * zoom) as f64).into(),
-                    size: LogicalSize::new((rect.width() * zoom).max(1.0) as f64, (rect.height() * zoom).max(1.0) as f64).into(),
-                });
+                let (w, h) = (f64::from((rect.width() * zoom).max(1.0)), f64::from((rect.height() * zoom).max(1.0)));
+                let (x, top) = (f64::from(rect.left() * zoom), f64::from(rect.top() * zoom));
+                // egui measures from the top; an unflipped AppKit view from the bottom.
+                let y = if self.parent.isFlipped() { top } else { self.parent.frame().size.height - top - h };
+                self.web.view.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)));
             }
             if key != self.loaded {
                 self.loaded = key;
                 let page = html();
                 log::debug!("mail view: loading a {} byte page at {rect:?}", page.len());
-                if let Err(e) = self.view.load_html(&page) {
-                    log::warn!("mail view: couldn't load the page: {e}");
-                }
+                self.web.load_html(&page);
             }
             if !self.visible {
                 self.visible = true;
-                let _ = self.view.set_visible(true);
+                self.web.view.setHidden(false);
             }
         }
 
         pub fn hide(&mut self) {
             if self.visible {
                 self.visible = false;
-                let _ = self.view.set_visible(false);
-                let _ = self.view.focus_parent();
+                self.web.view.setHidden(true);
+                // Keys go back to egui.
+                if let Some(w) = self.parent.window() {
+                    w.makeFirstResponder(Some(&self.parent));
+                }
             }
         }
 
         pub fn events(&mut self) -> Vec<ViewEvent> {
             self.rx.try_iter().collect()
         }
+    }
 
+    impl Drop for MailView {
+        fn drop(&mut self) {
+            self.web.view.removeFromSuperview();
+        }
     }
 }
 
