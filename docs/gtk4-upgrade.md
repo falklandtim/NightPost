@@ -174,7 +174,7 @@ An engine is in the running only if it passes every privacy, script and crash ch
 
 ### Recording the results
 
-Each run adds a dated entry under "Results" at the end of this file: which engines ran on which machines, the numbers, the scores, and what was decided. The pictures stay in `trials/email-engines/out/`, which isn't committed. Once a choice is made, the trial crate stays in the repository for re-testing when an engine releases a new version.
+Each run adds a dated entry under "Results" at the end of this file: which engines ran on which machines, the numbers, the scores, and what was decided. The pictures stay in `trials/email-engines/out/`, which isn't committed. Once the choice was made (WebKit on both systems, 2026-11-17), the trial program stayed on its branch, `trial/email-engines`, rather than `main`: it pins pre-release engines and would slowly stop building. Check out that branch to re-test an engine.
 
 ## Ready for GTK 5
 
@@ -211,4 +211,65 @@ WebKitGTK will also need a new version for GTK 5. When one is announced, note it
 
 ## Results
 
-None yet.
+### 2026-11-16: first run (branch `trial/email-engines`, on e542eeb)
+
+**Where it ran.** The trial program is kept on the branch `trial/email-engines` (on GitHub), not on `main`: it's in `trials/email-engines/` there (see its README). Servo builds from `trials/email-engines/servo-build/`, because its copy of Stylo can't share a lock file with Blitz's.
+
+| Engine | Mac (Apple silicon, macOS 26) | Fedora 44 KDE (ARM VM, Wayland) | Omarchy (x86_64, Hyprland) |
+|---|---|---|---|
+| WebKit, Mac (reference) | Ran | Mac only | Mac only |
+| litehtml | Ran | Ran | Ran |
+| Blitz | Ran | Ran | Ran |
+| Servo | Ran | Didn't build: SpiderMonkey needs `clang llvm m4`; stopped (see below) | Build stopped part way (see below) |
+| WebKitGTK 6.0 (GTK 4) | Linux only | Ran | Ran (drawn at 1×: the laptop's screen scale) |
+| WPE | Not needed (GTK 4 drew off screen) | | |
+
+Servo was stopped when Tim chose the GTK 4 route for Linux. Its Mac results were enough to rule it out for now.
+
+**Versions and licences** (pinned exactly in the trial only):
+
+| Engine | Crates | Licences |
+|---|---|---|
+| litehtml | `litehtml` 0.2.6, `litehtml-sys` 0.2.5 | MIT; the C++ engine MIT, BSD-3-Clause, Apache-2.0 |
+| Blitz | `blitz-html`, `-dom`, `-traits`, `-paint` 0.3.0-beta.4 (pre-release); `anyrender` 0.14.0; `anyrender_vello_cpu` 0.18.0 | MIT or Apache-2.0; 138 crates added, all fit |
+| Servo | `servo` 0.8.0 | MPL-2.0; one crate flagged: `webpki-roots` (root certificates, CDLA-Permissive-2.0), for Tim to check |
+| WebKitGTK 6.0 | `webkit6` 0.6.1, `gtk4` 0.11.5 (with `v4_10`) | MIT; 44 crates added, all fit |
+| WebKit, Mac | `objc2` 0.6.5, `objc2-web-kit` 0.3.2 (as the app) | MIT, Zlib, Apache-2.0 |
+
+**The must-pass checks** (7: privacy, no scripts, no crashes, links, text, sharp at 2×, licences):
+
+| Engine | Passed | Failed |
+|---|---|---|
+| WebKit, Mac | 7 | — |
+| WebKitGTK 6.0, Fedora and Omarchy | 7 | — |
+| Blitz (all three machines) | 7 | — |
+| litehtml (all three machines) | 6 | No crashes: hangs on nested tables |
+| Servo, Mac | 3 | No scripts, no crashes, text, licences (flagged) |
+
+**Numbers** (median per email after the first; first email after starting; peak memory drawing the 200-item digest):
+
+| Engine | Per email | First | Peak memory | Clean build (Mac) | Adds to the binary |
+|---|---|---|---|---|---|
+| WebKit, Mac | 88 ms | 1.6 s | 526 MB + WebKit's own process | 36 s | 0.3 MB |
+| WebKitGTK 6.0, Fedora / Omarchy | 145 / 305 ms | 218 / 465 ms | 812 / 280 MB + WebKit's own process | — | — |
+| Blitz, Mac / Fedora / Omarchy | 11 / 22 / 23 ms | 16 / 334 / 43 ms | 185 / 183 / 177 MB | 65 s | 13.7 MB |
+| litehtml, Mac / Fedora / Omarchy | 14 / 20 / 40 ms | 20 / 20 / 60 ms | 318 / 294 / 291 MB | 54 s | 3.8 MB |
+| Servo, Mac | 45 ms | 186 ms | 268 MB | 260 s | 85 MB |
+
+Both WebKits make a fresh web view for every email (so nothing is cached between them), which the app wouldn't do: their per-email times are pessimistic. Their memory figures leave out WebKit's separate web process, and the GTK 4 figure is mostly the full-page picture of the long digest.
+
+**What was found:**
+
+- **GTK 4 WebKit draws without showing a window,** on KDE Wayland and on Hyprland. The window must be realised and the web view given its size by hand (`realize` and `allocate`): a window that's never shown is otherwise 0 × 0, and WebKit lays the page out with no width. With that, its pictures match the Mac's WebKit closely, and every check passes on both. A hidden window draws at its display's scale (2× on the Fedora VM, 1× on the laptop), and a full-page snapshot is never shorter than the view, so short emails get blank space below them in the pictures (not on screen).
+- **GTK's dark preference is deprecated.** `gtk-application-prefer-dark-theme` still makes an email's `prefers-color-scheme` dark on both machines, but GTK 4.20 and later warn to use `gtk-interface-color-scheme`: the port should use that.
+- **litehtml can't be used as it is.** Its layout time triples with each level of nested tables: 10 levels take 57 ms, 13 take 1.5 s, 15 take 13 s, 500 never finish. Real newsletters nest tables that deep. It also drops Arabic text entirely, and its sample renderer (`pixbuf`) picks fonts badly (bold comes out monospaced on the Mac).
+- **Blitz is the strongest of the new engines.** It passes everything everywhere and is the fastest, but it's a pre-release, ignores `<font size color>` and table `border="1"`, sizes two 50% columns unequally, and draws emoji poorly (none on the Mac and Omarchy, black-and-white on Fedora).
+- **Servo is close to WebKit in looks, but not safe as it is.** Its Content Security Policy lets an inline `onload` run (the app's sandboxed iframe still stops it), it crashes the whole process on 500 nested tables (200 are fine), and its text-selection query returned nothing. It also needs `rusqlite` 0.38 while NightPost uses 0.37 (only one SQLite can be linked), so using it would mean that upgrade too. It has no switch to turn JavaScript off.
+- **The desktop app doesn't show `cid:` pictures** (pictures sent inside an email). This was already known: the README's "Not yet implemented" lists it. The core can already find the picture (`email_view::inline_part`), and the iPhone app and the MCP `view_message` tool use it; only the desktop's HTML view doesn't. Separate from this work, and left as a to-do.
+- **`html_clean` doesn't remove scripts.** The page's Content Security Policy is what stops them (and, in the app, the sandboxed iframe).
+
+**Scores:** the two WebKits (Mac and GTK 4) scored highest, in Tim's judgement (2026-11-17). No per-picture scores were recorded.
+
+**Decided (Tim, 2026-11-16):** Linux takes the GTK 4 WebKit route for both reading and writing, as planned in "The replacement" above; it draws off screen on both desktops, so WPE isn't needed. Servo is stopped. Blitz stays the fallback.
+
+**Decided (Tim, 2026-11-17):** NightPost stays with the system WebKit on both desktops: WKWebView on the Mac (as today) and WebKitGTK 6.0 on Linux. litehtml, Blitz and Servo aren't taken further.
