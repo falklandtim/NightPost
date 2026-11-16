@@ -19,6 +19,10 @@ pub fn set_password(email: &str, password: &str) -> Result<()> {
 }
 
 pub fn get_password(email: &str) -> Result<String> {
+    // Debug builds only (local testing): in the app people use, anything
+    // that can set an environment variable could otherwise swap in a
+    // password. Nothing NightPost runs sets it (asked 2026-11-17).
+    #[cfg(debug_assertions)]
     if let Ok(p) = std::env::var(format!("NIGHTPOST_PASSWORD_{}", env_key(email))) {
         return Ok(p);
     }
@@ -89,6 +93,7 @@ fn get_carried(key: &str) -> Result<String> {
 }
 
 /// `tim@icloud.com` → `TIM_ICLOUD_COM`, for headless/CI overrides.
+#[cfg(debug_assertions)]
 fn env_key(email: &str) -> String {
     email
         .chars()
