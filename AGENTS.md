@@ -4,7 +4,7 @@ NightPost is Tim Morrison's own native email client, written in Rust (egui/efram
 
 ## 1. House rules
 
-1. **Tim decides.** He owns the product and answers for it. Commit only when he asks. The one remote is `origin`, a GitHub repository (`falklandtim/OwlPost`, over SSH; still under the old name): never push, add another remote, change its visibility, publish or release without his say-so.
+1. **Tim decides.** He owns the product and answers for it. Commit only when he asks. The one remote is `origin`, a GitHub repository (`falklandtim/NightPost`, over SSH): never push, add another remote, change its visibility, publish or release without his say-so.
 2. **NightPost never sends mail on an agent's behalf.** The MCP server saves drafts; Tim sends. `send_email` and `reply` were removed on purpose. Never add a tool, flag or script that sends.
 3. **Real mail is private.** Never print, log, paste, commit or upload message content, addresses or attachments from a real account, including in crash dumps, screenshots and test fixtures. Look for the one fact you need (an error line, a count), not the mail around it. Keep personal details out of requests to outside services: no names or email addresses in headers, URLs or User-Agents.
 4. **Never touch a real mailbox from a test.** Tests use the demo accounts (`nightpost_core::demo`). Every engine function has a demo path. Real-account behaviour is checked by Tim, by hand.
