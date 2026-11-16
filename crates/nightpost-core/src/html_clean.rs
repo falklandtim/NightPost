@@ -18,6 +18,10 @@
 //! apply only where there's a size (`<img>`, `<input>`); everywhere else
 //! it's the known paths.
 //!
+//! [`clean`], which every reader uses, also takes out links to the app's own
+//! actions (`nightpost:`), `<meta>` refreshes and the content of an
+//! email's own frames, since those could load pages this file never sees.
+//!
 //! It scans the text rather than parsing HTML, in one pass, so a huge or
 //! broken email can't make it hang. Hidden pictures (`display:none`) are
 //! kept: newsletters hide their mobile-only pictures that way. Scripts are
@@ -36,7 +40,12 @@ pub fn has_remote_content(html: &str) -> bool {
 }
 
 /// Everything done to an email's HTML before it's shown: trackers removed
-/// (as [`strip_trackers`]) and links to the app's own actions taken out.
+/// (as [`strip_trackers`]), links to the app's own actions taken out, and
+/// anything that would load a page this file never sees: a `<meta>`
+/// refresh (an email redirecting itself) and the content of the email's own
+/// frames (`srcdoc`, or `src` such as a `data:` page). A tracker written
+/// inside those would otherwise load whenever remote images are on.
+/// Ordinary emails use neither, and most mail apps remove them too.
 ///
 /// Why the links: the app's page uses `nightpost://` links for its own
 /// buttons (Load images, attachments, Reply). An email could include one
@@ -131,9 +140,10 @@ type Size = (Option<f32>, Option<f32>);
 type Keep<'a> = dyn FnMut(&str, Option<Size>) -> bool + 'a;
 
 /// Walk every tag in `html`, ask `keep` about each address it would load,
-/// and return the HTML with the refused ones removed. Text, comments and
-/// untouched tags are copied as they are.
-fn walk(html: &str, app_links: bool, keep: &mut Keep) -> String {
+/// and return the HTML with the refused ones removed (`email`: and the
+/// email-only rules of [`clean`]). Text, comments and untouched tags are
+/// copied as they are.
+fn walk(html: &str, email: bool, keep: &mut Keep) -> String {
     // ASCII lowercasing keeps every byte where it was, so offsets carry over.
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
@@ -153,7 +163,7 @@ fn walk(html: &str, app_links: bool, keep: &mut Keep) -> String {
         }
         let end = tag_end(html, start);
         out.push_str(&html[copied..start]);
-        if let Some(tag) = clean_tag(&name, &html[start..end], app_links, keep) {
+        if let Some(tag) = clean_tag(&name, &html[start..end], email, keep) {
             out.push_str(&tag);
         }
         (copied, i) = (end, end);
@@ -167,10 +177,13 @@ fn walk(html: &str, app_links: bool, keep: &mut Keep) -> String {
     out
 }
 
-/// One tag with its refused addresses removed (and, with `app_links`, any
-/// link to the app's own actions), or `None` to drop the whole tag (a
-/// tracking `<img>` or `<input>`).
-fn clean_tag(name: &str, tag: &str, app_links: bool, keep: &mut Keep) -> Option<String> {
+/// One tag with its refused addresses removed, or `None` to drop the whole
+/// tag (a tracking `<img>` or `<input>`). With `email`, also the email-only
+/// rules of [`clean`]: app links, refreshes and frames' content.
+fn clean_tag(name: &str, tag: &str, email: bool, keep: &mut Keep) -> Option<String> {
+    if email && name == "meta" && tag_attr(tag, "http-equiv").is_some_and(|v| v.trim().eq_ignore_ascii_case("refresh")) {
+        return None;
+    }
     let sized = name == "img" || (name == "input" && tag_attr(tag, "type").is_some_and(|t| t.eq_ignore_ascii_case("image")));
     if sized {
         if let Some(src) = tag_attr(tag, "src") {
@@ -180,10 +193,17 @@ fn clean_tag(name: &str, tag: &str, app_links: bool, keep: &mut Keep) -> Option<
         }
     }
     let mut t = tag.to_string();
-    if app_links {
+    if email {
         for a in ["href", "xlink:href"] {
             if tag_attr(&t, a).is_some_and(|v| is_app_link(&v)) {
                 t = set_attr(&t, a, None);
+            }
+        }
+        if name == "iframe" || name == "frame" {
+            for a in ["srcdoc", "src"] {
+                if tag_attr(&t, a).is_some() {
+                    t = set_attr(&t, a, None);
+                }
             }
         }
     }
@@ -545,6 +565,27 @@ mod tests {
         for kept in ["See pictures", "Open", "Reply", "Fwd", "https://example.com/nightpost://x"] {
             assert!(clean.contains(kept), "{kept} lost: {clean}");
         }
+    }
+
+    /// An email that redirects itself, or brings its own frame, could load
+    /// a page this file never sees (a tracker inside a `data:` address).
+    #[test]
+    fn redirects_and_email_frames_are_removed() {
+        for meta in [
+            r#"<meta http-equiv="refresh" content="0;url=data:text/html,<img src=https://t.example/a.gif>">"#,
+            "<META HTTP-EQUIV=REFRESH CONTENT='5; URL=https://t.example/'>",
+            "<meta content=\"0;url=x\" http-equiv = 'Refresh' >",
+        ] {
+            let (clean, _) = clean(&format!("<p>Hi</p>{meta}<p>Bye</p>"));
+            assert_eq!(clean, "<p>Hi</p><p>Bye</p>", "{meta}");
+        }
+        // Other meta tags stay.
+        let html = r#"<meta charset="utf-8"><meta name="viewport" content="width=device-width">"#;
+        assert_eq!(clean(html).0, html);
+        // An email's own frames lose their content (the frame box stays).
+        let (out, _) = clean(r#"<iframe srcdoc="&lt;img src='https://t.example/o.gif'&gt;" width="300"></iframe><IFRAME SRC="data:text/html,<img src=https://t.example/p.gif>"></IFRAME><frame src="https://t.example/x">"#);
+        assert!(!out.contains("t.example") && !out.contains("srcdoc"), "{out}");
+        assert!(out.contains("width=\"300\""), "{out}");
     }
 
     #[test]
