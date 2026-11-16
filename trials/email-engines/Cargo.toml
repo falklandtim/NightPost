@@ -1,0 +1,70 @@
+[package]
+name = "email-engines"
+description = "A trial of HTML engines for drawing email in NightPost (not part of the app)"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+# Kept out of the NightPost workspace (see `exclude` in the root Cargo.toml),
+# with its own Cargo.lock, so no engine here reaches the app or its tests.
+[workspace]
+
+[features]
+default = []
+# litehtml (C++ engine, MIT/BSD/Apache) through litehtml-rs, drawn on the CPU
+# with tiny-skia and cosmic-text (its "pixbuf" feature). Mac and Linux.
+litehtml = ["dep:litehtml"]
+# Blitz (DioxusLabs: Stylo, Taffy, Parley), painted on the CPU with
+# vello_cpu through anyrender. Pre-release: approved for this trial only.
+blitz = ["dep:blitz-html", "dep:blitz-dom", "dep:blitz-traits", "dep:blitz-paint", "dep:anyrender", "dep:anyrender_vello_cpu"]
+# Linux only: WebKitGTK 6.0 (GTK 4), the system's WebKit, as the app's
+# composer will use after the GTK 3 bindings go. Needs gtk4-devel and
+# webkitgtk6.0-devel (Fedora) or gtk4 and webkitgtk-6.0 (Arch).
+webkit-gtk4 = ["dep:webkit6", "dep:gtk4"]
+# Mac only: today's WKWebView, the reference every other engine is compared with.
+webkit-mac = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit", "dep:objc2-web-kit", "dep:block2"]
+
+[dependencies]
+nightpost-core = { path = "../../crates/nightpost-core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mail-parser = "0.11"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg"] }
+# Trial-only engines, pinned exactly (AGENTS.md section 6).
+blitz-html = { version = "=0.3.0-beta.4", optional = true }
+blitz-dom = { version = "=0.3.0-beta.4", optional = true }
+blitz-traits = { version = "=0.3.0-beta.4", optional = true }
+blitz-paint = { version = "=0.3.0-beta.4", optional = true }
+anyrender = { version = "=0.14.0", optional = true }
+anyrender_vello_cpu = { version = "=0.18.0", optional = true }
+litehtml = { version = "=0.2.6", optional = true, features = ["vendored", "pixbuf", "email"] }
+
+# webkit-gtk4: gtk-rs's WebKitGTK 6.0 bindings (MIT).
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit6 = { version = "=0.6.1", optional = true }
+# webkit6 uses gtk::Accessible, which gtk4 only builds with GTK 4.10 support on.
+gtk4 = { version = "=0.11.5", optional = true, features = ["v4_10"] }
+
+# webkit-mac: the same binding crates and versions the app uses today.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "=0.6.5", optional = true }
+block2 = { version = "=0.6.2", optional = true }
+objc2-foundation = { version = "=0.3.2", optional = true, features = [
+    "NSData", "NSDate", "NSError", "NSGeometry", "NSRunLoop", "NSString", "NSURL", "NSURLRequest", "NSURLResponse", "NSValue", "NSObjCRuntime",
+] }
+objc2-app-kit = { version = "=0.3.2", optional = true, features = [
+    "NSAppearance", "NSApplication", "NSBitmapImageRep", "NSGraphics", "NSImage", "NSImageRep", "NSResponder", "NSRunningApplication", "NSView", "NSWindow",
+] }
+objc2-web-kit = { version = "=0.3.2", optional = true, features = [
+    "block2", "objc2-app-kit", "WKSnapshotConfiguration", "WKURLSchemeHandler", "WKURLSchemeTask", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore",
+] }
+
+[profile.release]
+strip = true
+
+[lints.rust]
+# Servo's feature lives in servo-build/Cargo.toml (see there for why).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("servo"))'] }

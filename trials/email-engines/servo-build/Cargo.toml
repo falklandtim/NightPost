@@ -1,0 +1,48 @@
+# Builds the trial (../src) with Servo. A package of its own, with its own
+# Cargo.lock, because Servo's copy of Stylo can't share a lock file with
+# Blitz's (Cargo allows one crate per `links` name). Run from here:
+#
+#   cargo run --release --features servo -- render --engine servo
+#
+# Results land in ../out, next to the other engines'.
+[package]
+name = "email-engines-servo"
+description = "The email engine trial, built with Servo (not part of NightPost)"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "email-engines"
+path = "../src/main.rs"
+
+[features]
+default = []
+# Servo 0.8 (MPL-2.0): a full browser engine as a library, drawn by its
+# software rendering context, in one process, without developer tools.
+servo = ["dep:servo", "dep:url", "dep:dpi", "dep:http", "dep:euclid"]
+
+[dependencies]
+# No nightpost-core: Servo and NightPost each link their own SQLite (rusqlite
+# 0.38 and 0.37). Pages come from the main build's `prepare` instead.
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mail-parser = "0.11"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg"] }
+servo = { version = "=0.8.0", optional = true, default-features = false, features = ["bundled"] }
+url = { version = "2", optional = true }
+dpi = { version = "*", optional = true }
+http = { version = "1", optional = true }
+euclid = { version = "0.22", optional = true }
+
+[lints.rust]
+# The other engines' features live in ../Cargo.toml.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("litehtml", "blitz", "webkit-mac", "webkit-gtk4"))'] }
+
+[profile.release]
+strip = true

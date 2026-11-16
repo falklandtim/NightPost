@@ -1,0 +1,13 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<script>new Image().src = "{{REMOTE}}/marker/head-script";</script>
+</head>
+<body onload="new Image().src='{{REMOTE}}/marker/body-onload'" style="font:15px Arial;padding:16px;">
+<p>This email tries to run scripts in five ways. If any runs, it asks the local server for <code>/marker/…</code>.</p>
+<script>document.write('<img src="{{REMOTE}}/marker/inline-script">'); fetch("{{REMOTE}}/marker/fetch");</script>
+<img src="cid:does-not-exist" alt="" onerror="new Image().src='{{REMOTE}}/marker/img-onerror'">
+<p><a id="jslink" href="javascript:new Image().src='{{REMOTE}}/marker/javascript-link'">A javascript: link</a> (only runs if clicked; the check asks the engine what the link is).</p>
+<p onclick="new Image().src='{{REMOTE}}/marker/onclick'">A paragraph with onclick.</p>
+<svg width="20" height="20" onload="new Image().src='{{REMOTE}}/marker/svg-onload'"><rect width="20" height="20" fill="#ccc"/></svg>
+<iframe srcdoc="<script>new Image().src='{{REMOTE}}/marker/iframe-script'</script>" width="200" height="40"></iframe>
+</body></html>

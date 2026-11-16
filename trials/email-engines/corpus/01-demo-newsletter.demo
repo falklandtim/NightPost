@@ -1,0 +1,2 @@
+The demo newsletter from nightpost_core::demo ("November roast: Ethiopia Guji").
+page.rs reads it from a scratch demo store, so it always matches what the app's demo shows.

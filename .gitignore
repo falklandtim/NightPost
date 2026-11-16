@@ -22,3 +22,9 @@
 /ios/google-client-id.txt
 xcuserdata/
 *.xcuserstate
+
+# The email engine trial: pictures, numbers and the report, remade by each run
+/trials/email-engines/out/
+/trials/email-engines/target/
+/trials/email-engines/target-*/
+/trials/email-engines/servo-build/target/

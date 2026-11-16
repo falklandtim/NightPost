@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  .col { display:inline-block; width:280px; vertical-align:top; }
+  .card { margin:10px; padding:16px; border:1px solid #d9e2dc; border-radius:8px; background:#fbfdfb; }
+  .title { font:bold 18px/1.3 Helvetica,Arial,sans-serif; color:#21543a; margin:10px 0 6px; }
+  .copy { font:14px/1.5 Helvetica,Arial,sans-serif; color:#3a4a40; margin:0; }
+  .narrow-only { display:none; }
+  @media (max-width: 480px) {
+    .col { display:block !important; width:100% !important; }
+    .narrow-only { display:block !important; }
+    .wide-only { display:none !important; }
+  }
+</style></head>
+<body style="margin:0;background:#ffffff;">
+  <div style="max-width:600px;margin:0 auto;padding:12px;">
+    <p style="font:bold 22px Helvetica,Arial,sans-serif;color:#21543a;margin:6px 10px;">Tramping Club: this weekend</p>
+    <p class="wide-only" style="font:13px Helvetica,Arial,sans-serif;color:#7a867f;margin:0 10px;">Two trips, side by side.</p>
+    <p class="narrow-only" style="font:13px Helvetica,Arial,sans-serif;color:#7a867f;margin:0 10px;">Two trips, one after the other.</p>
+    <div class="col"><div class="card">
+      <img src="{{REMOTE}}/images/photo-1.png" alt="Ridge track" style="width:100%;height:auto;border-radius:4px;display:block;">
+      <p class="title">Ridge loop (medium)</p>
+      <p class="copy">Six hours, 900 m of climbing. Meet at the car park at 7:30. Bring a raincoat whatever the forecast says.</p>
+    </div></div><div class="col"><div class="card">
+      <img src="{{REMOTE}}/images/photo-2.png" alt="River walk" style="width:100%;height:auto;border-radius:4px;display:block;">
+      <p class="title">River walk (easy)</p>
+      <p class="copy">Three hours on the flat with two swing bridges. Dogs on leads welcome. Coffee after at the store.</p>
+    </div></div>
+    <p style="font:12px Helvetica,Arial,sans-serif;color:#9aa49e;margin:16px 10px;">Example Tramping Club · <a href="https://tramping.example/unsubscribe" style="color:#9aa49e;">Unsubscribe</a></p>
+  </div>
+</body></html>

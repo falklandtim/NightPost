@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/nightpost-core", "crates/nightpost", "crates/nightpost-ffi"]
+# The HTML engine trial has its own lock file and heavy, trial-only
+# dependencies: keep them out of `cargo test --workspace` and the app.
+exclude = ["trials/email-engines"]
 
 [workspace.package]
 version = "0.1.0"
