@@ -33,7 +33,7 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSColor", "NSEv
 objc2-contacts = "0.3"
 objc2-foundation = "0.3"
 objc2-web-kit = { version = "0.3", default-features = false, features = [
-    "std", "block2", "objc2-app-kit", "WKNavigation", "WKNavigationAction", "WKNavigationDelegate", "WKScriptMessage", "WKScriptMessageHandler",
+    "std", "block2", "objc2-app-kit", "WKFrameInfo", "WKNavigation", "WKNavigationAction", "WKNavigationDelegate", "WKScriptMessage", "WKScriptMessageHandler",
     "WKUIDelegate", "WKUserContentController", "WKUserScript", "WKWebView", "WKWebViewConfiguration", "WKWindowFeatures",
 ] }
 raw-window-handle = "0.6"

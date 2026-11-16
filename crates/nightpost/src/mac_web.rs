@@ -35,8 +35,10 @@ const IPC_JS: &str = "Object.defineProperty(window,'ipc',{value:Object.freeze({p
 
 /// Called with each message a page posts.
 pub type OnMessage = Box<dyn Fn(String)>;
-/// Called with each address the page would go to: true lets it load.
-pub type OnNavigate = Box<dyn Fn(String) -> bool>;
+/// Called with each address the page would go to, and whether the click
+/// came from the page itself rather than a frame inside it (an email's):
+/// true lets it load.
+pub type OnNavigate = Box<dyn Fn(String, bool) -> bool>;
 
 /// What a [`WebView`] is for.
 pub struct Options {
@@ -125,7 +127,7 @@ define_class!(
         fn decide(&self, _view: &WKWebView, action: &WKNavigationAction, decide: &DynBlock<dyn Fn(WKNavigationActionPolicy)>) {
             // A download (a link with `download`, say) never starts.
             // SAFETY: a plain query of a live action (macOS 11.3+; NightPost needs 26).
-            let allow = !unsafe { action.shouldPerformDownload() } && self.ivars().on_navigate.as_ref().is_none_or(|f| f(address(action)));
+            let allow = !unsafe { action.shouldPerformDownload() } && self.ivars().on_navigate.as_ref().is_none_or(|f| f(address(action), from_main_frame(action)));
             decide.call((if allow { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));
         }
     }
@@ -136,13 +138,20 @@ define_class!(
         #[unsafe(method(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
         fn create(&self, _view: &WKWebView, _config: &WKWebViewConfiguration, action: &WKNavigationAction, _features: &WKWindowFeatures) -> *mut WKWebView {
             if let Some(f) = &self.ivars().on_navigate {
-                f(address(action));
+                f(address(action), from_main_frame(action));
             }
             // No new view: nil tells WebKit not to open one.
             std::ptr::null_mut()
         }
     }
 );
+
+/// Did the navigation start in the page itself (not a frame inside it)?
+fn from_main_frame(action: &WKNavigationAction) -> bool {
+    // SAFETY: plain queries of a live action and its source frame. No source
+    // frame (it can be nil): not the page, the safe answer.
+    unsafe { action.sourceFrame().is_some_and(|f| f.isMainFrame()) }
+}
 
 /// Where a navigation goes, as text.
 fn address(action: &WKNavigationAction) -> String {

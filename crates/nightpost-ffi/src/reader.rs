@@ -12,7 +12,7 @@
 //! open.
 
 use super::{fail, Mail, Result};
-use nightpost_core::html_clean::{has_remote_content, strip_trackers};
+use nightpost_core::html_clean::has_remote_content;
 use nightpost_core::{email_view, engine, mail_html, Message};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -68,7 +68,7 @@ fn nonce() -> String {
 /// The page for `m`'s HTML, or `None` when it has only text.
 pub(crate) fn page(m: &Message, remote_images: bool) -> Option<MessagePage> {
     let html = m.body_html.as_deref().filter(|h| !h.trim().is_empty())?;
-    let (clean, trackers) = strip_trackers(html);
+    let (clean, trackers) = nightpost_core::html_clean::clean(html);
     let remote_hidden = !remote_images && has_remote_content(&clean);
     let policy = mail_html::csp(&nonce(), remote_images);
     Some(MessagePage { html: mail_html::email_frame(&clean, &policy, PAPER, true), trackers, remote_hidden })

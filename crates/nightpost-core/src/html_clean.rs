@@ -28,18 +28,39 @@
 /// Decides whether "Load images" is offered when remote images are off.
 pub fn has_remote_content(html: &str) -> bool {
     let mut found = false;
-    walk(html, &mut |url, _| {
+    walk(html, false, &mut |url, _| {
         found |= remote_rest(url).is_some();
         true
     });
     found
 }
 
+/// Everything done to an email's HTML before it's shown: trackers removed
+/// (as [`strip_trackers`]) and links to the app's own actions taken out.
+///
+/// Why the links: the app's page uses `nightpost://` links for its own
+/// buttons (Load images, attachments, Reply). An email could include one
+/// styled as an ordinary button, and a click would turn on remote images or
+/// open a file. The app's own links are written outside the email, by
+/// `mail_view::document`, so they're untouched. Returns the cleaned HTML and
+/// the blocked trackers' hosts.
+pub fn clean(html: &str) -> (String, Vec<String>) {
+    let mut hosts: Vec<String> = Vec::new();
+    let out = walk(html, true, &mut |url, size| keep_unless_tracker(url, size, &mut hosts));
+    (out, hosts)
+}
+
 /// Remove trackers from an email (see the file's summary). Returns the
 /// cleaned HTML and the hosts the trackers pointed at, each once, in order.
 pub fn strip_trackers(html: &str) -> (String, Vec<String>) {
     let mut hosts: Vec<String> = Vec::new();
-    let out = walk(html, &mut |url, size| match tracker_host(url, size) {
+    let out = walk(html, false, &mut |url, size| keep_unless_tracker(url, size, &mut hosts));
+    (out, hosts)
+}
+
+/// Keep `url` unless it's a tracker; a tracker's host goes in `hosts`, once.
+fn keep_unless_tracker(url: &str, size: Option<Size>, hosts: &mut Vec<String>) -> bool {
+    match tracker_host(url, size) {
         Some(host) => {
             if !hosts.contains(&host) {
                 hosts.push(host);
@@ -47,8 +68,59 @@ pub fn strip_trackers(html: &str) -> (String, Vec<String>) {
             false
         }
         None => true,
-    });
-    (out, hosts)
+    }
+}
+
+/// Is this link one of the app's own (`nightpost:`), however it's written?
+/// Browsers decode entities in attributes and ignore spaces, tabs and
+/// newlines in a link's scheme, so `&#110;ightpost:` and `night\npost:` work
+/// as well as the plain form.
+fn is_app_link(href: &str) -> bool {
+    let decoded = decode_entities(href);
+    let squeezed: String = decoded.chars().filter(|c| !c.is_ascii_whitespace() && !c.is_ascii_control()).take(16).collect();
+    squeezed.to_ascii_lowercase().starts_with("nightpost:")
+}
+
+/// HTML character references in an attribute value: numeric (`&#110;`,
+/// `&#x6e;`) and the few named ones that could spell out a link's scheme.
+fn decode_entities(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let end = after.find(';').filter(|e| *e <= 10);
+        let decoded = end.and_then(|e| {
+            let name = &after[..e];
+            let c = match name.strip_prefix('#') {
+                Some(n) => match n.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok().and_then(char::from_u32),
+                    None => n.parse().ok().and_then(char::from_u32),
+                },
+                None => match name {
+                    "colon" => Some(':'),
+                    "sol" => Some('/'),
+                    "Tab" => Some('\t'),
+                    "NewLine" => Some('\n'),
+                    "amp" => Some('&'),
+                    _ => None,
+                },
+            };
+            c.map(|c| (c, e))
+        });
+        match decoded {
+            Some((c, e)) => {
+                out.push(c);
+                rest = &after[e + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A picture's width and height in pixels, where the tag gives them.
@@ -61,7 +133,7 @@ type Keep<'a> = dyn FnMut(&str, Option<Size>) -> bool + 'a;
 /// Walk every tag in `html`, ask `keep` about each address it would load,
 /// and return the HTML with the refused ones removed. Text, comments and
 /// untouched tags are copied as they are.
-fn walk(html: &str, keep: &mut Keep) -> String {
+fn walk(html: &str, app_links: bool, keep: &mut Keep) -> String {
     // ASCII lowercasing keeps every byte where it was, so offsets carry over.
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
@@ -81,7 +153,7 @@ fn walk(html: &str, keep: &mut Keep) -> String {
         }
         let end = tag_end(html, start);
         out.push_str(&html[copied..start]);
-        if let Some(tag) = clean_tag(&name, &html[start..end], keep) {
+        if let Some(tag) = clean_tag(&name, &html[start..end], app_links, keep) {
             out.push_str(&tag);
         }
         (copied, i) = (end, end);
@@ -95,9 +167,10 @@ fn walk(html: &str, keep: &mut Keep) -> String {
     out
 }
 
-/// One tag with its refused addresses removed, or `None` to drop the whole
-/// tag (a tracking `<img>` or `<input>`).
-fn clean_tag(name: &str, tag: &str, keep: &mut Keep) -> Option<String> {
+/// One tag with its refused addresses removed (and, with `app_links`, any
+/// link to the app's own actions), or `None` to drop the whole tag (a
+/// tracking `<img>` or `<input>`).
+fn clean_tag(name: &str, tag: &str, app_links: bool, keep: &mut Keep) -> Option<String> {
     let sized = name == "img" || (name == "input" && tag_attr(tag, "type").is_some_and(|t| t.eq_ignore_ascii_case("image")));
     if sized {
         if let Some(src) = tag_attr(tag, "src") {
@@ -107,6 +180,13 @@ fn clean_tag(name: &str, tag: &str, keep: &mut Keep) -> Option<String> {
         }
     }
     let mut t = tag.to_string();
+    if app_links {
+        for a in ["href", "xlink:href"] {
+            if tag_attr(&t, a).is_some_and(|v| is_app_link(&v)) {
+                t = set_attr(&t, a, None);
+            }
+        }
+    }
     let stylesheet = name == "link" && tag_attr(tag, "rel").is_some_and(|r| r.to_ascii_lowercase().contains("stylesheet"));
     let urls: &[&str] = match name {
         "image" => &["background", "href", "xlink:href"],
@@ -446,6 +526,25 @@ mod tests {
     fn comments_are_left_alone() {
         let html = r#"<!--[if mso]><img src="https://cdn.example/a.png" title='it"s'><![endif]--><p>Hi</p>"#;
         assert_eq!(strip_trackers(html), (html.to_string(), vec![]));
+    }
+
+    #[test]
+    fn app_links_are_removed_from_email() {
+        let html = concat!(
+            r#"<a href="nightpost://load-images">See pictures</a>"#,
+            r#"<a HREF='NIGHTPOST://attachment/1/0'>Open</a>"#,
+            r#"<a href=" &#110;ightpost&#x3a;//reply">Reply</a>"#,
+            "<a href=\"night\npost://forward\">Fwd</a>",
+            r#"<area href="nightpost&colon;//load-images">"#,
+            r#"<a href="https://example.com/nightpost://x">Fine</a>"#,
+        );
+        let (clean, _) = clean(html);
+        // Only the ordinary link keeps its address.
+        assert_eq!(clean.to_ascii_lowercase().matches("href").count(), 1, "{clean}");
+        // The link text stays; ordinary links stay.
+        for kept in ["See pictures", "Open", "Reply", "Fwd", "https://example.com/nightpost://x"] {
+            assert!(clean.contains(kept), "{kept} lost: {clean}");
+        }
     }
 
     #[test]

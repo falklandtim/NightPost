@@ -11,7 +11,7 @@
 use crate::style::{self, Colors};
 use eframe::egui;
 use nightpost_core::{Message, MessageId};
-pub use nightpost_core::html_clean::{has_remote_content, strip_trackers, tag_attr};
+pub use nightpost_core::html_clean::{has_remote_content, tag_attr};
 
 /// Something the page asks of the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +139,7 @@ pub fn document(page: &Page, col: &Colors) -> String {
         .iter()
         .map(|m| {
             m.body_html.as_deref().filter(|h| !h.trim().is_empty()).map(|h| {
-                let (clean, hosts) = strip_trackers(h);
+                let (clean, hosts) = nightpost_core::html_clean::clean(h);
                 for host in hosts {
                     if !trackers.contains(&host) {
                         trackers.push(host);
@@ -543,10 +543,16 @@ mod native {
                             }
                         }
                     }),
-                    on_navigate: Some(Box::new(move |url| {
+                    on_navigate: Some(Box::new(move |url, from_page| {
                         // Our own page loads; everything else is ours to handle.
                         if url.starts_with("about:") || url.starts_with("data:") {
                             return true;
+                        }
+                        // The app's own actions come only from its own page, never
+                        // from inside an email (html_clean strips them there too).
+                        if !from_page && url.get(..10).is_some_and(|s| s.eq_ignore_ascii_case("nightpost:")) {
+                            log::warn!("ignored an app link from inside an email");
+                            return false;
                         }
                         let _ = nav.send(parse_action(&url).unwrap_or(ViewEvent::OpenLink(url)));
                         false
@@ -963,7 +969,8 @@ mod offscreen {
     try {
       var fr = f.getBoundingClientRect();
       if (fr.height === 0) return;
-      f.contentDocument.querySelectorAll('a[href]').forEach(function (a) { add(a, fr.left, fr.top, { href: a.href }); });
+      // An email's own links never act on the app (html_clean strips them too).
+      f.contentDocument.querySelectorAll('a[href]').forEach(function (a) { if (!/^nightpost:/i.test(a.href)) add(a, fr.left, fr.top, { href: a.href }); });
     } catch (e) {}
   });
   var h = Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0);
@@ -1089,6 +1096,17 @@ mod tests {
         let col = Colors::new(nightpost_core::theme::discover().into_iter().find(|t| t.id == nightpost_core::theme::MOONLIT_DARK).unwrap().palette());
         let doc = document(&Page { messages: &[msg(1, "x", Some(&html))], expanded: &[true], remote_images: true, nonce: "n", avatar: &|_| None, dark_emails: true }, &col);
         std::fs::write(std::env::var("NIGHTPOST_DUMP_OUT").unwrap(), doc).unwrap();
+    }
+
+    /// An email can't carry a link to the app's own actions: only the app's
+    /// banner link to load images is left in the page.
+    #[test]
+    fn email_links_to_app_actions_are_removed() {
+        let evil = r#"<a href="nightpost://load-images" style="padding:8px;background:#06c">View in browser</a><a href="nightpost://attachment/9/0">Invoice</a><img src="https://cdn.example/a.png" width="600">"#;
+        let doc = document(&Page { messages: &[msg(9, "Hi", Some(evil))], expanded: &[true], remote_images: false, nonce: "n", avatar: &|_| None, dark_emails: true }, &colors());
+        assert_eq!(doc.matches("nightpost://load-images").count(), 1, "the banner's only");
+        assert!(!doc.contains("nightpost://attachment/9/0"));
+        assert!(doc.contains("View in browser") && doc.contains("Invoice"));
     }
 
     #[test]
@@ -1231,7 +1249,7 @@ mod tests {
         for f in files.split(':') {
             let raw = std::fs::read(f).unwrap();
             let m = nightpost_core::parse::parse_message(&raw, 1, 1, 1).unwrap();
-            let (_, hosts) = strip_trackers(m.body_html.as_deref().unwrap_or(""));
+            let (_, hosts) = nightpost_core::html_clean::clean(m.body_html.as_deref().unwrap_or(""));
             println!("{f}: snippet {:?}\n  trackers {hosts:?}", m.snippet);
             let name = std::path::Path::new(f).file_stem().unwrap().to_string_lossy().to_string();
             let doc = document(&Page { messages: &[m], expanded: &[true], remote_images: true, nonce: "n1", avatar: &|_| None, dark_emails: true }, &colors());

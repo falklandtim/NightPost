@@ -6,7 +6,7 @@
 //! marketing mail, charts, screenshots and photos pasted into the body.
 
 use crate::engine;
-use crate::html_clean::{strip_trackers, tag_attr};
+use crate::html_clean::tag_attr;
 use crate::models::{Account, Message};
 use crate::store::Store;
 use anyhow::{anyhow, Result};
@@ -71,7 +71,7 @@ pub fn view(store: &Store, account: &Account, m: &Message, opts: &Options) -> Re
     let Some(html) = m.body_html.as_deref().filter(|h| !h.trim().is_empty()) else {
         return Ok(View { text: m.body_text.clone(), ..Default::default() });
     };
-    let (clean, trackers) = strip_trackers(html);
+    let (clean, trackers) = crate::html_clean::clean(html);
     let (marked, mut images) = mark_images(&clean);
     let text = crate::parse::html_to_text(&marked);
     let mut raw: Option<Result<Vec<u8>>> = None;
