@@ -112,7 +112,7 @@ Tools: `list_accounts`, `list_folders`, `list_threads`, `search`, `read_thread`,
 
 - `view_message` shows an email the way it was designed. It returns the text with an `[image N]` marker where each picture sits, and then the pictures. Inline (`cid:`), remote and `data:` images are included. Tracking pixels are removed and never fetched, small icons are skipped, and pictures are sized to at most 1200 px. Remote pictures are fetched from the sender's servers, as when you open the email; pass `images: false` to skip them.
 - `get_attachment` downloads an attachment (using the same cache as the app) and returns its path. Pictures come back to look at, and small text files (CSV, JSON, ICS…) come back inline. Other files, such as PDFs, are opened from the path.
-- `save_draft` writes a draft (or, with `thread_id`, a reply draft) to the Drafts folder instead of sending it. You finish it with **Edit draft** in NightPost or in any other mail app.
+- `save_draft` writes a draft (or, with `thread_id`, a reply draft) to the Drafts folder instead of sending it. You finish it with **Edit draft** in NightPost or in any other mail app. It can attach files only from Downloads, Documents and Desktop (not hidden files or folders), or attachments it fetched with `get_attachment`, so an email can't trick an assistant into attaching something private such as an SSH key. Its reply lists the full path of everything it attached.
 
 ## Themes
 
