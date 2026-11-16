@@ -65,7 +65,7 @@ scripts/install-linux.sh   # build, then install to ~/.local (program, app-menu 
 
 It needs Rust, plus the OpenSSL, D-Bus and WebKitGTK development files (`sudo dnf install openssl-devel dbus-devel pkgconf-pkg-config gtk4-devel webkitgtk6.0-devel libsoup3-devel` on Fedora, `sudo pacman -S --needed openssl dbus pkgconf gtk4 webkitgtk-6.0` on Arch). These are GTK 4 and WebKitGTK 6.0; the GTK 3 packages (`webkit2gtk4.1-devel`, `gtk3-devel`) aren't needed any more. Install a Hunspell dictionary (e.g. `hunspell-en`) for spell checking. Tested on Fedora 44 KDE (ARM). Passwords and Google sign-ins go in the desktop's Secret Service (KDE Wallet or GNOME Keyring).
 
-NightPost runs natively on Wayland (tested on KDE Plasma); `NIGHTPOST_X11=1` runs it through XWayland instead. HTML email on Linux is drawn by WebKitGTK 6.0 in a GTK 4 window that's never shown and shown as a picture, with links, folds, Reply and attachments (including their right-click menu) clickable. Text in it can't be selected yet.
+NightPost runs natively on Wayland (tested on KDE Plasma); `NIGHTPOST_X11=1` runs it through XWayland instead. HTML email on Linux is drawn off screen by WebKitGTK 6.0 (in a GTK 4 window that's never shown) and shown as a picture, with links, folds, Reply and attachments (including their right-click menu) clickable. Text in it can't be selected yet.
 
 The app icon lives in `crates/nightpost/assets/icon-1024.png`. After changing it, run `cargo run -p nightpost --example icon_assets` to regenerate the padded macOS version. The bundle script also does this automatically when the source is newer.
 

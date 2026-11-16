@@ -95,3 +95,25 @@ Still to do, in order:
 3. **unwrap/expect:** 39 left. Most are lock and thread-spawn `expect`s in `worker.rs`; `snooze.rs` (7) and `attachments.rs` (6) need a look.
 4. **Tests:** none yet for `web_host.rs`, `prefs.rs`, `credentials.rs` or `onboarding.rs`.
 5. **The unused `outbox` table:** drop it or use it (asks first: it's a schema change).
+
+### 2026-11-17 (design and security audit: security fixes)
+
+From Tim's "NightPost design and security audit" and the brief [docs/tasks/audit-fixes-2026-11.md](tasks/audit-fixes-2026-11.md), on the branch `fix/audit-2026-11` (one commit per item). Closed:
+
+| Item | Fix |
+|---|---|
+| S1 (high) | Attachments carry the macOS quarantine mark (`LSFileQuarantineEnabled`, and `file_safety::quarantine` for the MCP server); programs, scripts, installers, archives and macro documents ask before opening |
+| S2 | `save_draft` attaches only from Downloads, Documents, Desktop or the attachment cache |
+| S3 | Unencrypted SMTP refused except to this computer |
+| S4 | Emails can't carry `nightpost:` links (stripped in `html_clean::clean`; Mac also ignores them from an email's frame) |
+| S5 | `<meta>` refreshes and the content of an email's own frames removed (tested first with the Mac's WebKit: images-off held, but a tracker in a `data:` frame loaded with images on) |
+| S6 | Tracker wording made honest; MCP remote pictures off by default and never from the local network (`net_guard`) |
+| S7 | Sender logo lookups skip addresses and single-word hosts, and downloads use `net_guard` |
+| S8 | The composer follows no links (Mac and Linux) |
+| S9 | No account addresses or sender URLs in the four log lines named |
+| S10 | One random nonce (`mail_html::nonce`) for every page's own script |
+| S11 | `NIGHTPOST_PASSWORD_<EMAIL>` only in debug builds |
+
+Checked: `cargo test --workspace` (205) and clippy on the Mac and on Fedora 44 KDE; the GTK tests (`NIGHTPOST_GTK_TESTS=1`) on Fedora; `scripts/ios-rust.sh` and the iPhone UI tests (10, simulator); `scripts/audit.sh` no worse anywhere (0 clippy and rustdoc warnings, 0 unsafe without SAFETY, unwrap/expect 38). `cargo audit` isn't installed on the Mac.
+
+Still to do: the design items D2–D7 (they change how things look, so screenshots for Tim first); error messages that name the account and can reach the log (S9's follow-up).
