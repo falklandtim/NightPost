@@ -967,7 +967,7 @@ mod push {
                 Err(e) => {
                     failures += 1;
                     let wait = idle::backoff(failures);
-                    log::info!("push for {} dropped: {e:#}; retrying in {}s", account.email, wait.as_secs());
+                    log::info!("push for account {} dropped: {e:#}; retrying in {}s", account.id, wait.as_secs());
                     notify(&store, PushState::Retrying(format!("{e:#}")));
                     // Sleep in short steps so a replacement or removal ends this thread promptly.
                     let until = Instant::now() + wait;

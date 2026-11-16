@@ -140,14 +140,14 @@ fn fetch_logo(org: &str, domain: &str) -> Option<Picture> {
     for d in &bimi_domains {
         if let Some(url) = dns::txt(&format!("default._bimi.{d}")).iter().find_map(|r| bimi_logo_url(r)) {
             if let Some(png) = get(&url, 512 * 1024).and_then(|(b, _)| normalize(&b, true)) {
-                log::debug!("logo for {org}: BIMI");
+                log::debug!("sender logo found: BIMI");
                 return Some(Picture { png, fill: true });
             }
         }
     }
     for site in [org.to_string(), format!("www.{org}")] {
         if let Some(png) = site_icon(&site) {
-            log::debug!("logo for {org}: site icon");
+            log::debug!("sender logo found: site icon");
             return Some(Picture { png, fill: false });
         }
     }
@@ -237,7 +237,8 @@ fn get(url: &str, limit: u64) -> Option<(Vec<u8>, String)> {
     }
     // Never a machine on your network, even after a redirect (net_guard).
     let agent = nightpost_core::net_guard::agent(ureq::AgentBuilder::new().timeout(TIMEOUT).redirects(5).user_agent("Mozilla/5.0 (Macintosh) NightPost"));
-    let r = agent.get(url).call().map_err(|e| log::debug!("{url}: {e}")).ok()?;
+    // Not the address: it names whoever sent the mail (AGENTS.md rule 3).
+    let r = agent.get(url).call().map_err(|e| log::debug!("a logo download failed: {}", e.kind())).ok()?;
     let final_url = r.get_url().to_string();
     let mut body = vec![];
     r.into_reader().take(limit).read_to_end(&mut body).ok()?;

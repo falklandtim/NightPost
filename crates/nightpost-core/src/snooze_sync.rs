@@ -885,7 +885,7 @@ pub fn save_tab_change(store: &Store, change: &TabChange) -> Result<()> {
             TabChange::Thread(r) => st.threads.push(r.clone()),
         });
         if let Err(e) = r {
-            log::warn!("couldn't save the tab change to {}: {e:#}", a.email);
+            log::warn!("couldn't save the tab change to account {}: {e:#}", a.id);
             err = Some(e);
         }
     }
@@ -945,7 +945,7 @@ pub fn wake_due(store: &Store) -> Result<usize> {
     for a in store.accounts()?.into_iter().filter(|a| due.contains(&a.id)) {
         match sync_snoozes(store, &a) {
             Ok(n) => woke += n,
-            Err(e) => log::warn!("waking snoozes for {} failed: {e:#}", a.email),
+            Err(e) => log::warn!("waking snoozes for account {} failed: {e:#}", a.id),
         }
     }
     Ok(woke)
