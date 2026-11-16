@@ -54,7 +54,7 @@ The UI thread draws each frame and never waits on the network.
 | push | One IMAP IDLE connection per account on its Inbox, run by a supervisor that replaces stalled ones, re-issued every 8 minutes and restarted after sleep. A change from the server asks `sync` for that Inbox. | `worker::push` |
 | `actions` | Takes each `Cmd` from the UI and runs it on its own short-lived thread. Commands on the same conversation take turns in the order sent (`Turns`), so an undo never overtakes its action. | `worker::Worker::spawn` |
 | `avatars-N` | A few sender-picture lookups at a time (Contacts photo, BIMI logo, site icon). | `worker::Worker::spawn` |
-| GTK (Linux only) | GTK's main loop, for WebKitGTK: the composer windows and the off-screen HTML view. Other threads post work to it. | `web_host` |
+| GTK (Linux only) | GTK 4's main loop (a `glib::MainLoop`), for WebKitGTK 6.0: the composer windows and the off-screen HTML view. Other threads post work to it. | `web_host` |
 
 Results come back to the UI as `worker::Event`s on a channel, and the UI repaints.
 
@@ -113,7 +113,7 @@ Colours come from the theme (`style::Colors`, built from a Mailspring-style pale
 
 - **HTML email** (`mail_view.rs`): one page per conversation, each email body in a sandboxed `<iframe>` under a strict Content Security Policy. The page's own small script sizes frames, recolours emails for dark themes, forwards shortcut keys and draws the attachment menu. Clicks come back as `nightpost://` links.
   - On the Mac it's a native WebKit view laid over the reading pane.
-  - On Linux an egui window can't hold a web view on Wayland, so WebKitGTK draws the page off screen. The app shows it as a picture and maps clicks to a list of targets (links, folds, attachments).
+  - On Linux an egui window can't hold a web view on Wayland, so WebKitGTK 6.0 draws the page in a GTK 4 window that's never shown. The app shows it as a picture and maps clicks to a list of targets (links, folds, attachments).
 - **Composer** (`composer.rs` + `web_host.rs`): a formatted editor in its own native window (WebKit or WebKitGTK), talking to the app through `postMessage`. Where no web view is available, an egui composer is used.
 
 ## Testing

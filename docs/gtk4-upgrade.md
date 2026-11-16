@@ -1,6 +1,6 @@
 # Moving the Linux build off GTK 3
 
-Status: **plan, 2026-11-16. Nothing changed in the code yet.** Step 1 (testing five ways to draw HTML email) comes before any porting.
+Status: **ported, 2026-11-17.** The Linux composer and HTML email use WebKitGTK 6.0 and GTK 4 directly (`webkit6` and `gtk4`, exact pins); `wry` stays on the Mac only. HTML email is drawn in a GTK 4 window that's never shown (realised and sized by hand), the first of the two ways below. Tested on Fedora 44 KDE and Omarchy Hyprland with `NIGHTPOST_GTK_TESTS=1 cargo test -p nightpost` (they open windows, so they're off by default). The engine trial's results are under "Results".
 
 ## Why
 

@@ -23,8 +23,7 @@ resvg = { version = "0.45", default-features = false }
 ureq = "2.12"
 base64 = "0.22"
 
-# HTML email is shown in the system web view (WebKit). macOS first; Linux
-# (WebKitGTK) to follow.
+# macOS: HTML email and the composer are WKWebView, through wry.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
@@ -34,19 +33,20 @@ objc2-foundation = "0.3"
 raw-window-handle = "0.6"
 wry = "0.57"
 
-# The formatted composer on Linux: WebKitGTK in a GTK window (native on
-# Wayland and X11).
+# Linux: the formatted composer is WebKitGTK 6.0 in a GTK 4 window (native
+# on Wayland and X11), and HTML email is drawn by it off screen. Talked to
+# directly: wry only supports the GTK 3 build of WebKit (docs/gtk4-upgrade.md).
+# Exact pins, as tested in trials/email-engines; move them up on purpose.
 [target.'cfg(target_os = "linux")'.dependencies]
-gtk = "0.18"
-javascriptcore-rs = "1.1"
+# webkit6 uses gtk::Accessible, which gtk4 only builds with GTK 4.10 support on.
+gtk4 = { version = "=0.11.5", features = ["v4_10"] }
 raw-window-handle = "0.6"
 # Ask the compositor (over the main window's own connection) to let a new
 # composer window come to the front (xdg-activation).
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
-webkit2gtk = "2.0"
-wry = { version = "0.57", default-features = false, features = ["os-webview"] }
+webkit6 = "=0.6.1"
 
 [dev-dependencies]
 egui_kittest = { version = "0.33", features = ["wgpu", "snapshot"] }

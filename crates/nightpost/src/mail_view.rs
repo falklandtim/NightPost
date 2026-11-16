@@ -614,9 +614,9 @@ mod fallback {
 /// Linux: the conversation drawn by WebKitGTK off screen, shown as a picture.
 ///
 /// Wayland has no way to put another toolkit's view inside our window, so
-/// WebKitGTK renders the page in an offscreen window on the GTK thread and
-/// hands back a full-page snapshot (sharp on HiDPI screens), with where the
-/// links and folds are. The app paints it, scrolls it, and turns clicks into
+/// WebKitGTK 6.0 renders the page in a GTK 4 window that is never shown, on
+/// the GTK thread, and hands back a full-page snapshot (sharp on HiDPI
+/// screens), with where the links and folds are. The app paints it, scrolls it, and turns clicks into
 /// the same events the macOS view sends. Emails run no scripts, so a picture
 /// of the page is the page. (Text can't be selected yet.)
 #[cfg(target_os = "linux")]
@@ -626,7 +626,7 @@ mod offscreen {
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug)]
-    enum Hit {
+    pub(super) enum Hit {
         Link(String),
         /// An older message's header: fold it open or shut.
         Fold(usize),
@@ -634,19 +634,19 @@ mod offscreen {
 
     /// A clickable spot, in page (CSS) pixels.
     #[derive(Clone, Debug)]
-    struct Target {
-        rect: egui::Rect,
-        hit: Hit,
+    pub(super) struct Target {
+        pub(super) rect: egui::Rect,
+        pub(super) hit: Hit,
     }
 
     /// A finished render.
-    struct Rendered {
-        key: u64,
+    pub(super) struct Rendered {
+        pub(super) key: u64,
         width: u32,
         /// Device pixels per CSS pixel.
-        scale: f32,
-        image: egui::ColorImage,
-        targets: Vec<Target>,
+        pub(super) scale: f32,
+        pub(super) image: egui::ColorImage,
+        pub(super) targets: Vec<Target>,
     }
 
     #[derive(Default)]
@@ -833,19 +833,30 @@ mod offscreen {
     }
 
     /// Runs on the GTK thread.
+    ///
+    /// GTK 4 has no off-screen window (GTK 3's `OffscreenWindow` is gone), so
+    /// the view sits in an ordinary window that's never shown. A window that's
+    /// never shown is never given a size either, so it's realised and the view
+    /// sized by hand on every load; otherwise WebKit lays the page out at
+    /// 0 × 0. Tested on KDE and Hyprland in trials/email-engines.
     mod gtk_side {
         use super::{Hit, Job, Rendered, Shared, Target};
         use eframe::egui;
-        use gtk::prelude::*;
         use std::cell::RefCell;
         use std::sync::{Arc, Mutex};
-        use webkit2gtk::{LoadEvent, SettingsExt, SnapshotOptions, SnapshotRegion, WebViewExt};
+        use webkit6::prelude::*;
+        use webkit6::{gdk, gio, glib, gtk, LoadEvent, SnapshotOptions, SnapshotRegion, WebView};
+
+        /// The view's height while laying out, in CSS pixels (the snapshot
+        /// takes the whole page; this only has to be something).
+        const VIEW_HEIGHT: f32 = 600.0;
 
         struct Off {
-            _window: gtk::OffscreenWindow,
-            view: webkit2gtk::WebView,
+            window: gtk::Window,
+            view: WebView,
             key: u64,
             width: u32,
+            /// Device pixels per CSS pixel in the snapshot.
             scale: f32,
             /// Bumped per load, so a late callback from an older page is ignored.
             gen: u64,
@@ -864,59 +875,61 @@ mod offscreen {
                     let gen = OFF.with(|o| {
                         o.borrow().as_ref().map(|off| {
                             let js = format!("(function(){{var d=document.querySelectorAll('details.card')[{i}]; if(d) d.open=!d.open; return '';}})()");
-                            off.view.run_javascript(&js, None::<&gtk::gio::Cancellable>, |_| {});
+                            off.view.evaluate_javascript(&js, None, None, None::<&gio::Cancellable>, |_| {});
                             off.gen
                         })
                     });
                     if let Some(gen) = gen {
-                        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || snapshot(gen));
+                        glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || snapshot(gen));
                     }
                 }
             }
         }
 
+        /// The hidden window and its view, made once.
+        fn make(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) -> Off {
+            let view = WebView::new();
+            view.connect_load_changed(|_, ev| {
+                if ev == LoadEvent::Finished {
+                    let gen = OFF.with(|o| o.borrow().as_ref().map(|off| off.gen));
+                    if let Some(gen) = gen {
+                        // Once the email frames have sized themselves, then
+                        // again after late pictures and fonts arrive.
+                        for ms in [250, 1500] {
+                            glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || snapshot(gen));
+                        }
+                    }
+                }
+            });
+            let window = gtk::Window::new();
+            window.set_decorated(false);
+            window.set_child(Some(&view));
+            // `realize` is on both Widget and WebView's own traits.
+            WidgetExt::realize(&window);
+            WidgetExt::realize(&view);
+            Off { window, view, key: 0, width: 0, scale: 1.0, gen: 0, shared: shared.clone(), ctx: ctx.clone() }
+        }
+
         fn load(key: u64, width: u32, scale: f32, html: String, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
             OFF.with(|o| {
                 let mut o = o.borrow_mut();
-                if o.is_none() {
-                    let window = gtk::OffscreenWindow::new();
-                    let view = webkit2gtk::WebView::new();
-                    // An offscreen window has no OpenGL, and if WebKit switches
-                    // to GL compositing (some emails, a resize) GDK aborts the
-                    // whole app. A snapshot only needs software drawing.
-                    if let Some(settings) = WebViewExt::settings(&view) {
-                        settings.set_hardware_acceleration_policy(webkit2gtk::HardwareAccelerationPolicy::Never);
-                    }
-                    view.connect_load_changed(|_, ev| {
-                        if ev == LoadEvent::Finished {
-                            let gen = OFF.with(|o| o.borrow().as_ref().map(|off| off.gen));
-                            if let Some(gen) = gen {
-                                // Once the email frames have sized themselves, then
-                                // again after late pictures and fonts arrive.
-                                for ms in [250, 1500] {
-                                    gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || snapshot(gen));
-                                }
-                            }
-                        }
-                    });
-                    window.add(&view);
-                    window.show_all();
-                    *o = Some(Off { _window: window, view, key: 0, width: 0, scale: 1.0, gen: 0, shared: shared.clone(), ctx: ctx.clone() });
-                }
-                let off = o.as_mut().expect("just made");
+                let off = o.get_or_insert_with(|| make(&shared, &ctx));
                 off.key = key;
                 off.width = width;
-                off.scale = scale;
                 off.gen += 1;
                 off.shared = shared;
                 off.ctx = ctx;
-                // GTK may already draw at the screen's scale (HiDPI); zoom the
+                // GTK draws at the screen's scale already (HiDPI); zoom the
                 // page for whatever's left, so the picture is sharp but the
                 // layout stays `width` CSS pixels wide.
-                let gdk = off.view.scale_factor().max(1) as f32;
-                let zoom = (scale / gdk).max(0.25);
-                off.view.set_zoom_level(zoom as f64);
-                off.view.set_size_request((width as f32 * zoom).round() as i32, (600.0 * zoom) as i32);
+                let gdk_scale = off.view.scale_factor().max(1) as f32;
+                let zoom = (scale / gdk_scale).max(0.25);
+                off.scale = gdk_scale * zoom;
+                off.view.set_zoom_level(f64::from(zoom));
+                let (w, h) = ((width as f32 * zoom).round() as i32, (VIEW_HEIGHT * zoom).round() as i32);
+                off.window.set_default_size(w, h);
+                off.view.set_size_request(w, h);
+                off.view.allocate(w, h, -1, None);
                 off.view.load_html(&html, None);
             });
         }
@@ -945,10 +958,10 @@ mod offscreen {
             let view = OFF.with(|o| o.borrow().as_ref().filter(|off| off.gen == gen).map(|off| off.view.clone()));
             let Some(view) = view else { return };
             let runner = view.clone();
-            runner.run_javascript(MEASURE, None::<&gtk::gio::Cancellable>, move |r| {
-                use javascriptcore::ValueExt;
-                let json = r.ok().and_then(|r| r.js_value()).map(|v| v.to_str().to_string()).unwrap_or_default();
+            runner.evaluate_javascript(MEASURE, None, None, None::<&gio::Cancellable>, move |r| {
+                let json = r.ok().map(|v| v.to_str().to_string()).unwrap_or_default();
                 let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                let height = v["h"].as_f64().unwrap_or(0.0) as f32;
                 let targets: Vec<Target> = v["t"]
                     .as_array()
                     .into_iter()
@@ -963,38 +976,57 @@ mod offscreen {
                         Some(Target { rect, hit })
                     })
                     .collect();
-                view.snapshot(SnapshotRegion::FullDocument, SnapshotOptions::NONE, None::<&gtk::gio::Cancellable>, move |s| {
-                    let Ok(surface) = s else { return };
-                    let Some(image) = to_image(surface) else { return };
+                view.snapshot(SnapshotRegion::FullDocument, SnapshotOptions::NONE, None::<&gio::Cancellable>, move |s| {
+                    let Ok(texture) = s else { return };
                     OFF.with(|o| {
-                        if let Some(off) = o.borrow().as_ref().filter(|off| off.gen == gen) {
-                            if let Ok(mut sh) = off.shared.lock() {
-                                // Device pixels per CSS pixel, as it actually came out.
-                                let scale = image.size[0] as f32 / off.width.max(1) as f32;
-                                let _ = off.scale;
-                                sh.rendered = Some(Rendered { key: off.key, width: off.width, scale, image, targets });
-                            }
-                            off.ctx.request_repaint();
+                        let o = o.borrow();
+                        let Some(off) = o.as_ref().filter(|off| off.gen == gen) else { return };
+                        // The snapshot covers anything wider than the pane and
+                        // is never shorter than the view: keep just the page.
+                        let w = (off.width as f32 * off.scale).round() as usize;
+                        let h = (height * off.scale).round() as usize;
+                        let Some(image) = to_image(&texture, w, h) else { return };
+                        if let Ok(mut sh) = off.shared.lock() {
+                            sh.rendered = Some(Rendered { key: off.key, width: off.width, scale: off.scale, image, targets });
                         }
+                        off.ctx.request_repaint();
                     });
                 });
             });
         }
 
-        /// A cairo snapshot (premultiplied BGRA) as an egui image.
-        fn to_image(surface: gtk::cairo::Surface) -> Option<egui::ColorImage> {
-            let mut img = gtk::cairo::ImageSurface::try_from(surface).ok()?;
-            img.flush();
-            let (w, h, stride) = (img.width() as usize, img.height() as usize, img.stride() as usize);
-            let data = img.data().ok()?;
+        /// A snapshot as an egui image, cut to at most `max_w` × `max_h`
+        /// pixels (`max_h` 0: the whole height).
+        fn to_image(texture: &gdk::Texture, max_w: usize, max_h: usize) -> Option<egui::ColorImage> {
+            let (tw, th) = (usize::try_from(texture.width()).ok()?, usize::try_from(texture.height()).ok()?);
+            let mut down = gdk::TextureDownloader::new(texture);
+            down.set_format(gdk::MemoryFormat::R8g8b8a8Premultiplied);
+            let (bytes, stride) = down.download_bytes();
+            let w = tw.min(max_w.max(1));
+            let h = if max_h == 0 { th } else { th.min(max_h) };
             let mut rgba = Vec::with_capacity(w * h * 4);
             for y in 0..h {
-                let row = &data[y * stride..y * stride + w * 4];
-                for px in row.chunks_exact(4) {
-                    rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-                }
+                rgba.extend_from_slice(bytes.get(y * stride..y * stride + w * 4)?);
             }
             Some(egui::ColorImage::from_rgba_premultiplied([w, h], &rgba))
+        }
+    }
+
+    /// Tests: draw `html` off screen as the reading pane would, and wait for
+    /// the first picture. Fails the test after 15 s.
+    #[cfg(test)]
+    pub(super) fn draw(html: String, width: u32, scale: f32) -> Rendered {
+        let ctx = egui::Context::default();
+        assert!(crate::web_host::init(&ctx), "GTK didn't start");
+        let shared: Arc<Mutex<Shared>> = Arc::default();
+        request(Job::Load { key: 7, width, scale, html }, shared.clone(), ctx);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(r) = shared.lock().ok().and_then(|mut s| s.rendered.take()) {
+                return r;
+            }
+            assert!(std::time::Instant::now() < end, "no picture within 15 s");
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 }
@@ -1122,6 +1154,56 @@ mod tests {
             let doc = document(&Page { messages: &msgs, expanded: &[true, true], remote_images: remote, nonce: "n1", avatar: &|_| None, dark_emails: true }, &colors());
             std::fs::write(std::path::Path::new(&dir).join(format!("{name}.html")), doc).unwrap();
         }
+    }
+
+    /// Linux: draws the demo newsletter conversation with WebKitGTK off
+    /// screen, as the reading pane shows it, and saves PNGs (light and dark)
+    /// to $NIGHTPOST_SHOTS. Needs a desktop session and NIGHTPOST_GTK_TESTS=1.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn draws_demo_page_on_linux() {
+        let (Ok(dir), Some(_)) = (std::env::var("NIGHTPOST_SHOTS"), std::env::var_os("NIGHTPOST_GTK_TESTS")) else { return };
+        let p = std::env::temp_dir().join(format!("sp-mv-gtk-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let store = nightpost_core::Store::open(&p).unwrap();
+        nightpost_core::demo::seed(&store).unwrap();
+        let acc = store.accounts().unwrap().into_iter().next().unwrap();
+        let inbox = store.folder_by_role(acc.id, nightpost_core::FolderRole::Inbox).unwrap().unwrap();
+        let t = store.threads(&nightpost_core::MailboxView::Folder(inbox.id), "Guji", 5).unwrap().remove(0);
+        let msgs = store.thread_messages(acc.id, &t.thread_key).unwrap();
+        let expanded = vec![true; msgs.len()];
+        for (name, theme) in [("linux-mail-view-light", nightpost_core::theme::MOONLIT_LIGHT), ("linux-mail-view-dark", nightpost_core::theme::MOONLIT_DARK)] {
+            let col = Colors::new(nightpost_core::theme::discover().into_iter().find(|t| t.id == theme).unwrap().palette());
+            let doc = document(&Page { messages: &msgs, expanded: &expanded, remote_images: false, nonce: "n1", avatar: &|_| None, dark_emails: true }, &col);
+            let r = offscreen::draw(doc, 700, 2.0);
+            let [w, h] = r.image.size;
+            assert!(w == 1400 && h > 400, "{w}×{h}");
+            let rgba: Vec<u8> = r.image.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+            image::save_buffer(std::path::Path::new(&dir).join(format!("{name}.png")), &rgba, w as u32, h as u32, image::ColorType::Rgba8).unwrap();
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Linux: draws a page with WebKitGTK in the hidden window and checks the
+    /// picture's size and colour and the link's place. It needs a desktop
+    /// session, so it runs only with NIGHTPOST_GTK_TESTS=1.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn draws_a_page_off_screen() {
+        if std::env::var_os("NIGHTPOST_GTK_TESTS").is_none() {
+            return;
+        }
+        let html = "<body style='margin:0;background:#fff'><div style='height:900px;background:#c00'>\
+                    <a href='https://example.com/x' style='display:block;width:100px;height:20px'>x</a></div></body>";
+        let r = offscreen::draw(html.into(), 400, 2.0);
+        assert_eq!(r.key, 7);
+        // The pane's width and the page's height (not the view's), at the scale asked for.
+        assert_eq!(r.scale, 2.0);
+        assert_eq!(r.image.size, [800, 1800]);
+        let px = r.image.pixels[100 * 800 + 400];
+        assert!(px.r() > 150 && px.g() < 60 && px.b() < 60, "not red: {px:?}");
+        let link = r.targets.iter().find(|t| matches!(&t.hit, offscreen::Hit::Link(h) if h == "https://example.com/x")).expect("the link");
+        assert_eq!((link.rect.width(), link.rect.height()), (100.0, 20.0));
     }
 
     /// Renders saved raw emails to look at: `NIGHTPOST_EML=a.eml:b.eml` writes

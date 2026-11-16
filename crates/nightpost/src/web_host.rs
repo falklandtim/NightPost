@@ -1,8 +1,9 @@
 //! Windows holding a web page (the formatted composer), outside egui.
 //!
 //! The same HTML runs everywhere, each in the system's own web engine:
-//! WebKit in a native window on macOS, WebKitGTK in a GTK window on Linux.
-//! A GTK window is its own toplevel, so this works on Wayland as well as
+//! WebKit in a native window on macOS (through wry), WebKitGTK 6.0 in a
+//! GTK 4 window on Linux (directly: wry only supports GTK 3). A GTK window
+//! is its own toplevel, so this works on Wayland as well as
 //! X11 (an egui window can only host a web view under X11).
 //!
 //! Pages talk to the app with `window.ipc.postMessage(json)`; the app
@@ -101,7 +102,7 @@ pub fn on_gtk_thread(f: impl FnOnce() + Send + 'static) -> bool {
     if !imp::available() {
         return false;
     }
-    gtk::glib::MainContext::default().invoke(f);
+    webkit6::glib::MainContext::default().invoke(f);
     true
 }
 
@@ -321,22 +322,27 @@ mod edit_menu {
 mod imp {
     use super::{events, HostEvent, WindowSpec};
     use eframe::egui;
-    use gtk::prelude::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use webkit6::prelude::*;
+    use webkit6::{gdk, glib, gtk, UserContentInjectedFrames, UserContentManager, UserScript, UserScriptInjectionTime, WebView};
 
     static READY: AtomicBool = AtomicBool::new(false);
 
     struct Win {
         window: gtk::Window,
-        webview: wry::WebView,
+        webview: WebView,
     }
 
     thread_local! {
         // Only touched on the GTK thread.
         static WINS: RefCell<HashMap<u64, Win>> = RefCell::new(HashMap::new());
     }
+
+    /// The page's side of `window.ipc.postMessage` (the name wry used on the
+    /// Mac, so the same pages run on both): WebKitGTK's message handler.
+    const IPC_JS: &str = "window.ipc={postMessage:function(s){window.webkit.messageHandlers.ipc.postMessage(String(s))}};";
 
     pub(super) fn init(ctx: &egui::Context) -> bool {
         if READY.load(Ordering::SeqCst) {
@@ -346,13 +352,16 @@ mod imp {
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new().name("gtk".into()).spawn(move || {
             // The launcher's id, so GTK windows group with NightPost's.
-            gtk::glib::set_prgname(Some("co.timson.NightPost"));
+            glib::set_prgname(Some("co.timson.NightPost"));
+            // GTK takes this thread as its own: every GTK call from here on
+            // is posted to it (`on_gtk`).
             if gtk::init().is_err() {
                 let _ = tx.send(false);
                 return;
             }
             let _ = tx.send(true);
-            gtk::main();
+            // GTK 4 has no gtk::main(): run the default context's loop.
+            glib::MainLoop::new(None, false).run();
         });
         let ok = spawned.is_ok() && rx.recv().unwrap_or(false);
         READY.store(ok, Ordering::SeqCst);
@@ -368,7 +377,7 @@ mod imp {
 
     /// Run `f` on the GTK thread.
     fn on_gtk(f: impl FnOnce() + Send + 'static) {
-        gtk::glib::MainContext::default().invoke(f);
+        glib::MainContext::default().invoke(f);
     }
 
     pub(super) fn open(id: u64, spec: WindowSpec) -> anyhow::Result<()> {
@@ -385,44 +394,46 @@ mod imp {
     }
 
     fn build(id: u64, spec: WindowSpec, token: Option<String>) -> anyhow::Result<()> {
-        use wry::WebViewBuilderExtUnix;
-        let window = gtk::Window::new(gtk::WindowType::Toplevel);
-
-        window.set_title(&spec.title);
-        window.set_default_size(spec.width as i32, spec.height as i32);
-        window.set_position(gtk::WindowPosition::Center);
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        window.add(&content);
-        let (r, g, b) = spec.background;
-        let webview = wry::WebViewBuilder::new()
-            .with_html(spec.html)
-            .with_background_color((r, g, b, 255))
-            .with_ipc_handler(move |req| events::push(HostEvent::Message(id, req.into_body())))
-            .build_gtk(&content)?;
-        spell_check(&webview);
-        window.connect_delete_event(move |_, _| {
-            events::push(HostEvent::CloseRequested(id));
-            gtk::glib::Propagation::Stop
-        });
-        window.show_all();
-        window.present();
-        // Bring it to the front with the main window's permission (else KDE
-        // opens it behind the main window).
-        if let Some(t) = token {
-            // Once the compositor has mapped it.
-            let w = window.clone();
-            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || super::activation::activate_gtk(&w, &t));
+        let content = UserContentManager::new();
+        content.add_script(&UserScript::new(IPC_JS, UserContentInjectedFrames::TopFrame, UserScriptInjectionTime::Start, &[], &[]));
+        content.connect_script_message_received(Some("ipc"), move |_, value| events::push(HostEvent::Message(id, value.to_str().to_string())));
+        if !content.register_script_message_handler("ipc", None) {
+            anyhow::bail!("WebKit refused the page's message handler");
         }
-        log::info!("web window {id}: realized={} visible={} mapped={} size={:?}", window.is_realized(), window.is_visible(), window.is_mapped(), window.size());
+        let webview = WebView::builder().user_content_manager(&content).build();
+        let (r, g, b) = spec.background;
+        webview.set_background_color(&gdk::RGBA::new(f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0));
+        spell_check(&webview);
+        webview.load_html(&spec.html, None);
+
+        let window = gtk::Window::new();
+        window.set_title(Some(&spec.title));
+        window.set_default_size(spec.width as i32, spec.height as i32);
+        window.set_child(Some(&webview));
+        window.connect_close_request(move |_| {
+            events::push(HostEvent::CloseRequested(id));
+            glib::Propagation::Stop
+        });
+        present(&window, token);
+        log::info!("web window {id}: realized={} visible={} mapped={}", window.is_realized(), window.is_visible(), window.is_mapped());
         WINS.with(|w| w.borrow_mut().insert(id, Win { window, webview }));
         Ok(())
     }
 
+    /// Show a window and bring it to the front with the main window's
+    /// permission (else KDE opens it behind the main window).
+    fn present(window: &gtk::Window, token: Option<String>) {
+        window.present();
+        if let Some(t) = token {
+            // Once the compositor has mapped it.
+            let w = window.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || super::activation::activate_gtk(&w, &t));
+        }
+    }
+
     /// Check spelling in the system's language (Hunspell dictionaries).
-    fn spell_check(webview: &wry::WebView) {
-        use webkit2gtk::{WebContextExt, WebViewExt};
-        use wry::WebViewExtUnix;
-        if let Some(ctx) = webview.webview().context() {
+    fn spell_check(webview: &WebView) {
+        if let Some(ctx) = webview.web_context() {
             let lang = std::env::var("LANG").ok().and_then(|l| l.split('.').next().map(str::to_string)).filter(|l| !l.is_empty() && l != "C").unwrap_or_else(|| "en_US".into());
             ctx.set_spell_checking_enabled(true);
             ctx.set_spell_checking_languages(&[lang.as_str()]);
@@ -440,37 +451,28 @@ mod imp {
     }
 
     pub(super) fn eval(id: u64, js: String) {
-        with(id, move |w| {
-            let _ = w.webview.evaluate_script(&js);
-        })
+        with(id, move |w| w.webview.evaluate_javascript(&js, None, None, None::<&webkit6::gio::Cancellable>, |_| {}))
     }
 
     pub(super) fn set_title(id: u64, title: String) {
-        with(id, move |w| w.window.set_title(&title))
+        with(id, move |w| w.window.set_title(Some(&title)))
     }
 
     pub(super) fn show(id: u64) {
         let token = super::activation::token();
-        with(id, move |w| {
-            w.window.show_all();
-            w.window.present();
-            if let Some(t) = token {
-                let win = w.window.clone();
-                gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || super::activation::activate_gtk(&win, &t));
-            }
-        })
+        with(id, move |w| present(&w.window, token))
     }
 
     pub(super) fn hide(id: u64) {
-        with(id, |w| w.window.hide())
+        with(id, |w| w.window.set_visible(false))
     }
 
     pub(super) fn close(id: u64) {
         on_gtk(move || {
             if let Some(w) = WINS.with(|w| w.borrow_mut().remove(&id)) {
+                w.window.set_child(None::<&gtk::Widget>);
                 drop(w.webview);
-                // SAFETY: the window is ours and nothing else holds it.
-                unsafe { w.window.destroy() };
+                w.window.destroy();
             }
         });
     }
@@ -492,6 +494,7 @@ mod activation {
     use wayland_client::protocol::{wl_registry, wl_surface::WlSurface};
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
     use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
+    use webkit6::{gdk, gtk};
 
     /// The main window's wl_display and wl_surface.
     static MAIN: Mutex<Option<(usize, usize)>> = Mutex::new(None);
@@ -523,25 +526,28 @@ mod activation {
         }
     }
 
+    // In libgtk-4 itself (GDK's Wayland backend), so no extra crate.
     extern "C" {
-        fn gdk_wayland_window_get_wl_surface(window: *mut gtk::gdk::ffi::GdkWindow) -> *mut std::ffi::c_void;
-        fn gdk_wayland_display_get_wl_display(display: *mut gtk::gdk::ffi::GdkDisplay) -> *mut std::ffi::c_void;
+        fn gdk_wayland_surface_get_wl_surface(surface: *mut gdk::ffi::GdkSurface) -> *mut std::ffi::c_void;
+        fn gdk_wayland_display_get_wl_display(display: *mut gdk::ffi::GdkDisplay) -> *mut std::ffi::c_void;
     }
 
     /// On the GTK thread: activate a shown GTK window with `token`, using
     /// GTK's own Wayland connection. Does nothing under X11.
     pub(super) fn activate_gtk(window: &gtk::Window, token: &str) {
-        use gtk::glib::translate::ToGlibPtr;
-        use gtk::prelude::*;
-        let Some(gdk_window) = window.window() else { return };
-        let display = gdk_window.display();
+        use webkit6::glib::prelude::*;
+        use webkit6::glib::translate::ToGlibPtr;
+        use webkit6::gtk::prelude::*;
+        let Some(surface) = window.surface() else { return };
+        let display = surface.display();
+        // Wayland's types are GdkWayland…; X11 needs no token.
         if !display.type_().name().contains("Wayland") {
             return;
         }
-        // SAFETY: both are GTK's live Wayland objects, checked above.
-        let (wl_display, wl_surface) = unsafe {
-            (gdk_wayland_display_get_wl_display(display.to_glib_none().0), gdk_wayland_window_get_wl_surface(gdk_window.to_glib_none().0))
-        };
+        // SAFETY: both are GTK's live Wayland objects (the type is checked
+        // above, and the window is shown, so it has a surface).
+        let (wl_display, wl_surface) =
+            unsafe { (gdk_wayland_display_get_wl_display(display.to_glib_none().0), gdk_wayland_surface_get_wl_surface(surface.to_glib_none().0)) };
         if wl_display.is_null() || wl_surface.is_null() {
             return;
         }
@@ -616,5 +622,70 @@ mod imp {
     pub(super) fn close(_id: u64) {}
     pub(super) fn poll() -> Vec<HostEvent> {
         vec![]
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A message from window `id` that contains `text`, within `wait`.
+    fn wait_for(id: u64, text: &str, wait: Duration) -> Option<String> {
+        let end = Instant::now() + wait;
+        while Instant::now() < end {
+            for e in poll() {
+                if let HostEvent::Message(i, m) = e {
+                    if i == id && m.contains(text) {
+                        return Some(m);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
+    /// Wait for a message from window `id` that contains `text`.
+    fn message(id: u64, text: &str) -> String {
+        wait_for(id, text, Duration::from_secs(15)).unwrap_or_else(|| panic!("no {text:?} from window {id}"))
+    }
+
+    /// Opens a composer-style window and checks the page and the app can
+    /// talk both ways (`window.ipc.postMessage` and [`eval`]). It shows a
+    /// window, so it runs only with NIGHTPOST_GTK_TESTS=1.
+    #[test]
+    fn web_window_talks_both_ways() {
+        if std::env::var_os("NIGHTPOST_GTK_TESTS").is_none() {
+            return;
+        }
+        assert!(init(&egui::Context::default()), "GTK didn't start");
+        let html = "<title>t</title><p>Hi</p><script>window.ipc.postMessage(JSON.stringify({ready:1}))</script>".to_string();
+        open(41, WindowSpec { title: "NightPost test".into(), width: 400.0, height: 300.0, html, background: (20, 20, 30) }).unwrap();
+        message(41, "ready");
+        eval(41, "window.ipc.postMessage('pong:' + document.querySelector('p').textContent)");
+        assert_eq!(message(41, "pong"), "pong:Hi");
+        close(41);
+
+        // The real composer page, with a demo account: it starts, and hands
+        // back what's in it when asked (as when a draft is saved).
+        let init = r##"{"accounts":[{"id":1,"label":"Alex Rivera <alex@icloud.demo>"}],"account":1,"to":"kowhai@demo","cc":"","bcc":"",
+            "subject":"Hello from GTK 4","html":"<div>Hi there</div>","signatures":[],"signature":"","signatureHtml":null,"attachments":[],
+            "hasPhotos":false,"imageSize":"original","focusBody":false,"colors":{"bg":"#101828","bg2":"#18223a","text":"#e6e8ee","subtle":"#8a93a6",
+            "border":"#2a3550","accent":"#7aa2f7","accent-text":"#101828","hover":"rgba(255,255,255,0.08)","danger":"#f7768e"}}"##;
+        let page = include_str!("../assets/composer.html").replace("/*NONCE*/", "t1").replace("/*INIT*/{}", init);
+        open(42, WindowSpec { title: "NightPost test".into(), width: 760.0, height: 640.0, html: page, background: (16, 24, 40) }).unwrap();
+        let end = Instant::now() + Duration::from_secs(15);
+        let state = loop {
+            // Until the page has started (the first asks may come too soon).
+            eval(42, "flush()");
+            if let Some(m) = wait_for(42, "Hello from GTK 4", Duration::from_millis(500)) {
+                break m;
+            }
+            assert!(Instant::now() < end, "the composer page never answered");
+        };
+        assert!(state.contains("Hi there") && state.contains("kowhai@demo"), "{state}");
+        close(42);
     }
 }
