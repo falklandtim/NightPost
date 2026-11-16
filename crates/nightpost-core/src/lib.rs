@@ -9,6 +9,7 @@ pub mod email_view;
 pub mod engine;
 pub mod file_safety;
 pub mod html_clean;
+pub mod net_guard;
 pub mod idle;
 pub mod mail_html;
 pub mod mcp;

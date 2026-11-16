@@ -165,8 +165,10 @@ fn load(src: &str, opts: &Options, raw: impl FnOnce() -> Result<Vec<u8>>) -> Res
     fetch(&url)
 }
 
+/// Fetch a remote picture, never from this machine or the local network
+/// (the address comes from the email: crate::net_guard).
 fn fetch(url: &str) -> Result<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).user_agent("NightPost").build();
+    let agent = crate::net_guard::agent(ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).user_agent("NightPost"));
     let resp = agent.get(url).call().map_err(|e| anyhow!("couldn't load: {}", e.to_string().chars().take(120).collect::<String>()))?;
     let mut buf = Vec::new();
     resp.into_reader().take(MAX_DOWNLOAD + 1).read_to_end(&mut buf)?;
@@ -222,6 +224,19 @@ pub fn picture_max(data: &[u8], max_edge: u32) -> Result<Picture> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A picture address pointing at this machine (or the local network)
+    /// is never fetched: the listener sees no connection.
+    #[test]
+    fn pictures_on_the_local_network_are_not_fetched() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(fetch(&format!("http://127.0.0.1:{port}/a.png")).is_err());
+        assert!(fetch(&format!("http://localhost:{port}/a.png")).is_err());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(listener.accept().is_err(), "something connected");
+    }
 
     fn png(w: u32, h: u32) -> Vec<u8> {
         let img = image::RgbImage::from_fn(w, h, |x, y| image::Rgb([(x % 255) as u8, (y % 255) as u8, 90]));

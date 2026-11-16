@@ -106,7 +106,7 @@ fn tools() -> Value {
             json!({"type":"object","required":["thread_id"],"properties":{
                 "thread_id":thread,
                 "message_id":{"type":"string","description":"Which message (from read_thread). Defaults to the newest."},
-                "images":{"type":"boolean","default":true,"description":"Include the pictures. Remote ones are fetched from the sender's servers, as when the email is viewed."},
+                "images":{"type":"boolean","default":false,"description":"Also fetch remote pictures from the sender's servers. That tells the sender the email was opened (and roughly where), so it's off unless asked for. Pictures sent inside the email are always included."},
                 "max_images":{"type":"integer","default":8,"maximum":20}
             }}), true, false),
         tool("get_attachment", "Download an attachment (cached after the first time) and return its file path. Pictures are also returned to look at, and small text files (txt, csv, json, ics…) inline. Open other files, such as PDFs, from the returned path.",
@@ -335,9 +335,12 @@ impl Server {
 
     fn view_message(&self, args: &Value) -> Result<(Value, Vec<Value>)> {
         let (account, m) = self.pick_message(args, |_| true)?;
-        let images = args.get("images").and_then(Value::as_bool).unwrap_or(true);
+        // Off unless asked for: fetching remote pictures tells the sender.
+        let images = args.get("images").and_then(Value::as_bool).unwrap_or(false);
         let max = args.get("max_images").and_then(Value::as_u64).unwrap_or(8).min(20) as usize;
-        let opts = crate::email_view::Options { remote: images, max_images: if images { max } else { 0 } };
+        // Pictures sent inside the email are always included; `images` only
+        // decides whether remote ones are fetched.
+        let opts = crate::email_view::Options { remote: images, max_images: max };
         let v = crate::email_view::view(&self.store, &account, &m, &opts)?;
         let mut extra = vec![];
         let mut list = vec![];

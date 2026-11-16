@@ -122,7 +122,7 @@ pub struct Prefs {
     google_edit: bool,
     /// Emails shown as designed (HTML in the web view); set by the app.
     pub html_email: bool,
-    /// Load remote images without asking (trackers are always blocked).
+    /// Load remote images without asking (known trackers are blocked).
     pub load_images: bool,
     /// Recolour emails to match a dark theme.
     pub dark_emails: bool,
@@ -205,7 +205,7 @@ impl Prefs {
         ui.label(RichText::new("Messages").strong().size(16.0));
         let mut html = self.html_email;
         let tip = if cfg!(any(target_os = "macos", target_os = "linux")) {
-            "HTML emails are shown with their layout, colours and fonts (WebKit). Scripts never run, and tracking pixels are always blocked."
+            "HTML emails are shown with their layout, colours and fonts (WebKit). Scripts never run, and known tracking pixels are blocked."
         } else {
             "Coming soon on this platform: messages are shown as text for now."
         };
@@ -215,8 +215,8 @@ impl Prefs {
         ui.add_enabled_ui(self.html_email, |ui| {
             let mut load = self.load_images;
             let tip = "On: pictures in emails load straight away, like Canary and Apple Mail. Off: they wait until you click Load images. \
-                       Tracking pixels, which report when and where you open an email, are blocked either way.";
-            if ui.checkbox(&mut load, "Load remote images (trackers are always blocked)").on_hover_text(tip).changed() {
+                       Tracking pixels and known tracking addresses are removed. Any remote picture can still tell the sender you opened the email.";
+            if ui.checkbox(&mut load, "Load remote images (known trackers are blocked)").on_hover_text(tip).changed() {
                 act = PrefsAction::SetLoadImages(load);
             }
             let mut dark = self.dark_emails;
