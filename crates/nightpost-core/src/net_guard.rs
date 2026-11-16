@@ -43,17 +43,24 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// May NightPost fetch from `host`, which resolves to `addresses`? Only a
-/// dotted name or a public address, all of whose addresses are public.
-pub fn host_allowed(host: &str, addresses: &[IpAddr]) -> bool {
+/// Could `host` be on the public internet, judging by the name alone (no
+/// lookup)? A public address, or a dotted name that isn't `localhost`.
+pub fn plausible_public_name(host: &str) -> bool {
     let h = host.trim().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.');
     if let Ok(ip) = h.parse::<IpAddr>() {
         return is_public_ip(ip);
     }
-    if !h.contains('.') || h.eq_ignore_ascii_case("localhost") || h.to_ascii_lowercase().ends_with(".localhost") {
-        return false;
+    h.contains('.') && !h.eq_ignore_ascii_case("localhost") && !h.to_ascii_lowercase().ends_with(".localhost")
+}
+
+/// May NightPost fetch from `host`, which resolves to `addresses`? Only a
+/// [`plausible_public_name`] all of whose addresses are public.
+pub fn host_allowed(host: &str, addresses: &[IpAddr]) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.parse::<IpAddr>().is_ok() {
+        return plausible_public_name(h);
     }
-    !addresses.is_empty() && addresses.iter().all(|ip| is_public_ip(*ip))
+    plausible_public_name(h) && !addresses.is_empty() && addresses.iter().all(|ip| is_public_ip(*ip))
 }
 
 /// Name lookup for [`agent`]: refuses hosts [`host_allowed`] says no to.

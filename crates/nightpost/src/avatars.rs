@@ -121,7 +121,18 @@ fn logo(org: &str, domain: &str, cache: &Path) -> Option<Picture> {
     found
 }
 
+/// May the sender's domain be looked up for a logo? Not an address or a
+/// single word: the domain comes from the email, and those would point the
+/// lookup at a machine on your network. (Downloads are guarded as well, in
+/// `get`, for names that resolve to one.)
+fn logo_lookup_allowed(domain: &str) -> bool {
+    nightpost_core::net_guard::plausible_public_name(domain)
+}
+
 fn fetch_logo(org: &str, domain: &str) -> Option<Picture> {
+    if !logo_lookup_allowed(domain) {
+        return None;
+    }
     let mut bimi_domains = vec![domain.to_string()];
     if org != domain {
         bimi_domains.push(org.to_string());
@@ -224,7 +235,8 @@ fn get(url: &str, limit: u64) -> Option<(Vec<u8>, String)> {
     if cfg!(test) {
         return None;
     }
-    let agent = ureq::AgentBuilder::new().timeout(TIMEOUT).redirects(5).user_agent("Mozilla/5.0 (Macintosh) NightPost").build();
+    // Never a machine on your network, even after a redirect (net_guard).
+    let agent = nightpost_core::net_guard::agent(ureq::AgentBuilder::new().timeout(TIMEOUT).redirects(5).user_agent("Mozilla/5.0 (Macintosh) NightPost"));
     let r = agent.get(url).call().map_err(|e| log::debug!("{url}: {e}")).ok()?;
     let final_url = r.get_url().to_string();
     let mut body = vec![];
@@ -510,6 +522,18 @@ pub mod dns {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sender's domain that's an address or a single word (a machine on
+    /// your network) is never looked up.
+    #[test]
+    fn logos_only_for_public_names() {
+        for d in ["192.168.1.1", "10.0.0.5", "127.0.0.1", "localhost", "router", "[::1]", "printer.localhost"] {
+            assert!(!logo_lookup_allowed(d), "{d}");
+        }
+        for d in ["example.com", "mail.example.co.nz"] {
+            assert!(logo_lookup_allowed(d), "{d}");
+        }
+    }
 
     #[test]
     fn domains() {
