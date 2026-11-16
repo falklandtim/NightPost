@@ -1043,13 +1043,6 @@ fn signature_html(sig: &Signature) -> String {
     }
 }
 
-/// A one-off token for the editor page's script.
-fn nonce() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-    format!("{:016x}{:016x}", h.finish(), std::collections::hash_map::RandomState::new().build_hasher().finish())
-}
 
 impl Composer {
     /// Open the formatted editor in its own window.
@@ -1086,7 +1079,7 @@ impl Composer {
         });
         // `</` would end the script early.
         let init = init.to_string().replace("</", "<\\/");
-        let nonce = nonce();
+        let nonce = nightpost_core::mail_html::nonce();
         let page = include_str!("../assets/composer.html").replace("/*NONCE*/", &nonce).replace("/*INIT*/{}", &init);
         let title = if self.subject.trim().is_empty() { self.title.clone() } else { self.subject.clone() };
         let bg = col.bg;

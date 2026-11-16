@@ -19,5 +19,4 @@ path = "src/bin/uniffi-bindgen.rs"
 nightpost-core = { path = "../nightpost-core" }
 anyhow.workspace = true
 chrono.workspace = true
-getrandom = "0.2"
 uniffi = { version = "0.29", features = ["cli"] }

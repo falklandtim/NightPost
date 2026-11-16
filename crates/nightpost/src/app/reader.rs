@@ -223,7 +223,7 @@ impl NightPostApp {
         let faces = &self.faces;
         let dark_emails = self.dark_emails;
         view.show(ctx, rect, ctx.zoom_factor(), page_key, || {
-            let nonce = format!("{:x}", page_key ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7));
+            let nonce = nightpost_core::mail_html::nonce();
             crate::mail_view::document(&crate::mail_view::Page { messages: &open.messages, expanded: &open.expanded, remote_images: remote, nonce: &nonce, avatar: &|e| faces.data_uri(e), dark_emails }, col)
         });
     }

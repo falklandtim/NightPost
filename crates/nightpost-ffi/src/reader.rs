@@ -55,22 +55,14 @@ fn image_type(data: &[u8]) -> &'static str {
     }
 }
 
-/// A random nonce: nothing on the phone runs by it (JavaScript is off),
-/// but the policy needs one.
-fn nonce() -> String {
-    let mut b = [0u8; 12];
-    if getrandom::getrandom(&mut b).is_err() {
-        return "nightpost".into();
-    }
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
 
 /// The page for `m`'s HTML, or `None` when it has only text.
 pub(crate) fn page(m: &Message, remote_images: bool) -> Option<MessagePage> {
     let html = m.body_html.as_deref().filter(|h| !h.trim().is_empty())?;
     let (clean, trackers) = nightpost_core::html_clean::clean(html);
     let remote_hidden = !remote_images && has_remote_content(&clean);
-    let policy = mail_html::csp(&nonce(), remote_images);
+    // Nothing on the phone runs by it (JavaScript is off), but the policy needs one.
+    let policy = mail_html::csp(&mail_html::nonce(), remote_images);
     Some(MessagePage { html: mail_html::email_frame(&clean, &policy, PAPER, true), trackers, remote_hidden })
 }
 

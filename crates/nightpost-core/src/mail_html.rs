@@ -29,6 +29,24 @@ pub fn csp(nonce: &str, remote: bool) -> String {
     )
 }
 
+/// A one-off token admitting a page's own script under [`csp`]: 16 random
+/// bytes from the system, URL-safe base64 (22 characters). It must be
+/// unguessable, or an email could carry a script with the same token. If
+/// the system has no randomness (it always should), a per-process random
+/// hash with the time stands in rather than failing to show the email.
+pub fn nonce() -> String {
+    use base64::Engine;
+    let mut b = [0u8; 16];
+    if getrandom::getrandom(&mut b).is_err() {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        b[..8].copy_from_slice(&h.finish().to_le_bytes());
+        b[8..].copy_from_slice(&std::collections::hash_map::RandomState::new().build_hasher().finish().to_le_bytes());
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
 /// One email's HTML as a page of its own, under `policy` (from [`csp`]).
 /// Links target the top page, so the app decides where they go. `css` adds
 /// colours (e.g. for a dark theme); `viewport` adds the phone's
@@ -138,6 +156,16 @@ pub fn email_document(inner: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nonces_are_random_and_url_safe() {
+        let (a, b) = (super::nonce(), super::nonce());
+        assert_ne!(a, b);
+        for n in [&a, &b] {
+            assert!(n.len() >= 22, "{n}");
+            assert!(n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "{n}");
+        }
+    }
+
     use super::*;
 
     #[test]
