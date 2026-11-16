@@ -176,6 +176,20 @@ An engine is in the running only if it passes every privacy, script and crash ch
 
 Each run adds a dated entry under "Results" at the end of this file: which engines ran on which machines, the numbers, the scores, and what was decided. The pictures stay in `trials/email-engines/out/`, which isn't committed. Once a choice is made, the trial crate stays in the repository for re-testing when an engine releases a new version.
 
+## Ready for GTK 5
+
+GTK 5 hasn't been released, but the GTK team has published what to prepare for: [Migrating from GTK 4 to GTK 5](https://docs.gtk.org/gtk4/migrating-4to5.html). GTK 5 will break both the API and the ABI, and the main way to prepare is to stop using anything GTK 4 has deprecated. Since we're writing this port now, we write it so the move to GTK 5 is small:
+
+- **No deprecated GTK 4 calls.** gtk4-rs marks them `#[deprecated]`, so the compiler warns. Never silence that with `#[allow(deprecated)]` in this code: use the replacement the deprecation note names. Build with the newest GTK 4 the supported Linux versions have, so we see the newest deprecations.
+- **Keep GTK in one place.** All GTK and WebKitGTK calls stay in the Linux-only modules of `web_host.rs` and `mail_view.rs`, behind the same functions the Mac uses. Moving to GTK 5 (and whatever WebKitGTK version goes with it) then changes those modules and nothing else.
+- **Use only the parts of GTK we need:** a window, a web view, its snapshot and the main loop. No dialogs, info bars or other widgets, many of which go in GTK 5. Native dialogs come from `rfd` and egui, as now.
+- **Pictures as `GdkTexture`,** never `GdkPixbuf`: GTK 5 drops GdkPixbuf as the way pictures move around. WebKitGTK 6.0's snapshot already returns a texture.
+- **Sizes from `width()` and `height()`** (or `compute_bounds()`), not the "allocated" size calls or `allocation()`, which go. This matters for the off-screen view, which the trial had to size by hand.
+- **Links open in the browser through our own code** (as now), not `gtk_show_uri()`, which is replaced by `GtkUriLauncher`.
+- **Dark theme through `gtk-interface-color-scheme`,** not `gtk-application-prefer-dark-theme` (deprecated since GTK 4.20, as the trial found).
+
+WebKitGTK will also need a new version for GTK 5. When one is announced, note it here, and check whether `webkit6`'s maintainers plan Rust bindings for it.
+
 ## Plan
 
 1. **Test the engines for HTML email**, as set out in "How we'll test the engines" above. This decides how step 3 is done before any porting starts.
@@ -184,6 +198,7 @@ Each run adds a dated entry under "Results" at the end of this file: which engin
 4. **Remove the GTK 3 crates:** `gtk`, `webkit2gtk`, `javascriptcore-rs` and the Linux `wry` entry in `crates/nightpost/Cargo.toml`. Check `cargo tree` shows no `gtk-sys` 0.18 left and `cargo audit` no longer lists the GTK 3 advisories.
 5. **Update the README** (Linux build packages, and remove this Known issue) and `docs/architecture.md` (the GTK thread row and the Linux web view notes).
 6. **Check it:**
+   - No deprecation warnings from GTK or WebKitGTK, and no `#[allow(deprecated)]` in the Linux modules (see "Ready for GTK 5").
    - `cargo test --workspace`, clippy and `scripts/audit.sh` on Linux and on the Mac (the Mac build must not change).
    - Tim, by hand, on Fedora KDE and Omarchy: write, format, paste and drag pictures into a message, spelling, send and drafts; open HTML newsletters in light and dark themes, click links, folds, Reply and attachments; the composer window comes to the front when it opens.
 
