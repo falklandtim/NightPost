@@ -42,7 +42,7 @@ The code should explain itself to the next person or agent who opens it cold.
 - **Every file starts with a `//!` summary** of what it does and, for anything non-obvious, how it's designed.
 - **Every public item gets a `///` doc comment**: what it is or does, what it returns, and anything surprising (blocking, network, demo behaviour).
 - **Comments say why, not what.** "Gmail's Important folder duplicates INBOX, so skip it", not "skip Important".
-- **The README changes in the same commit as the behaviour.** It's the user manual. Nothing in it may go stale.
+- **The README and the manual change in the same commit as the behaviour.** The README lists every feature; `docs/manual/` explains how to use NightPost, page by page, for Mac and Linux. Nothing in either may go stale.
 - **`docs/architecture.md` changes when the structure does:** a new thread, process, module, table or synced record.
 - **Plain English, British spelling** (colour, behaviour), short sentences, in UI text, docs and comments alike.
 
@@ -118,6 +118,7 @@ On a small Linux machine (4 GB), build with `CARGO_BUILD_JOBS=2`, and run long b
 | Read | For |
 |---|---|
 | `README.md` | What NightPost does, for users: every feature, the MCP server, snooze sync, known issues |
+| `docs/manual/` | The user manual: installing, accounts, reading, organising, writing, shortcuts, preferences, troubleshooting |
 | `docs/architecture.md` | How it fits together: crates, threads, processes, data, sync |
 | `docs/code-audit.md` | The audit process and each audit's results |
 | `docs/ios.md` | The iPhone app: plan, decisions and progress |

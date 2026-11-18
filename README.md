@@ -3,6 +3,8 @@
 A fast, native email client written in Rust, inspired by [Mailspring](https://github.com/foundry376/mailspring).
 It has one binary with no Electron, a local SQLite cache and a built-in MCP server.
 
+**New to NightPost? Read [the manual](docs/manual/README.md)**: how to install it, add your accounts and use it, on the Mac and on Linux. This README lists every feature in detail.
+
 ## Features
 
 - **Gmail, iCloud and any IMAP/SMTP account.** Presets for Gmail, iCloud, Outlook, Yahoo and Fastmail; passwords are kept in the macOS Keychain (or the Windows/Linux equivalent).
