@@ -5,7 +5,8 @@
 //! of the window lives in its own module, as more `impl NightPostApp` blocks:
 //!
 //! - `sidebar`: accounts and folders
-//! - `list`: the message list, its rows, swipes and menus
+//! - `list`: the message list, its rows and menus
+//! - `swipe`: swiping a row sideways: its buttons, motion and actions
 //! - `reader`: the open conversation
 //! - `toolbar`: the toolbar and its pop-ups
 //! - `sheets`: dialogs, sheets and the other windows
@@ -37,7 +38,10 @@ mod list;
 mod reader;
 mod sheets;
 mod sidebar;
+mod swipe;
 mod toolbar;
+
+use swipe::{Swipe, SwipePhase};
 use input::*;
 use reader::*;
 use sheets::*;
@@ -130,33 +134,6 @@ impl ListFilter {
             ListFilter::Pinned => "is:pinned",
             ListFilter::Attachments => "has:attachment",
         }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SwipePhase {
-    /// Following two-finger trackpad scrolling.
-    Trackpad,
-    /// Following a mouse drag.
-    Drag,
-    /// Fingers lifted / mouse released: decide whether to act.
-    Released,
-    /// Sliding back into place.
-    Settling,
-}
-
-/// A conversation being swiped sideways in the list.
-struct Swipe {
-    account_id: AccountId,
-    thread_key: String,
-    offset: f32,
-    phase: SwipePhase,
-    last: Instant,
-}
-
-impl Swipe {
-    fn new(t: &ThreadSummary, phase: SwipePhase, offset: f32) -> Self {
-        Self { account_id: t.account_id, thread_key: t.thread_key.clone(), offset, phase, last: Instant::now() }
     }
 }
 
@@ -411,6 +388,9 @@ pub struct NightPostApp {
     /// Keys pressed in the web view, fed to egui next frame.
     pending_input: Vec<egui::Event>,
     swipe: Option<Swipe>,
+    /// A row whose right-click menu should open at this point when the
+    /// list next draws it (a swipe's More button).
+    row_menu_for: Option<(AccountId, String, egui::Pos2)>,
     last_wheel_x: Option<Instant>,
     /// Initial width of the message list (it's resizable afterwards).
     list_default_width: f32,
@@ -597,6 +577,7 @@ impl NightPostApp {
             remote_images: HashSet::new(),
             pending_input: vec![],
             swipe: None,
+            row_menu_for: None,
             last_wheel_x: None,
             list_default_width: 400.0,
             picker_query: String::new(),

@@ -131,23 +131,10 @@ impl NightPostApp {
 
     pub(super) fn thread_list(&mut self, ctx: &egui::Context) {
         let col = self.colors.clone();
-        // Two-finger trackpad swipes arrive as horizontal wheel deltas.
-        let (wheel_x, wheel_y) = ctx.input(|i| {
-            i.events.iter().fold((0.0_f32, 0.0_f32), |acc, e| match e {
-                egui::Event::MouseWheel { unit, delta, .. } => {
-                    let k = match unit {
-                        egui::MouseWheelUnit::Point => 1.0,
-                        egui::MouseWheelUnit::Line => 24.0,
-                        egui::MouseWheelUnit::Page => 400.0,
-                    };
-                    (acc.0 + delta.x * k, acc.1 + delta.y * k)
-                }
-                _ => acc,
-            })
-        });
+        let wheel = wheel_delta(ctx);
         let now = Instant::now();
         let fresh_gesture = self.last_wheel_x.is_none_or(|t| now.duration_since(t) > Duration::from_millis(150));
-        if wheel_x != 0.0 {
+        if wheel.x != 0.0 {
             self.last_wheel_x = Some(now);
         }
         let mut commit: Option<(AccountId, String, SwipeAction)> = None;
@@ -166,14 +153,18 @@ impl NightPostApp {
                     return;
                 }
                 let width = ui.available_width();
-                let threshold = (width * 0.3).clamp(80.0, 140.0);
                 let settings = self.list_settings;
                 let show_quick = settings.quick_actions && width >= QUICK_ACTIONS_MIN_WIDTH;
 
-                commit = self.advance_swipe(ctx, wheel_x, now, threshold);
+                commit = self.advance_swipe(ctx, wheel, now, width);
                 let swiping = self.swipe.is_some();
+                // Two-finger sideways scrolling is the swipe, not the list's.
+                let tracking = self.swipe.as_ref().is_some_and(|s| s.phase == SwipePhase::Trackpad);
+                // A click that shut an open row does only that.
+                let tapped_shut = self.swipe.as_ref().is_some_and(|s| s.tapped_shut);
 
                 let row_h = ROW_H;
+                let frame = RowFrame { col: col.clone(), wheel, fresh_gesture, swiping, tapped_shut, show_quick, all_tabs: Vec::new() };
                 let mut clicked = None;
                 let mut row_pick: Option<RowPick> = None;
                 let all_tabs: Vec<(u8, String)> = nightpost_core::category::ALL
@@ -181,12 +172,13 @@ impl NightPostApp {
                     .map(|c| (*c, nightpost_core::category::label(*c).to_string()))
                     .chain(self.store.tabs().unwrap_or_default())
                     .collect();
+                let frame = RowFrame { all_tabs, ..frame };
                 let mut toggle_pinned = false;
                 let grouped = self.selection != Selection::Snoozed;
                 let layout = list_layout(&self.rows, grouped, self.hidden_pinned, Utc::now());
                 let total = layout.last().map(|(y, h, _)| y + h).unwrap_or(0.0) + 12.0;
                 self.list_top = ui.cursor().top();
-                egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_source(egui::scroll_area::ScrollSource { mouse_wheel: !swiping, ..egui::scroll_area::ScrollSource::ALL }).show_viewport(ui, |ui, viewport| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_source(egui::scroll_area::ScrollSource { mouse_wheel: !tracking, ..egui::scroll_area::ScrollSource::ALL }).show_viewport(ui, |ui, viewport| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     let width = ui.available_width();
                     let origin = ui.max_rect().min;
@@ -205,104 +197,21 @@ impl NightPostApp {
                             }
                             ListItem::Row(i) => *i,
                         };
-                        let t = self.rows[i].t.clone();
-                        let snoozed_until = self.rows[i].snoozed_until;
                         let rect = egui::Rect::from_min_size(origin + egui::vec2(0.0, *y), egui::vec2(width, row_h));
-                        let resp = ui.interact(rect, ui.id().with(("row", t.account_id, &t.thread_key)), Sense::click_and_drag());
-                        if self.selected == Some(i) && ui.ctx().input(|inp| inp.key_pressed(Key::ArrowDown) || inp.key_pressed(Key::ArrowUp) || inp.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "j" || t == "k"))) {
-                            ui.scroll_to_rect(rect, None);
-                        }
-                        let is_this = |s: &Swipe| s.account_id == t.account_id && s.thread_key == t.thread_key;
-
-                        // Start a swipe: a fresh, mostly-horizontal trackpad gesture over this row…
-                        if self.swipe.is_none() && resp.contains_pointer() && fresh_gesture && wheel_x.abs() > wheel_y.abs() && wheel_x.abs() > 0.5 {
-                            self.swipe = Some(Swipe::new(&t, SwipePhase::Trackpad, wheel_x));
-                        }
-                        // …or a mouse drag: sideways swipes, up/down picks the
-                        // conversation up to drop on a folder in the sidebar.
-                        if resp.dragged() && self.dragging.is_none() {
-                            let dx = resp.drag_delta().x;
-                            let (origin, at) = ui.ctx().input(|inp| (inp.pointer.press_origin(), inp.pointer.interact_pos()));
-                            let moved = match (origin, at) {
-                                (Some(o), Some(p)) => p - o,
-                                _ => egui::Vec2::ZERO,
-                            };
-                            // Dragged out of the list into the sidebar: that's a move too.
-                            let into_sidebar = self.show_sidebar && at.is_some_and(|p| p.x < self.sidebar_right);
-                            let pick_up = |s: &mut Self| {
-                                s.swipe = None;
-                                let key = (t.account_id, t.thread_key.clone());
-                                s.dragging = Some(if s.is_marked(key.0, &key.1) { s.marked.clone() } else { vec![key] });
-                            };
-                            match &mut self.swipe {
-                                Some(s) if is_this(s) && into_sidebar => pick_up(self),
-                                Some(s) if is_this(s) => {
-                                    s.phase = SwipePhase::Drag;
-                                    s.offset += dx;
-                                }
-                                None if moved.length() >= 6.0 && moved.y.abs() > moved.x.abs() => pick_up(self),
-                                None if moved.length() >= 6.0 => self.swipe = Some(Swipe::new(&t, SwipePhase::Drag, moved.x)),
-                                _ => {}
-                            }
-                        }
-                        if resp.drag_stopped() {
-                            if let Some(s) = &mut self.swipe {
-                                if is_this(s) {
-                                    s.phase = SwipePhase::Released;
-                                }
-                            }
-                        }
-                        let mut offset = self.swipe.as_ref().filter(|s| is_this(s)).map(|s| s.offset).unwrap_or(0.0);
-                        // A side with no action doesn't move.
-                        if (offset > 0.0 && settings.swipe_right == SwipeAction::Nothing) || (offset < 0.0 && settings.swipe_left == SwipeAction::Nothing) {
-                            offset = 0.0;
-                        }
-                        offset = offset.clamp(-rect.width() * 0.85, rect.width() * 0.85);
-
-                        let p = ui.painter_at(rect);
-                        if offset != 0.0 {
-                            let action = if offset > 0.0 { settings.swipe_right } else { settings.swipe_left };
-                            paint_swipe_under(&p, &col, rect, offset, action, offset.abs() >= threshold, &t);
-                        }
-                        let rect_c = rect.translate(egui::vec2(offset, 0.0));
-
-                        let selected = self.selected == Some(i) || self.is_marked(t.account_id, &t.thread_key);
-                        let hovered = resp.contains_pointer() && !swiping;
-                        let look = row_look(&col, selected, hovered, &t);
-                        // Full-width rows with a hairline between them.
-                        p.rect_filled(rect_c, 0.0, look.bg);
-                        p.hline(rect_c.x_range(), rect_c.bottom() - style::DIVIDER_WIDTH / 2.0, egui::Stroke::new(style::DIVIDER_WIDTH, col.list_border));
-                        let rect = rect_c;
-                        self.paint_row(&p, rect, &t, snoozed_until, &look);
-
-                        // Quick actions on hover, in a wide enough list.
-                        if show_quick && hovered {
-                            if let Some(act) = quick_actions(ui, &col, rect, &t, i, &look) {
-                                quick = Some((t.account_id, t.thread_key.clone(), act));
-                            }
-                        }
-
-                        if resp.clicked() {
+                        let out = self.list_row(ui, i, rect, &frame);
+                        if out.clicked {
                             clicked = Some(i);
                         }
-                        resp.context_menu(|ui| {
-                            if let Some(pick) = self.row_menu(ui, &t, &all_tabs) {
-                                row_pick = Some(pick);
-                            }
-                        });
-                    }
-                });
-                if let Some(i) = clicked {
-                    if quick.is_none() {
-                        let m = ctx.input(|i| i.modifiers);
-                        if m.command {
-                            self.toggle_mark(i);
-                        } else if m.shift {
-                            self.mark_range(i);
-                        } else {
-                            self.select(i);
+                        if out.act.is_some() {
+                            quick = out.act;
+                        }
+                        if out.pick.is_some() {
+                            row_pick = out.pick;
                         }
                     }
+                });
+                if let (Some(i), None) = (clicked, &quick) {
+                    self.click_row(ctx, i);
                 }
                 if toggle_pinned {
                     self.list_settings.hide_pinned = !self.list_settings.hide_pinned;
@@ -318,6 +227,66 @@ impl NightPostApp {
         }
     }
 
+
+    /// A row clicked: ⌘ adds or removes it from the selection, Shift selects
+    /// a range, and a plain click opens it.
+    fn click_row(&mut self, ctx: &egui::Context, i: usize) {
+        let m = ctx.input(|i| i.modifiers);
+        if m.command {
+            self.toggle_mark(i);
+        } else if m.shift {
+            self.mark_range(i);
+        } else {
+            self.select(i);
+        }
+    }
+
+    /// Draw one conversation's row and handle what's done to it: clicks,
+    /// swipes, hover quick actions and its right-click menu.
+    fn list_row(&mut self, ui: &mut egui::Ui, i: usize, rect: egui::Rect, f: &RowFrame) -> RowOut {
+        let mut out = RowOut::default();
+        let t = self.rows[i].t.clone();
+        let snoozed_until = self.rows[i].snoozed_until;
+        let resp = ui.interact(rect, ui.id().with(("row", t.account_id, &t.thread_key)), Sense::click_and_drag());
+        if self.selected == Some(i) && ui.ctx().input(|inp| inp.key_pressed(Key::ArrowDown) || inp.key_pressed(Key::ArrowUp) || inp.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "j" || t == "k"))) {
+            ui.scroll_to_rect(rect, None);
+        }
+        let offset = self.swipe_input(ui, &resp, &t, f.wheel, f.fresh_gesture);
+        let p = ui.painter_at(rect);
+        if offset != 0.0 {
+            if let Some(act) = self.swipe_under(ui, &p, &f.col, rect, offset, &t) {
+                out.act = Some((t.account_id, t.thread_key.clone(), act));
+            }
+        }
+        let rect_c = rect.translate(egui::vec2(offset, 0.0));
+
+        let selected = self.selected == Some(i) || self.is_marked(t.account_id, &t.thread_key);
+        let hovered = resp.contains_pointer() && !f.swiping;
+        let look = row_look(&f.col, selected, hovered, &t);
+        // Full-width rows with a hairline between them.
+        p.rect_filled(rect_c, 0.0, look.bg);
+        p.hline(rect_c.x_range(), rect_c.bottom() - style::DIVIDER_WIDTH / 2.0, egui::Stroke::new(style::DIVIDER_WIDTH, f.col.list_border));
+        let rect = rect_c;
+        self.paint_row(&p, rect, &t, snoozed_until, &look);
+
+        // Quick actions on hover, in a wide enough list.
+        if f.show_quick && hovered {
+            if let Some(act) = quick_actions(ui, &f.col, rect, &t, i, &look) {
+                out.act = Some((t.account_id, t.thread_key.clone(), act));
+            }
+        }
+
+        out.clicked = resp.clicked() && !f.tapped_shut;
+        if let Some(pick) = self.more_menu(ui, &resp, &t, &f.all_tabs) {
+            out.pick = Some(pick);
+        }
+        resp.context_menu(|ui| {
+            if let Some(pick) = self.row_menu(ui, &t, &f.all_tabs) {
+                out.pick = Some(pick);
+            }
+        });
+        out
+    }
 
     /// What the list says when it has nothing to show.
     fn empty_list(&self, ui: &mut egui::Ui, col: &Colors) {
@@ -335,50 +304,6 @@ impl NightPostApp {
             ui.label(RichText::new(icon).size(36.0));
             ui.label(RichText::new(text).color(col.subtle));
         });
-    }
-
-    /// Move the current swipe along: follow the trackpad, release after a
-    /// short pause (when the fingers, and momentum, stop), then settle back.
-    /// Returns the action to run when a release passed the threshold.
-    fn advance_swipe(&mut self, ctx: &egui::Context, wheel_x: f32, now: Instant, threshold: f32) -> Option<(AccountId, String, SwipeAction)> {
-        let settings = self.list_settings;
-        let mut commit = None;
-        if let Some(s) = &mut self.swipe {
-            match s.phase {
-                SwipePhase::Trackpad => {
-                    if wheel_x != 0.0 {
-                        s.offset += wheel_x;
-                        s.last = now;
-                    } else if now.duration_since(s.last) > Duration::from_millis(140) {
-                        s.phase = SwipePhase::Released;
-                    }
-                }
-                SwipePhase::Settling => {
-                    s.offset *= 0.55;
-                }
-                SwipePhase::Drag | SwipePhase::Released => {}
-            }
-        }
-        if let Some(s) = &mut self.swipe {
-            if s.phase == SwipePhase::Released {
-                let action = if s.offset > 0.0 { settings.swipe_right } else { settings.swipe_left };
-                if s.offset.abs() >= threshold && action != SwipeAction::Nothing {
-                    commit = Some((s.account_id, s.thread_key.clone(), action));
-                    if matches!(action, SwipeAction::Archive | SwipeAction::Trash) {
-                        // The row is going away; don't animate it back.
-                        s.offset = 0.0;
-                    }
-                }
-                s.phase = SwipePhase::Settling;
-            }
-        }
-        if self.swipe.as_ref().is_some_and(|s| s.phase == SwipePhase::Settling && s.offset.abs() < 1.0) {
-            self.swipe = None;
-        }
-        if self.swipe.is_some() {
-            ctx.request_repaint();
-        }
-        commit
     }
 
     /// Draw a conversation's row: the sender's picture, names and date, the
@@ -471,7 +396,7 @@ impl NightPostApp {
 
     /// A conversation's right-click menu. Returns what was picked; the
     /// caller applies it with [`Self::apply_row_pick`] once the list is drawn.
-    fn row_menu(&mut self, ui: &mut egui::Ui, t: &ThreadSummary, all_tabs: &[(u8, String)]) -> Option<RowPick> {
+    pub(super) fn row_menu(&mut self, ui: &mut egui::Ui, t: &ThreadSummary, all_tabs: &[(u8, String)]) -> Option<RowPick> {
         let mut pick = None;
         if ui.button(if t.pinned { "Unpin" } else { "Pin to top" }).clicked() {
             pick = Some(RowPick::TogglePin(t.account_id, t.thread_key.clone()));
@@ -566,29 +491,6 @@ impl NightPostApp {
                     self.remove_row(a, &k);
                 }
                 self.toast(format!("Created “{name}”"), false);
-            }
-        }
-    }
-
-    /// Run a swipe / quick action on any conversation, not just the open one.
-    pub(super) fn thread_action(&mut self, ctx: &egui::Context, a: AccountId, k: &str, act: SwipeAction) {
-        match act {
-            SwipeAction::Nothing => {}
-            SwipeAction::Archive => self.move_thread(a, k, FolderRole::Archive),
-            SwipeAction::Trash => self.move_thread(a, k, FolderRole::Trash),
-            SwipeAction::Pin => self.toggle_pin(a, k),
-            SwipeAction::ToggleRead => {
-                let unread = self.rows.iter().find(|r| r.t.account_id == a && r.t.thread_key == k).map(|r| r.t.unread).unwrap_or(false);
-                self.set_row_unread(a, k, !unread);
-                self.did(if unread { "Marked as read" } else { "Marked as unread" }, Undo::Unread { items: vec![(a, k.to_string(), unread)] });
-                self.reload();
-            }
-            SwipeAction::Snooze => {
-                // Open the conversation and pop the snooze menu in the toolbar.
-                if let Some(i) = self.rows.iter().position(|r| r.t.account_id == a && r.t.thread_key == k) {
-                    self.select(i);
-                    ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("snooze_open"), true));
-                }
             }
         }
     }
@@ -746,40 +648,6 @@ pub(super) fn section_header(ui: &mut egui::Ui, col: &Colors, rect: egui::Rect, 
     let r = ui.interact(br, ui.id().with(("section", title)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
     p.galley(egui::pos2(br.left() + 4.0, br.top() + 4.0), g, if r.hovered() { col.text } else { col.subtle });
     r.clicked()
-}
-
-pub(super) fn swipe_color(col: &Colors, a: SwipeAction) -> egui::Color32 {
-    match a {
-        SwipeAction::Archive => col.success,
-        SwipeAction::Trash => col.error,
-        SwipeAction::Snooze => col.snooze,
-        SwipeAction::Pin => col.accent,
-        SwipeAction::ToggleRead => col.unread,
-        SwipeAction::Nothing => col.list,
-    }
-}
-
-pub(super) fn swipe_icon(a: SwipeAction) -> Icon {
-    match a {
-        SwipeAction::Archive => Icon::Done,
-        SwipeAction::Trash => Icon::Trash,
-        SwipeAction::Snooze => Icon::Snooze,
-        SwipeAction::Pin => Icon::PinFilled,
-        SwipeAction::ToggleRead | SwipeAction::Nothing => Icon::Envelope,
-    }
-}
-
-pub(super) fn swipe_label(a: SwipeAction, unread: bool, pinned: bool) -> &'static str {
-    match a {
-        SwipeAction::Archive => "Archive",
-        SwipeAction::Trash => "Trash",
-        SwipeAction::Snooze => "Snooze",
-        SwipeAction::Pin if pinned => "Unpin",
-        SwipeAction::Pin => "Pin",
-        SwipeAction::ToggleRead if unread => "Mark read",
-        SwipeAction::ToggleRead => "Mark unread",
-        SwipeAction::Nothing => "",
-    }
 }
 
 /// The list's "who" line, Canary style: the latest sender first (shown in
@@ -948,20 +816,43 @@ fn quick_actions(ui: &mut egui::Ui, col: &Colors, rect: egui::Rect, t: &ThreadSu
     r.iter().zip(acts).find(|(resp, _)| resp.clicked()).map(|(_, act)| act)
 }
 
-/// Under a row being swiped: the action's colour (paler until it's far
-/// enough to take effect), its icon and its name on the side it's going.
-fn paint_swipe_under(p: &egui::Painter, col: &Colors, rect: egui::Rect, offset: f32, action: SwipeAction, armed: bool, t: &ThreadSummary) {
-    let base = swipe_color(col, action);
-    p.rect_filled(rect, 0.0, if armed { base } else { style::blend(base, col.list, 0.55) });
-    let label = swipe_label(action, t.unread, t.pinned);
-    let fg = egui::Color32::WHITE;
-    let galley = p.layout_no_wrap(label.to_string(), egui::FontId::proportional(13.0), fg);
-    let cy = rect.center().y;
-    let (icon_x, text_x) = if offset > 0.0 {
-        (rect.left() + 26.0, rect.left() + 44.0)
-    } else {
-        (rect.right() - 26.0, rect.right() - 44.0 - galley.size().x)
-    };
-    icons::paint(p, egui::pos2(icon_x, cy), 18.0, swipe_icon(action), fg);
-    p.galley(egui::pos2(text_x, cy - galley.size().y / 2.0), galley, fg);
+/// What every row in one drawing of the list shares.
+struct RowFrame {
+    col: Colors,
+    /// This frame's scrolling: sideways, from a trackpad, is a swipe.
+    wheel: egui::Vec2,
+    /// The scrolling starts a new gesture rather than continuing one.
+    fresh_gesture: bool,
+    swiping: bool,
+    /// A click shut an open swiped row: it doesn't also select one.
+    tapped_shut: bool,
+    show_quick: bool,
+    all_tabs: Vec<(u8, String)>,
+}
+
+/// What happened to a row.
+#[derive(Default)]
+struct RowOut {
+    clicked: bool,
+    /// A swipe button or quick action clicked.
+    act: Option<(AccountId, String, SwipeAction)>,
+    pick: Option<RowPick>,
+}
+
+/// This frame's scrolling in points. Two-finger trackpad swipes arrive as
+/// horizontal wheel deltas.
+fn wheel_delta(ctx: &egui::Context) -> egui::Vec2 {
+    ctx.input(|i| {
+        i.events.iter().fold(egui::Vec2::ZERO, |acc, e| match e {
+            egui::Event::MouseWheel { unit, delta, .. } => {
+                let k = match unit {
+                    egui::MouseWheelUnit::Point => 1.0,
+                    egui::MouseWheelUnit::Line => 24.0,
+                    egui::MouseWheelUnit::Page => 400.0,
+                };
+                acc + *delta * k
+            }
+            _ => acc,
+        })
+    })
 }

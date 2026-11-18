@@ -100,7 +100,8 @@ Older copies of NightPost ignore fields they don't know, and may rewrite the sta
 | File | Part |
 |---|---|
 | `app/sidebar.rs` | All Accounts, then each account's folders as a tree |
-| `app/list.rs` | The message list: header, tabs, rows, swipes, hover actions, right-click menu |
+| `app/list.rs` | The message list: header, tabs, rows, hover actions, right-click menu |
+| `app/swipe.rs` | Swiping a row sideways: its buttons, the motion, and running the action |
 | `app/reader.rs` | The open conversation (cards, or the HTML web view), attachments |
 | `app/toolbar.rs` | The toolbar and its pop-ups (Move, Label, More, Snooze calendar) |
 | `app/sheets.rs` | Dialogs and other windows: shortcuts, Sync activity, folders, new tab, Show original, composers, preferences |

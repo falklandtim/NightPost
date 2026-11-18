@@ -7,7 +7,8 @@ use crate::composer::SignatureBook;
 use crate::worker::PushState;
 use nightpost_core::{Account, AccountId, Auth, Signature};
 
-/// What a swipe on a conversation in the list does.
+/// What a swipe on a conversation in the list does: a button revealed by a
+/// shorter swipe, or (the first on each side) what a full swipe does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SwipeAction {
     Nothing,
@@ -16,11 +17,29 @@ pub enum SwipeAction {
     Snooze,
     Pin,
     ToggleRead,
+    /// Open the Move to… picker.
+    Move,
+    /// Open the conversation's right-click menu.
+    More,
+    Star,
+    Spam,
+    Reply,
 }
 
 impl SwipeAction {
-    pub const ALL: [SwipeAction; 6] =
-        [SwipeAction::Archive, SwipeAction::Trash, SwipeAction::Snooze, SwipeAction::Pin, SwipeAction::ToggleRead, SwipeAction::Nothing];
+    pub const ALL: [SwipeAction; 11] = [
+        SwipeAction::Archive,
+        SwipeAction::Trash,
+        SwipeAction::Snooze,
+        SwipeAction::Move,
+        SwipeAction::More,
+        SwipeAction::Pin,
+        SwipeAction::ToggleRead,
+        SwipeAction::Star,
+        SwipeAction::Spam,
+        SwipeAction::Reply,
+        SwipeAction::Nothing,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             SwipeAction::Nothing => "Nothing",
@@ -29,6 +48,11 @@ impl SwipeAction {
             SwipeAction::Snooze => "Snooze",
             SwipeAction::Pin => "Pin / unpin",
             SwipeAction::ToggleRead => "Mark read / unread",
+            SwipeAction::Move => "Move to…",
+            SwipeAction::More => "More…",
+            SwipeAction::Star => "Star / unstar",
+            SwipeAction::Spam => "Report as spam",
+            SwipeAction::Reply => "Reply",
         }
     }
     fn key(self) -> &'static str {
@@ -39,6 +63,11 @@ impl SwipeAction {
             SwipeAction::Snooze => "snooze",
             SwipeAction::Pin => "pin",
             SwipeAction::ToggleRead => "read",
+            SwipeAction::Move => "move",
+            SwipeAction::More => "more",
+            SwipeAction::Star => "star",
+            SwipeAction::Spam => "spam",
+            SwipeAction::Reply => "reply",
         }
     }
     fn parse(s: &str) -> Option<Self> {
@@ -46,13 +75,18 @@ impl SwipeAction {
     }
 }
 
+/// The buttons on one side of a swiped row, outermost first. The first is
+/// what a full swipe does; `Nothing` there turns the side off, and
+/// `Nothing` later is an empty slot.
+pub type SwipeSide = [SwipeAction; 3];
+
 /// Message-list behaviour, saved with the window state.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ListSettings {
     /// Row dragged to the left (reveals the right-hand side).
-    pub swipe_left: SwipeAction,
+    pub swipe_left: SwipeSide,
     /// Row dragged to the right.
-    pub swipe_right: SwipeAction,
+    pub swipe_right: SwipeSide,
     /// Show action buttons when hovering a conversation in a wide list.
     pub quick_actions: bool,
     /// The Pinned section is folded away ("Hide" in its header).
@@ -66,20 +100,63 @@ pub const UNDO_SEND_CHOICES: [u32; 6] = [0, 5, 10, 20, 30, 60];
 
 impl Default for ListSettings {
     fn default() -> Self {
-        Self { swipe_left: SwipeAction::Trash, swipe_right: SwipeAction::Archive, quick_actions: true, hide_pinned: false, undo_send_secs: 10 }
+        Self {
+            swipe_left: [SwipeAction::Trash, SwipeAction::Snooze, SwipeAction::More],
+            swipe_right: [SwipeAction::Archive, SwipeAction::ToggleRead, SwipeAction::Nothing],
+            quick_actions: true,
+            hide_pinned: false,
+            undo_send_secs: 10,
+        }
     }
 }
 
+/// A side's second and third buttons, saved as `snooze+more`.
+fn encode_extras(side: &SwipeSide) -> String {
+    side[1..].iter().filter(|a| **a != SwipeAction::Nothing).map(|a| a.key()).collect::<Vec<_>>().join("+")
+}
+
+/// A side from its saved first action and extras. Settings saved before
+/// sides had several buttons have no extras: they get the default ones,
+/// leaving out the action already first.
+fn decode_side(first: Option<SwipeAction>, extras: Option<&str>, default: SwipeSide) -> SwipeSide {
+    let first = first.unwrap_or(default[0]);
+    let extras: Vec<SwipeAction> = match extras {
+        Some(e) => e.split('+').filter_map(SwipeAction::parse).collect(),
+        None => default[1..].to_vec(),
+    };
+    let mut side = [first, SwipeAction::Nothing, SwipeAction::Nothing];
+    let mut slots = side.iter_mut().skip(1);
+    for a in extras.into_iter().filter(|a| *a != SwipeAction::Nothing && *a != first) {
+        match slots.next() {
+            Some(slot) => *slot = a,
+            None => break,
+        }
+    }
+    side
+}
+
 impl ListSettings {
+    /// The first five fields are the format older builds read (each side's
+    /// full-swipe action first), so an older copy still swipes the same
+    /// way; the extra buttons follow at the end, where it ignores them.
     pub fn encode(&self) -> String {
-        format!("{},{},{},{},{}", self.swipe_left.key(), self.swipe_right.key(), self.quick_actions as u8, self.hide_pinned as u8, self.undo_send_secs)
+        format!(
+            "{},{},{},{},{},{},{}",
+            self.swipe_left[0].key(),
+            self.swipe_right[0].key(),
+            self.quick_actions as u8,
+            self.hide_pinned as u8,
+            self.undo_send_secs,
+            encode_extras(&self.swipe_left),
+            encode_extras(&self.swipe_right),
+        )
     }
     pub fn decode(s: &str) -> Self {
         let mut d = Self::default();
         let parts: Vec<&str> = s.split(',').collect();
         if let [l, r, q, rest @ ..] = parts.as_slice() {
-            d.swipe_left = SwipeAction::parse(l).unwrap_or(d.swipe_left);
-            d.swipe_right = SwipeAction::parse(r).unwrap_or(d.swipe_right);
+            d.swipe_left = decode_side(SwipeAction::parse(l), rest.get(2).copied(), d.swipe_left);
+            d.swipe_right = decode_side(SwipeAction::parse(r), rest.get(3).copied(), d.swipe_right);
             d.quick_actions = *q != "0";
             // Added later: older settings have three fields.
             d.hide_pinned = rest.first().is_some_and(|h| *h == "1");
@@ -590,15 +667,32 @@ fn shortcuts(ui: &mut egui::Ui, col: &Colors) {
 fn list_settings(ui: &mut egui::Ui, col: &Colors, list: &mut ListSettings) {
     ui.label(RichText::new("Swipe actions").strong().size(16.0));
     ui.label(RichText::new("Swipe sideways with two fingers on a trackpad, or drag a conversation with the mouse.").color(col.subtle));
+    ui.label(
+        RichText::new("A short swipe shows the buttons; a full swipe does the first one. Set the first to Nothing to turn that side off.")
+            .small()
+            .color(col.subtle),
+    );
     ui.add_space(6.0);
-    egui::Grid::new("swipes").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
-        for (label, value, salt) in [("Swipe right", &mut list.swipe_right, "sr"), ("Swipe left", &mut list.swipe_left, "sl")] {
+    egui::Grid::new("swipes").num_columns(4).spacing([10.0, 8.0]).show(ui, |ui| {
+        ui.label("");
+        for h in ["Full swipe", "Button 2", "Button 3"] {
+            ui.label(RichText::new(h).small().color(col.subtle));
+        }
+        ui.end_row();
+        for (label, side, salt) in [("Swipe right", &mut list.swipe_right, "sr"), ("Swipe left", &mut list.swipe_left, "sl")] {
             ui.label(label);
-            egui::ComboBox::from_id_salt(salt).selected_text(value.label()).width(200.0).show_ui(ui, |ui| {
-                for a in SwipeAction::ALL {
-                    ui.selectable_value(value, a, a.label());
-                }
-            });
+            let off = side[0] == SwipeAction::Nothing;
+            for (i, value) in side.iter_mut().enumerate() {
+                let shown = if i > 0 && *value == SwipeAction::Nothing { "None" } else { value.label() };
+                ui.add_enabled_ui(i == 0 || !off, |ui| {
+                    egui::ComboBox::from_id_salt((salt, i)).selected_text(shown).width(150.0).show_ui(ui, |ui| {
+                        for a in SwipeAction::ALL {
+                            let name = if i > 0 && a == SwipeAction::Nothing { "None" } else { a.label() };
+                            ui.selectable_value(value, a, name);
+                        }
+                    });
+                });
+            }
             ui.end_row();
         }
     });

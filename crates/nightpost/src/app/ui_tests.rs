@@ -206,6 +206,9 @@ fn renders_every_builtin_theme_and_snoozes() {
             h.state_mut().prefs = Some(Prefs::new(Tab::Mcp));
             h.run_steps(3);
             save(&mut h, "prefs-mcp");
+            h.state_mut().prefs = Some(Prefs::new(Tab::List));
+            h.run_steps(3);
+            save(&mut h, "prefs-list");
         }
     }
 }
@@ -224,45 +227,88 @@ fn swipe_quick_actions_and_composer_window() {
     let before = h.state().rows.len();
     let first = h.state().rows[0].t.thread_key.clone();
 
-    // Mouse drag to the right past the threshold: archive (the default).
-    let start = row_center(&h, 0);
-    h.drag_at(start);
-    h.run_steps(1);
-    for dx in [40.0, 90.0, 140.0, 190.0] {
-        h.hover_at(start + egui::vec2(dx, 0.0));
+    let drag = |h: &mut Harness<'static, NightPostApp>, start: egui::Pos2, to: f32| {
+        h.drag_at(start);
         h.run_steps(1);
-    }
-    save(&mut h, "swipe-right-archive");
-    h.drop_at(start + egui::vec2(190.0, 0.0));
-    h.run_steps(3);
-    assert_eq!(h.state().rows.len(), before - 1, "drag-swipe should archive");
+        for k in 1..=4 {
+            h.hover_at(start + egui::vec2(to * k as f32 / 4.0, 0.0));
+            h.run_steps(1);
+        }
+        h.drop_at(start + egui::vec2(to, 0.0));
+        h.run_steps(4);
+    };
+    let click = |h: &mut Harness<'static, NightPostApp>, at: egui::Pos2| {
+        h.hover_at(at);
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        h.run_steps(4);
+    };
+    let phase = |h: &Harness<'static, NightPostApp>| h.state().swipe.as_ref().map(|s| s.phase);
+
+    // A medium drag to the right leaves the row open on its buttons
+    // (Archive, Read/Unread by default) without doing anything.
+    let start = row_center(&h, 0);
+    drag(&mut h, start, 170.0);
+    assert_eq!(phase(&h), Some(SwipePhase::Open), "a medium swipe opens the buttons");
+    assert_eq!(h.state().rows.len(), before);
+    save(&mut h, "swipe-open-right");
+    // Clicking the row shuts it, and only that: the conversation stays closed.
+    click(&mut h, start + egui::vec2(200.0, 0.0));
+    assert_eq!(phase(&h), None, "a click shuts an open row");
+    assert!(h.state().open.is_none(), "the click that shut it doesn't open the conversation");
+
+    // A full drag to the right: archive, once the row has slid out.
+    drag(&mut h, start, 340.0);
+    h.run_steps(4);
+    assert_eq!(h.state().rows.len(), before - 1, "a full swipe should archive");
     assert!(h.state().rows.iter().all(|r| r.t.thread_key != first));
     assert!(h.state().open.is_none(), "a swipe isn't a click");
     assert!(h.state().toasts.iter().any(|t| t.text == "Archived"));
 
     // A short drag springs back without doing anything.
     let start = row_center(&h, 0);
-    h.drag_at(start);
-    h.run_steps(1);
-    h.hover_at(start - egui::vec2(30.0, 0.0));
-    h.run_steps(1);
-    h.drop_at(start - egui::vec2(30.0, 0.0));
-    h.run_steps(8);
+    drag(&mut h, start, -30.0);
+    h.run_steps(4);
+    assert_eq!(phase(&h), None);
     assert_eq!(h.state().rows.len(), before - 1);
 
-    // Two-finger trackpad swipe to the left: trash.
+    // A two-finger trackpad swipe to the left opens Trash, Snooze and
+    // More; the Trash button (outermost, at the row's right) trashes.
     let target = h.state().rows[1].t.thread_key.clone();
-    h.hover_at(row_center(&h, 1));
+    let c = row_center(&h, 1);
+    h.hover_at(c);
     h.run_steps(1);
     for _ in 0..8 {
         h.event(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(-25.0, 0.0), modifiers: Default::default() });
         h.run_steps(1);
     }
-    save(&mut h, "swipe-left-trash");
     std::thread::sleep(Duration::from_millis(200));
-    h.run_steps(3);
-    assert!(h.state().rows.iter().all(|r| r.t.thread_key != target), "trackpad swipe should trash");
+    h.run_steps(4);
+    assert_eq!(phase(&h), Some(SwipePhase::Open), "fingers lifted part-way: the buttons stay");
+    save(&mut h, "swipe-open-left");
+    let trash = egui::pos2(h.state().list_right - 1.0 - swipe::BUTTON_W / 2.0, c.y - 9.0);
+    click(&mut h, trash);
+    h.run_steps(4);
+    assert!(h.state().rows.iter().all(|r| r.t.thread_key != target), "the Trash button should trash");
     assert_eq!(h.state().rows.len(), before - 2);
+
+    // More (the innermost button) opens the row's right-click menu.
+    let c = row_center(&h, 0);
+    h.hover_at(c);
+    h.run_steps(1);
+    for _ in 0..8 {
+        h.event(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(-25.0, 0.0), modifiers: Default::default() });
+        h.run_steps(1);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    h.run_steps(4);
+    let more = egui::pos2(h.state().list_right - 1.0 - swipe::BUTTON_W * 2.5, c.y - 9.0);
+    click(&mut h, more);
+    assert!(egui::Popup::is_id_open(&h.ctx, swipe::MORE_MENU.into()), "More opens the menu");
+    save(&mut h, "swipe-more-menu");
+    assert_eq!(h.state().rows.len(), before - 2, "More does nothing by itself");
 
     // Hover quick actions in the wide list: click the pin (5th button).
     let c = row_center(&h, 2);
