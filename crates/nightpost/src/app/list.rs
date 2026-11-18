@@ -845,10 +845,21 @@ pub(super) fn unread_wash(col: &Colors, hovered: bool) -> egui::Color32 {
     style::blend(col.sidebar_active, col.list, if hovered { base + 0.25 } else { base })
 }
 
-/// A pinned row's background: a pale wash of the star's yellow.
-pub(super) fn pinned_wash(col: &Colors, hovered: bool) -> egui::Color32 {
-    let base = if list_is_dark(col) { 0.08 } else { 0.10 };
-    style::blend(col.star, col.list, if hovered { base + 0.06 } else { base })
+/// The colour pinned rows are washed with: a violet, the same in every
+/// theme (themes have no colour of their own for it).
+const PINNED_TINT: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x5c, 0xf6);
+
+/// A pinned row's background: a pale wash of [`PINNED_TINT`], deeper when
+/// it has unread mail. Pinned rows don't get the unread wash, so without
+/// this, new mail in a pinned conversation showed only as the small dot.
+pub(super) fn pinned_wash(col: &Colors, hovered: bool, unread: bool) -> egui::Color32 {
+    let base = match (list_is_dark(col), unread) {
+        (true, false) => 0.08,
+        (false, false) => 0.10,
+        (true, true) => 0.18,
+        (false, true) => 0.24,
+    };
+    style::blend(PINNED_TINT, col.list, if hovered { base + 0.06 } else { base })
 }
 
 /// What was picked in a conversation's right-click menu.
@@ -879,8 +890,9 @@ pub(super) struct RowLook {
 
 /// A row's colours. A soft highlight (Moonlit) keeps the normal text
 /// colours; a strong one (most Mailspring themes) inverts them. Pinned rows
-/// get a pale wash of the star's yellow, unread ones a lighter wash of the
-/// sidebar's highlight (full strength would look like the selected row).
+/// get a pale wash of [`PINNED_TINT`] (deeper when unread), other unread
+/// ones a lighter wash of the sidebar's highlight (full strength would look
+/// like the selected row).
 fn row_look(col: &Colors, selected: bool, hovered: bool, t: &ThreadSummary) -> RowLook {
     let soft = selected && col.p.list_focused.over(col.p.list).contrast(col.p.list) < 1.6;
     let (bg, fg, sub) = if selected && !soft {
@@ -888,7 +900,7 @@ fn row_look(col: &Colors, selected: bool, hovered: bool, t: &ThreadSummary) -> R
     } else if selected {
         (col.list_focused, col.list_focused_text, col.subtle)
     } else if t.pinned {
-        (pinned_wash(col, hovered), col.text, col.subtle)
+        (pinned_wash(col, hovered, t.unread), col.text, col.subtle)
     } else if t.unread {
         (unread_wash(col, hovered), col.text, col.subtle)
     } else if hovered {

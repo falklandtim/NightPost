@@ -22,6 +22,9 @@ fn unread_rows_are_tinted() {
         assert!(h.state().rows.iter().any(|r| r.t.unread), "unread mail in the demo inbox");
         let read = h.state().rows.iter().find(|r| !r.t.unread).map(|r| (r.t.account_id, r.t.thread_key.clone())).unwrap();
         h.state_mut().toggle_pin(read.0, &read.1);
+        // A second unread conversation, so one stays unpinned.
+        let unread = h.state().rows.iter().filter(|r| r.t.unread).nth(1).map(|r| (r.t.account_id, r.t.thread_key.clone())).unwrap();
+        h.state_mut().toggle_pin(unread.0, &unread.1);
         h.state_mut().reload();
         h.run();
         save(&mut h, &format!("unread-rows-{name}"));
@@ -31,10 +34,16 @@ fn unread_rows_are_tinted() {
             let want = unread_wash(&col, false);
             let near = |p: &image::Rgba<u8>| (0..3).all(|c| (p[c] as i32 - want.to_array()[c] as i32).abs() <= 2);
             assert!((0..img.height()).any(|y| near(img.get_pixel(x, y))), "unread rows use the sidebar's highlight ({name})");
-            let want = pinned_wash(&col, false);
-            let near = |p: &image::Rgba<u8>| (0..3).all(|c| (p[c] as i32 - want.to_array()[c] as i32).abs() <= 2);
-            assert!((0..img.height()).any(|y| near(img.get_pixel(x, y))), "pinned rows are yellow ({name})");
+            for (unread, what) in [(false, "read"), (true, "unread")] {
+                let want = pinned_wash(&col, false, unread);
+                let near = |p: &image::Rgba<u8>| (0..3).all(|c| (p[c] as i32 - want.to_array()[c] as i32).abs() <= 2);
+                assert!((0..img.height()).any(|y| near(img.get_pixel(x, y))), "{what} pinned rows are yellow ({name})");
+            }
         }
+        // New mail in a pinned conversation stands out from the read ones,
+        // as an unread row does from a read one: a stronger wash.
+        let away = |c: egui::Color32| (0..3).map(|i| (c.to_array()[i] as i32 - col.list.to_array()[i] as i32).abs()).sum::<i32>();
+        assert!(away(pinned_wash(&col, false, true)) > away(pinned_wash(&col, false, false)) + 20, "unread pinned rows are a deeper yellow ({name})");
     }
 }
 
