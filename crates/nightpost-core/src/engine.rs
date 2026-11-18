@@ -826,21 +826,38 @@ pub fn send(store: &Store, account: &Account, out: &OutgoingMessage) -> Result<S
         Auth::Google => crate::oauth::access_token(account)?,
     };
     let (id, raw) = smtp::send(account, &secret, out)?;
-    if !smtp::server_saves_sent_copy(account) {
-        if let Some(sent) = store.folder_by_role(account.id, FolderRole::Sent)? {
-            match connect(account) {
-                Ok(mut s) => {
-                    if let Err(e) = s.append_with_flags(&sent.path, &raw, &[imap::types::Flag::Seen]) {
-                        log::warn!("could not save to Sent: {e}");
-                    }
-                    let _ = sync_folder(store, &mut s, account, &sent);
-                    let _ = s.logout();
-                }
-                Err(e) => log::warn!("could not save to Sent: {e}"),
+    if let Some(sent) = store.folder_by_role(account.id, FolderRole::Sent)? {
+        match connect(account) {
+            Ok(mut s) => {
+                file_in_sent(store, &mut s, account, &sent, &id, &raw);
+                let _ = s.logout();
             }
+            Err(e) => log::warn!("could not reach Sent after sending: {e}"),
         }
     }
     Ok(id)
+}
+
+/// After sending, put a copy in Sent if the server won't, then fetch Sent so
+/// the reply shows in its conversation straight away. Gmail files its own
+/// copy, and push only watches the Inbox, so without this a reply waited
+/// for the next full check (every few minutes) to appear. Gmail may file
+/// the copy a moment after SMTP accepts the message, so look once more if
+/// it isn't there yet. Failures are only logged: the mail has gone, and the
+/// next sync brings Sent up to date anyway.
+fn file_in_sent(store: &Store, s: &mut Session, account: &Account, sent: &Folder, id: &str, raw: &[u8]) {
+    let server_files = smtp::server_saves_sent_copy(account);
+    if !server_files {
+        if let Err(e) = s.append_with_flags(&sent.path, raw, &[imap::types::Flag::Seen]) {
+            log::warn!("could not save to Sent: {e}");
+        }
+    }
+    let _ = sync_folder(store, s, account, sent);
+    let filed = || store.copy_in_role(account.id, id, FolderRole::Sent).ok().flatten().is_some();
+    if server_files && !filed() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = sync_folder(store, s, account, sent);
+    }
 }
 
 /// Save a draft in the account's Drafts folder on the server, where other

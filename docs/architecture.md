@@ -21,7 +21,7 @@ nightpost (binary)
 ├── mac_web.rs         macOS: WKWebView set up for those two (messages, links, background)
 ├── prefs.rs, onboarding.rs, avatars.rs, contacts.rs, attachments.rs, …
 └── uses nightpost-core
-        ├── store/         SQLite: accounts, folders, mail, snoozes, pins, tabs
+        ├── store/         SQLite: accounts, folders, mail, snoozes, pins, tabs (a file each)
         ├── engine.rs      IMAP sync and every server-side action
         ├── idle.rs        push mail (IMAP IDLE)
         ├── snooze_sync.rs the state kept on each server (snoozes, pins, tabs)
