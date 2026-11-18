@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- What app stores (GNOME Software, KDE Discover, Flathub) show about NightPost. -->
+<component type="desktop-application">
+  <id>co.timson.NightPost</id>
+  <name>NightPost</name>
+  <summary>A fast, native email client</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="co.timson">
+    <name>Tim Morrison</name>
+  </developer>
+  <description>
+    <p>NightPost is an email client for Gmail, iCloud and any IMAP account, written in Rust.</p>
+    <ul>
+      <li>One inbox for every account, with Primary, Promotions and Social tabs</li>
+      <li>Snooze and pin conversations, synced between your computers</li>
+      <li>Swipe a conversation to archive, trash, snooze or move it</li>
+      <li>HTML email with trackers blocked, and a formatted composer</li>
+      <li>A built-in MCP server, so an assistant can read your mail and save drafts for you to send</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">co.timson.NightPost.desktop</launchable>
+  <url type="homepage">https://github.com/falklandtim/NightPost</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-19"/>
+  </releases>
+</component>

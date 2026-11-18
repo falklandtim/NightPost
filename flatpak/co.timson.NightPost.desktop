@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NightPost
+GenericName=Mail Client
+Comment=A fast, native email client
+Exec=nightpost
+Icon=co.timson.NightPost
+Terminal=false
+Categories=Network;Email;
+Keywords=mail;email;imap;inbox;
+StartupWMClass=co.timson.NightPost

@@ -617,6 +617,10 @@ fn copy_block(ui: &mut egui::Ui, col: &Colors, text: &str) {
 
 fn mcp(ui: &mut egui::Ui, col: &Colors) {
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "nightpost".into());
+    // How it's started from outside: a Flatpak's own path only exists inside it.
+    let flatpak_id = std::env::var("FLATPAK_ID").ok();
+    let (program, args) = nightpost_core::flatpak::mcp_launch(&exe, flatpak_id.as_deref());
+    let args_json = args.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(", ");
     ui.label(RichText::new("Built-in MCP server").strong().size(16.0));
     ui.label(
         RichText::new(
@@ -628,13 +632,13 @@ fn mcp(ui: &mut egui::Ui, col: &Colors) {
     );
     ui.add_space(10.0);
     ui.label(RichText::new("Claude Code").strong());
-    copy_block(ui, col, &format!("claude mcp add nightpost -- \"{exe}\" mcp"));
+    copy_block(ui, col, &format!("claude mcp add nightpost -- \"{program}\" {}", args.join(" ")));
     ui.add_space(8.0);
     ui.label(RichText::new("Claude Desktop (claude_desktop_config.json) or any MCP client").strong());
     copy_block(
         ui,
         col,
-        &format!("{{\n  \"mcpServers\": {{\n    \"nightpost\": {{\n      \"command\": \"{}\",\n      \"args\": [\"mcp\"]\n    }}\n  }}\n}}", exe.replace('\\', "\\\\")),
+        &format!("{{\n  \"mcpServers\": {{\n    \"nightpost\": {{\n      \"command\": \"{}\",\n      \"args\": [{args_json}]\n    }}\n  }}\n}}", program.replace('\\', "\\\\")),
     );
     ui.add_space(10.0);
     ui.label(RichText::new("Tools").strong());

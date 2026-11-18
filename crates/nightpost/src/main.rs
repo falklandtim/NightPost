@@ -75,6 +75,19 @@ fn main() -> Result<()> {
         None => "app",
     });
 
+    // A Flatpak's first run brings the installed copy's mail and settings
+    // across, once. Never for a demo (demo runs mustn't read real mail) or a
+    // database chosen with --db.
+    if nightpost_core::flatpak::running_in_flatpak() && !demo && std::env::var_os("NIGHTPOST_DB").is_none() {
+        if let Some(paths) = nightpost_core::flatpak::ImportPaths::for_this_user() {
+            match nightpost_core::flatpak::import_installed_copy(&paths) {
+                Ok(true) => log::info!("copied the installed NightPost's mail and settings into the Flatpak"),
+                Ok(false) => {}
+                Err(e) => log::warn!("couldn't copy the installed NightPost's mail into the Flatpak, so it starts empty: {e:#}"),
+            }
+        }
+    }
+
     match args.first().map(String::as_str) {
         Some("-h") | Some("--help") | Some("help") => {
             print!("{HELP}");

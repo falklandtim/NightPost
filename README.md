@@ -66,6 +66,15 @@ scripts/install-linux.sh   # build, then install to ~/.local (program, app-menu 
 
 It needs Rust, plus the OpenSSL, D-Bus and WebKitGTK development files (`sudo dnf install openssl-devel dbus-devel pkgconf-pkg-config gtk4-devel webkitgtk6.0-devel libsoup3-devel` on Fedora, `sudo pacman -S --needed openssl dbus pkgconf gtk4 webkitgtk-6.0` on Arch). These are GTK 4 and WebKitGTK 6.0; the GTK 3 packages (`webkit2gtk4.1-devel`, `gtk3-devel`) aren't needed any more. Install a Hunspell dictionary (e.g. `hunspell-en`) for spell checking. Tested on Fedora 44 KDE (ARM). Passwords and Google sign-ins go in the desktop's Secret Service (KDE Wallet or GNOME Keyring).
 
+**Or as a Flatpak**, which needs no Rust or development packages, and brings its own GTK 4 and WebKitGTK 6.0 from the GNOME runtime, the same on every distribution:
+
+```sh
+scripts/flatpak.sh            # build, then install for this user (flatpak run co.timson.NightPost)
+scripts/flatpak.sh --bundle   # also write target/flatpak/nightpost-<version>-<arch>.flatpak
+```
+
+A `.flatpak` file from a GitHub release installs with `flatpak install --user nightpost-<version>-<arch>.flatpak`. The Flatpak keeps its files in `~/.var/app/co.timson.NightPost/` (the log file is in `.local/state/nightpost/` there). The first time it runs, it copies a copy installed with `scripts/install-linux.sh` across, once: its accounts, mail and settings. Quit that NightPost first, so the copy is taken while nothing is writing to it. Passwords stay in the keyring, which both use. After that the two keep separate databases, and each syncs with the server. The Flatpak can read only your Downloads, Documents and Desktop folders (Downloads to save attachments, all three for the MCP server's `save_draft`), plus the installed copy's folders for that one copy; Save As and Attach Files use the desktop's own file dialog. Its MCP server starts with `flatpak run co.timson.NightPost mcp`, which Preferences → MCP Server shows. When `Cargo.lock` changes, run `scripts/flatpak-cargo-sources.py` and commit `flatpak/cargo-sources.json`: the Flatpak builds without the network, from that list. See [docs/flatpak.md](docs/flatpak.md).
+
 NightPost runs natively on Wayland (tested on KDE Plasma); `NIGHTPOST_X11=1` runs it through XWayland instead. HTML email on Linux is drawn off screen by WebKitGTK 6.0 (in a GTK 4 window that's never shown) and shown as a picture, with links, folds, Reply and attachments (including their right-click menu) clickable. Text in it can't be selected yet.
 
 The app icon lives in `crates/nightpost/assets/icon-1024.png`. After changing it, run `cargo run -p nightpost --example icon_assets` to regenerate the padded macOS version. The bundle script also does this automatically when the source is newer.

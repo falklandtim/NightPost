@@ -1,0 +1,86 @@
+# NightPost as a Flatpak (docs/flatpak.md). Build it with scripts/flatpak.sh.
+#
+# The GNOME runtime brings GTK 4 and WebKitGTK 6.0, so every distribution
+# gets the same ones. Rust is the pinned release (rust-toolchain.toml),
+# installed for the build only, and the crates come from
+# cargo-sources.json (scripts/flatpak-cargo-sources.py), since
+# flatpak-builder builds without the network.
+id: co.timson.NightPost
+runtime: org.gnome.Platform
+runtime-version: "51"
+sdk: org.gnome.Sdk
+command: nightpost
+
+finish-args:
+  # IMAP, SMTP, Google sign-in and sender logos.
+  - --share=network
+  # The window: native Wayland, or X11 (NIGHTPOST_X11=1, or no Wayland).
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Passwords and Google tokens, in GNOME Keyring or KDE Wallet.
+  - --talk-name=org.freedesktop.secrets
+  # Screen readers.
+  - --talk-name=org.a11y.Bus
+  # Save to Downloads; the MCP server's save_draft attaches from these
+  # three folders and no others (mcp.rs).
+  - --filesystem=xdg-download
+  - --filesystem=xdg-documents:ro
+  - --filesystem=xdg-desktop:ro
+  # Read-only, for the one-time copy of a copy installed with
+  # scripts/install-linux.sh (flatpak.rs): its database and settings.
+  - --filesystem=~/.local/share/nightpost:ro
+  - --filesystem=~/.local/share/co.timson.nightpost:ro
+
+modules:
+  # Rust, as pinned in rust-toolchain.toml. Move it with the pin (AGENTS.md
+  # section 6). Only for building: removed before the app is exported.
+  - name: rust
+    buildsystem: simple
+    # Leave the compiler as shipped: splitting out and stripping its debug
+    # information broke libLLVM ("object file has no loadable segments").
+    build-options:
+      no-debuginfo: true
+      strip: false
+    cleanup:
+      - /rust
+    build-commands:
+      - ./install.sh --prefix=/app/rust --components=rustc,cargo,rust-std-$(uname -m)-unknown-linux-gnu --disable-ldconfig
+    sources:
+      - type: archive
+        only-arches: [x86_64]
+        url: https://static.rust-lang.org/dist/rust-1.99.0-x86_64-unknown-linux-gnu.tar.xz
+        sha256: 891c6366d7100feda0bca4c03ce63f3c9ac827cbebbc283e7433061d42c6a376
+      - type: archive
+        only-arches: [aarch64]
+        url: https://static.rust-lang.org/dist/rust-1.99.0-aarch64-unknown-linux-gnu.tar.xz
+        sha256: 5a30ce742be0835d9b23fc862db5cbbbc71464e1c9b1fca22917e10e4ba32a92
+
+  - name: nightpost
+    buildsystem: simple
+    build-options:
+      append-path: /app/rust/bin
+      env:
+        # cargo-sources.json puts the crates and cargo's settings here.
+        CARGO_HOME: /run/build/nightpost/cargo
+        # The Omarchy laptop has 4 GB (AGENTS.md section 8).
+        CARGO_BUILD_JOBS: "2"
+    build-commands:
+      - cargo --offline build --release -p nightpost
+      - install -Dm755 target/release/nightpost /app/bin/nightpost
+      - install -Dm644 flatpak/co.timson.NightPost.desktop /app/share/applications/co.timson.NightPost.desktop
+      - install -Dm644 flatpak/co.timson.NightPost.metainfo.xml /app/share/metainfo/co.timson.NightPost.metainfo.xml
+      - for s in 64 128 256 512; do install -Dm644 flatpak/icons/$s.png /app/share/icons/hicolor/${s}x${s}/apps/co.timson.NightPost.png; done
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - .git
+          - ios
+          - trials
+          - Artwork
+          - zzz Misc from Timbo
+          - .flatpak-builder
+      - cargo-sources.json

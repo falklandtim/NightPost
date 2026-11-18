@@ -28,6 +28,7 @@ nightpost (binary)
         ├── smtp.rs, oauth.rs, credentials.rs, parse.rs, category.rs
         ├── mail_html.rs   reading and writing HTML: the email page's policy, quotes, drafts made safe to edit
         ├── mcp.rs         the MCP server
+        ├── flatpak.rs     running as a Flatpak: the MCP command, and the one-time copy of an installed copy's data
         └── theme.rs       Mailspring-compatible themes
 
 nightpost-ffi (library for the iPhone app, UniFFI → Swift)
@@ -36,7 +37,7 @@ nightpost-ffi (library for the iPhone app, UniFFI → Swift)
 
 ## Processes
 
-On a computer, two kinds of process use the same database, `~/Library/Application Support/co.timson.NightPost/nightpost.db` on a Mac (`~/.local/share/…` on Linux, or `NIGHTPOST_DB`):
+On a computer, two kinds of process use the same database, `~/Library/Application Support/co.timson.NightPost/nightpost.db` on a Mac (`~/.local/share/…` on Linux, `~/.var/app/co.timson.NightPost/data/…` in the Flatpak, or `NIGHTPOST_DB`):
 
 - **The app** (`nightpost`): the window and its threads.
 - **The iPhone app** (`ios/`, SwiftUI) has its own database in its sandbox, set with `nightpost_core::use_folders`. It agrees with the computers through the mail server, like any other copy.

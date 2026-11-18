@@ -60,12 +60,12 @@ Nothing about the build changes by accident. Every update is its own deliberate,
 ### Rust
 
 - **The compiler is pinned** in `rust-toolchain.toml` (1.99.0 now), so the Mac, the laptop, Fedora and the iPhone build all use the same Rust. rustup installs it on the first build.
-- **Move it up on purpose**, every month or two (a new stable comes every six weeks): change the file, run the full checks (section 7) on the Mac and on Linux, run `scripts/ios-rust.sh`, and commit it on its own.
+- **Move it up on purpose**, every month or two (a new stable comes every six weeks): change the file and the Rust module in `flatpak/co.timson.NightPost.yml` (its URLs and SHA-256s), run the full checks (section 7) on the Mac and on Linux, run `scripts/ios-rust.sh`, and commit it on its own.
 
 ### Crates
 
 - **`Cargo.lock` is committed.** A build never picks up a new version by itself.
-- **Monthly, with the code audit:** `cargo update` (compatible versions only), then the full checks, the Linux build and `scripts/ios-rust.sh`. One commit, "Update dependencies", listing what moved.
+- **Monthly, with the code audit:** `cargo update` (compatible versions only), then `scripts/flatpak-cargo-sources.py`, the full checks, the Linux build and `scripts/ios-rust.sh`. One commit, "Update dependencies", listing what moved.
 - **Major versions** (1.x to 2.x, or 0.x to 0.y): one crate per change, after reading its changelog, with Tim's OK. When the crate touches mail, sign-in or stored data (`imap`, `lettre`, `mail-parser`, `keyring`, `rusqlite`, `ureq`, `native-tls`) or the window (`eframe`/`egui`, `objc2-web-kit`, `webkit6`, `gtk4`, `uniffi`), Tim checks it with a real account before it goes on the machines he relies on.
 - **Security advisories** (`cargo audit`, run by `scripts/audit.sh`): an advisory for a crate NightPost uses is fixed straight away, not left for the monthly update. An "unmaintained" notice goes in the README's Known issues with the plan for it.
 - **Deprecation warnings** from a dependency are fixed by using the replacement it names, not silenced with `#[allow(deprecated)]`. Deprecations are how a library tells us what its next major version removes (GTK 5 is the next big one: see `docs/gtk4-upgrade.md`).
@@ -105,6 +105,7 @@ cargo audit                                  # no known security advisories
 |---|---|
 | Mac | `scripts/bundle-macos.sh --install` (signs with the local certificate, so Keychain access survives) |
 | Linux | `scripts/install-linux.sh` (installs to `~/.local/bin/nightpost` with a launcher) |
+| Flatpak | `scripts/flatpak.sh` (`--bundle` for a `.flatpak` file); regenerate `flatpak/cargo-sources.json` with `scripts/flatpak-cargo-sources.py` when `Cargo.lock` changes |
 | MCP | `nightpost mcp` on stdio; register with `claude mcp add nightpost -- <path> mcp` |
 | Demo | `cargo run --release -- --demo` |
 | iPhone | `scripts/ios-rust.sh` builds the core and Swift bindings for `ios/`; then open `ios/NightPost.xcodeproj` in Xcode (see `docs/ios.md`) |
@@ -124,4 +125,5 @@ On a small Linux machine (4 GB), build with `CARGO_BUILD_JOBS=2`, and run long b
 | `rust-toolchain.toml` | The pinned Rust version (section 6) |
 | `docs/imap-upgrade.md` | The plan for moving off `imap` 2.4.1 |
 | `docs/gtk4-upgrade.md` | The plan for moving the Linux web views to GTK 4 |
+| `docs/flatpak.md` | The plan for a Flatpak of NightPost for Linux |
 | `docs/tasks/` | Briefs for larger tasks to be done later, e.g. `email-engine-trial.md` |
