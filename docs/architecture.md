@@ -122,5 +122,5 @@ Colours come from the theme (`style::Colors`, built from a Mailspring-style pale
 ## Testing
 
 - `cargo test --workspace`: unit tests in both crates, plus offscreen UI tests (`app/ui_tests.rs`, egui_kittest) that render the app with the demo accounts and click through it. `NIGHTPOST_SHOTS=<dir>` saves their screenshots.
-- Demo accounts (`nightpost_core::demo`, `--demo`) never touch the network; every engine function has a demo path. Real accounts are tested by hand.
+- Demo accounts (`nightpost_core::demo`, `--demo`) never touch the network; every engine function has a demo path. Real accounts are tested by hand. `--demo` seeds the demo accounts into whichever database is open (`demo::seed`), so a run by hand uses `--db` or `NIGHTPOST_DB` with a throwaway path to keep them out of the real one. Tests open their own stores.
 - `scripts/audit.sh`: the code audit's numbers (see [code-audit.md](code-audit.md)).

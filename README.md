@@ -49,7 +49,8 @@ NightPost was called OwlPost (and SpringPost before that). The first time it run
 
 ```sh
 cargo run --release              # the app
-cargo run --release -- --demo    # with sample accounts
+cargo run --release -- --demo    # with sample accounts, added to your real database
+cargo run --release -- --db /tmp/demo.db --demo   # sample accounts in a throwaway database
 cargo test --workspace           # unit + offscreen UI render tests
 scripts/bundle-macos.sh          # build target/release/NightPost.app (with icon)
 scripts/bundle-macos.sh --install   # …and copy it to /Applications
