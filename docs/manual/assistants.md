@@ -14,9 +14,37 @@ The exact command is in **Preferences → MCP Server**, ready to copy. It depend
 | The Linux Flatpak | `claude mcp add nightpost -- flatpak run co.timson.NightPost mcp` |
 | Built on Linux | `claude mcp add nightpost -- ~/.local/bin/nightpost mcp` |
 
-Other assistants, such as Claude Desktop, take the same program and arguments in their settings file; Preferences → MCP Server shows the text to paste.
+The MCP server uses the same accounts and mail as the app, so add your accounts in NightPost first. The app doesn't need to be open.
 
-The MCP server uses the same accounts and mail as the app. The app doesn't need to be open.
+## Connecting Claude Desktop
+
+1. In Claude Desktop, open **Settings → Developer → Edit Config**. This opens Claude's settings file, `claude_desktop_config.json`. On a Mac it's in `~/Library/Application Support/Claude/`.
+2. If the file is empty, or only has `{}` in it, replace everything with this:
+
+   ```json
+   {
+     "mcpServers": {
+       "nightpost": {
+         "command": "/Applications/NightPost.app/Contents/MacOS/nightpost",
+         "args": ["mcp"]
+       }
+     }
+   }
+   ```
+
+   If it already has an `"mcpServers"` section with other entries, add only the `"nightpost": { … }` part inside it, with a comma after the entry before it.
+
+   For the Linux Flatpak, use `"command": "flatpak"` and `"args": ["run", "co.timson.NightPost", "mcp"]` instead. **Preferences → MCP Server** shows the right text for your computer, ready to copy.
+3. **Quit Claude Desktop completely** (⌘ Q, not just closing its window), then open it again. NightPost appears in Claude's list of tools.
+4. On a Mac, the first time Claude reads your mail, macOS may ask whether `nightpost` may use your Keychain, where your mail passwords are kept. Choose **Always Allow**.
+
+Then ask Claude things like:
+
+- "What's unread in my inbox?"
+- "Snooze the newsletter from Kōwhai until Saturday."
+- "Draft a reply to Sam saying Thursday works."
+
+If NightPost doesn't appear in Claude, check that the path in step 2 is where NightPost is installed. NightPost's log file marks the MCP server's lines with `[mcp]` (see [When something goes wrong](troubleshooting.md#the-log-file)).
 
 ## What an assistant can do
 

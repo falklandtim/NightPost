@@ -47,6 +47,12 @@ fn tool(name: &str, description: &str, schema: Value, read_only: bool, destructi
     })
 }
 
+/// The names of the tools the server offers, for anything that lists them
+/// (Preferences → MCP Server checks its descriptions against these).
+pub fn tool_names() -> Vec<String> {
+    tools().as_array().map(|ts| ts.iter().filter_map(|t| t["name"].as_str().map(String::from)).collect()).unwrap_or_default()
+}
+
 fn tools() -> Value {
     let thread = json!({"type":"string","description":"Thread id from list_threads/search, e.g. \"2:abc@example.com\""});
     json!([

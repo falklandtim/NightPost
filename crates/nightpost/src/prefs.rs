@@ -641,6 +641,22 @@ fn copy_block(ui: &mut egui::Ui, col: &Colors, text: &str) {
         });
 }
 
+/// The MCP server's tools as Preferences describes them, grouped. A test
+/// checks these names against the server's own list: this page once kept
+/// listing send_email and reply long after they were removed on purpose.
+const MCP_TOOLS: &[(&str, &str)] = &[
+    ("list_accounts / list_folders", "See configured accounts and mailboxes"),
+    ("list_threads / search", "Browse or search conversations (from:, subject:, is:unread …)"),
+    ("read_thread / view_message", "Read a conversation, or see one email as designed, with its pictures"),
+    ("get_attachment", "Open an attachment"),
+    ("snooze_thread / unsnooze_thread / list_snoozed", "Defer mail until later"),
+    ("mark_read / star_thread / pin_thread", "Read state, stars and pins"),
+    ("move_thread / label_thread", "Archive, trash, spam, folders and Gmail labels"),
+    ("list_tabs / sort_sender / sort_thread", "Inbox tabs, and which senders and conversations go in them"),
+    ("save_draft", "Write a new message or reply as a draft, for you to send (nothing is sent)"),
+    ("sync / sync_status", "Fetch new mail now; check each account is connected"),
+];
+
 fn mcp(ui: &mut egui::Ui, col: &Colors) {
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "nightpost".into());
     // How it's started from outside: a Flatpak's own path only exists inside it.
@@ -650,9 +666,10 @@ fn mcp(ui: &mut egui::Ui, col: &Colors) {
     ui.label(RichText::new("Built-in MCP server").strong().size(16.0));
     ui.label(
         RichText::new(
-            "NightPost includes a Model Context Protocol server, so assistants like Claude can search, read, triage, \
-             snooze and send your mail using the accounts configured here. It runs as `nightpost mcp` over stdio and \
-             shares this app's local database.",
+            "NightPost includes a Model Context Protocol server, so assistants like Claude can search, read, triage \
+             and snooze your mail, using the accounts configured here. An assistant can't send: what it writes is \
+             saved as a draft, for you to check and send. The server shares this app's local database, and the app \
+             doesn't need to be open.",
         )
         .color(col.subtle),
     );
@@ -660,7 +677,7 @@ fn mcp(ui: &mut egui::Ui, col: &Colors) {
     ui.label(RichText::new("Claude Code").strong());
     copy_block(ui, col, &format!("claude mcp add nightpost -- \"{program}\" {}", args.join(" ")));
     ui.add_space(8.0);
-    ui.label(RichText::new("Claude Desktop (claude_desktop_config.json) or any MCP client").strong());
+    ui.label(RichText::new("Claude Desktop (Settings > Developer > Edit Config) or any MCP client").strong());
     copy_block(
         ui,
         col,
@@ -668,15 +685,7 @@ fn mcp(ui: &mut egui::Ui, col: &Colors) {
     );
     ui.add_space(10.0);
     ui.label(RichText::new("Tools").strong());
-    for (name, desc) in [
-        ("list_accounts / list_folders", "See configured accounts and mailboxes"),
-        ("list_threads / search", "Browse or search conversations (from:, subject:, is:unread …)"),
-        ("read_thread", "Read a whole conversation"),
-        ("snooze_thread / unsnooze_thread / list_snoozed", "Defer mail until later"),
-        ("mark_read / star_thread / move_thread", "Triage: read state, stars, archive, trash, spam"),
-        ("send_email / reply", "Compose and send (clients ask you to confirm)"),
-        ("sync", "Fetch new mail now"),
-    ] {
+    for &(name, desc) in MCP_TOOLS {
         ui.horizontal(|ui| {
             ui.label(RichText::new(name).monospace().color(col.accent));
             ui.label(RichText::new(desc).color(col.subtle));
@@ -862,4 +871,20 @@ pub(crate) fn push_line(ui: &mut egui::Ui, col: &Colors, st: Option<&PushState>)
     })
     .response
     .on_hover_text(tip);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Preferences → MCP Server lists exactly the tools the server has: none
+    /// missing, and none it doesn't (such as the send tools, removed on purpose).
+    #[test]
+    fn mcp_page_lists_the_real_tools() {
+        let mut shown: Vec<&str> = MCP_TOOLS.iter().flat_map(|(names, _)| names.split(" / ")).collect();
+        let mut real = nightpost_core::mcp::tool_names();
+        shown.sort_unstable();
+        real.sort_unstable();
+        assert_eq!(shown, real);
+    }
 }
