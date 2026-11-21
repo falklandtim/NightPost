@@ -14,6 +14,9 @@ log.workspace = true
 rusqlite = { version = "0.41", features = ["bundled"] }
 imap = "2.4.1"
 native-tls = "0.2"
+# TCP keepalive on IMAP connections (engine::open_tcp). Already built for
+# lettre; "all" adds the getters the keepalive test reads back.
+socket2 = { version = "0.6", features = ["all"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls", "hostname"] }
 mail-parser = "0.11"
 html2text = "0.15"

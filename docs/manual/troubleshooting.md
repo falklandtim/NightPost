@@ -22,6 +22,8 @@ If the server turns down an action (moving, archiving, deleting, labelling, star
 
 For example, Gmail sometimes answers "System Error" when moving mail to Trash. That's a fault on Google's side.
 
+"Too many simultaneous connections" means Gmail already has 15 connections open for the account. Every computer, phone and mail app you use counts towards that, as does an assistant using NightPost's MCP server. NightPost itself uses about five per computer: one for push, one for checking mail, and up to three for actions. Closing mail apps you aren't using frees some up; Gmail also closes forgotten ones after a while.
+
 ## Passwords keep being asked for
 
 - **On the Mac,** when macOS asks whether NightPost may use the Keychain, choose **Always Allow**.

@@ -65,7 +65,26 @@ pub(crate) fn open_tcp(server: &ServerConfig) -> Result<TcpStream> {
         .with_context(|| format!("connecting to {}:{}", server.host, server.port))?;
     tcp.set_read_timeout(Some(crate::idle::IO_TIMEOUT))?;
     tcp.set_write_timeout(Some(crate::idle::IO_TIMEOUT))?;
+    keep_alive(&tcp)?;
     Ok(tcp)
+}
+
+/// Quiet time before the first TCP keepalive probe.
+pub(crate) const KEEPALIVE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+/// Time between probes once the other end stops answering.
+pub(crate) const KEEPALIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Send TCP keepalives on a quiet connection. A push connection sits
+/// silent through each IDLE wait (`idle::CYCLE`), and something on the
+/// way to Gmail forgot such connections in under 8 minutes: every cycle
+/// ended in "Operation timed out" and a fresh sign-in, the dead connection
+/// still counted towards Gmail's limit of 15, and mail that arrived in the
+/// meantime waited for the next timed check. A probe every minute keeps the
+/// route open, and a connection that dies anyway is noticed within about
+/// two minutes instead of at the end of the cycle.
+fn keep_alive(tcp: &TcpStream) -> Result<()> {
+    let ka = socket2::TcpKeepalive::new().with_time(KEEPALIVE_AFTER).with_interval(KEEPALIVE_EVERY).with_retries(4);
+    socket2::SockRef::from(tcp).set_tcp_keepalive(&ka).context("turning on TCP keepalive")
 }
 
 /// Connect with a password (account setup checks one before saving it).
@@ -1191,6 +1210,20 @@ mod tests {
         let tcp = open_tcp(&server).unwrap();
         assert_eq!(tcp.read_timeout().unwrap(), Some(crate::idle::IO_TIMEOUT));
         assert_eq!(tcp.write_timeout().unwrap(), Some(crate::idle::IO_TIMEOUT));
+    }
+
+    /// IMAP connections (push and sync alike) send keepalives, so a quiet
+    /// IDLE isn't forgotten on the way to the server.
+    #[test]
+    fn imap_connections_keep_alive() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = ServerConfig { host: "127.0.0.1".into(), port: listener.local_addr().unwrap().port(), security: Security::Tls };
+        let tcp = open_tcp(&server).unwrap();
+        let sock = socket2::SockRef::from(&tcp);
+        assert!(sock.keepalive().unwrap());
+        assert_eq!(sock.tcp_keepalive_time().unwrap(), KEEPALIVE_AFTER);
+        assert_eq!(sock.tcp_keepalive_interval().unwrap(), KEEPALIVE_EVERY);
+        assert!(KEEPALIVE_AFTER < crate::idle::CYCLE, "probes start well inside one IDLE wait");
     }
 
     /// A stand-in connection: `dead` once the server has hung up.

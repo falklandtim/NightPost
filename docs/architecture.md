@@ -53,8 +53,8 @@ The UI thread draws each frame and never waits on the network.
 |---|---|---|
 | UI (main) | egui: draws, handles input, changes the local store at once | `main.rs`, `app/` |
 | `sync` | One sync at a time, every 5 minutes or on request. Requests that queue up meanwhile are merged (`SyncPlan`). A pushed change syncs just that Inbox. After mail, each account's server state (snoozes, pins, tabs) is merged. | `worker::Worker::spawn` |
-| push | One IMAP IDLE connection per account on its Inbox, run by a supervisor that replaces stalled ones, re-issued every 8 minutes and restarted after sleep. A change from the server asks `sync` for that Inbox. | `worker::push` |
-| `actions` | Takes each `Cmd` from the UI and runs it on its own short-lived thread. Commands on the same conversation take turns in the order sent (`Turns`), so an undo never overtakes its action. | `worker::Worker::spawn` |
+| push | One IMAP IDLE connection per account on its Inbox, run by a supervisor that replaces stalled ones, re-issued every 8 minutes and restarted after sleep. Every IMAP connection sends TCP keepalives after 60 quiet seconds (`engine::open_tcp`), so a silent IDLE isn't dropped on the way. A change from the server asks `sync` for that Inbox. | `worker::push` |
+| `actions` | Takes each `Cmd` from the UI and runs it on its own short-lived thread. Commands on the same conversation take turns in the order sent (`Turns`), so an undo never overtakes its action. At most three run against one account's server at once (`Lanes`), so a burst doesn't hit Gmail's connection limit. | `worker::Worker::spawn` |
 | `avatars-N` | A few sender-picture lookups at a time (Contacts photo, BIMI logo, site icon). | `worker::Worker::spawn` |
 | GTK (Linux only) | GTK 4's main loop (a `glib::MainLoop`), for WebKitGTK 6.0: the composer windows and the off-screen HTML view. Other threads post work to it. | `web_host` |
 | `blitz-fetch-0` … `-3` (Linux, Blitz engine only) | Fetch an email's web pictures, style sheets and fonts for Blitz, once remote content is allowed, so the UI thread never waits on them. Started the first time they're needed; they end when the engine is switched back to WebKit. | `app/blitz_net.rs` `Pool::new` |
@@ -66,7 +66,7 @@ Results come back to the UI as `worker::Event`s on a channel, and the UI repaint
 Archiving a conversation, for example:
 
 1. **UI** (`app/actions.rs`): removes the row and updates the store at once, records an `Undo`, shows the toast, and sends `Cmd::Move(account, thread, Archive)`.
-2. **actions thread** (`worker.rs` `run_action`): waits its turn for that conversation, then calls `engine::move_thread`.
+2. **actions thread** (`worker.rs` `run_action`): waits its turn for that conversation and a free lane for the account, then calls `engine::move_thread`.
 3. **engine** (`engine.rs`): connects over IMAP and moves the messages (on Gmail, only takes the Inbox label off), then updates the store to match the server.
 4. **UI**: on `Event::Changed` it reloads the list; on `Event::Error` it shows what went wrong.
 

@@ -113,6 +113,31 @@ impl Cmd {
         }
     }
 
+    /// The account whose server this action connects to, for [`Lanes`].
+    /// None for the few that don't name one up front (they're rare and run
+    /// unlimited).
+    fn account(&self) -> Option<AccountId> {
+        match self {
+            Cmd::SetUnread(a, ..)
+            | Cmd::SetStarred(a, ..)
+            | Cmd::Move(a, ..)
+            | Cmd::MoveTo(a, ..)
+            | Cmd::Label(a, ..)
+            | Cmd::CreateFolder(a, ..)
+            | Cmd::NewFolder(a, ..)
+            | Cmd::MoveAcross(a, ..)
+            | Cmd::Send(a, ..)
+            | Cmd::SaveDraft(a, ..)
+            | Cmd::Restore(a, ..)
+            | Cmd::Snooze(a, ..)
+            | Cmd::Unsnooze(a, ..)
+            | Cmd::SyncPins(a) => Some(*a),
+            Cmd::TabChange(_, moved) => moved.as_ref().map(|m| m.0),
+            Cmd::OpenDraft(m) | Cmd::ShowOriginal(m) | Cmd::Attachment(m, ..) => Some(m.account_id),
+            _ => None,
+        }
+    }
+
     /// For mailbox actions: the account, and what to call the action in Sync
     /// activity when it fails. None for the rest, because their errors can
     /// quote attachment names or recipients' addresses, which mustn't reach
@@ -179,6 +204,54 @@ impl Turns {
             }
         }
         self.cv.notify_all();
+    }
+}
+
+/// The most actions that talk to one account's server at once. Each action
+/// opens its own connection, and Gmail turns away a sign-in once an account
+/// has 15 open, counting every computer, phone and the MCP server; three
+/// Trash actions sent at once were all refused with "Too many simultaneous
+/// connections". Push and sync use one more each.
+const ACTIONS_PER_ACCOUNT: usize = 3;
+
+/// Lets at most [`ACTIONS_PER_ACCOUNT`] actions per account run at once;
+/// the rest wait their turn rather than open more connections.
+#[derive(Default)]
+struct Lanes {
+    busy: std::sync::Mutex<HashMap<AccountId, usize>>,
+    cv: std::sync::Condvar,
+}
+
+impl Lanes {
+    /// Wait for a free lane on `account`; it's freed when the guard drops.
+    fn take(&self, account: AccountId) -> Lane<'_> {
+        // Nothing panics while holding this lock; recover it anyway rather than add a panic.
+        let mut busy = self.busy.lock().unwrap_or_else(|p| p.into_inner());
+        while busy.get(&account).copied().unwrap_or(0) >= ACTIONS_PER_ACCOUNT {
+            busy = self.cv.wait(busy).unwrap_or_else(|p| p.into_inner());
+        }
+        *busy.entry(account).or_insert(0) += 1;
+        Lane { lanes: self, account }
+    }
+}
+
+/// A lane in use; dropping it (even if the action panicked) lets the next action in.
+struct Lane<'a> {
+    lanes: &'a Lanes,
+    account: AccountId,
+}
+
+impl Drop for Lane<'_> {
+    fn drop(&mut self) {
+        // Recover a poisoned lock here: a guard dropping during a panic must still free its lane.
+        let mut busy = self.lanes.busy.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = busy.get_mut(&self.account) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                busy.remove(&self.account);
+            }
+        }
+        self.lanes.cv.notify_all();
     }
 }
 
@@ -413,6 +486,7 @@ impl Worker {
             .name("actions".into())
             .spawn(move || {
                 let turns = Arc::new(Turns::default());
+                let lanes = Arc::new(Lanes::default());
                 for cmd in cmd_rx {
                     match cmd {
                         Cmd::SyncAll => {
@@ -432,11 +506,17 @@ impl Worker {
                                 (k, t)
                             });
                             let turns = turns.clone();
+                            let lanes = lanes.clone();
                             std::thread::spawn(move || {
                                 if let Some((k, t)) = &turn {
                                     turns.wait(k, *t);
                                 }
+                                // Only after its turn: a thread waiting for
+                                // a turn never holds a lane, so the two
+                                // queues can't wait on each other.
+                                let lane = other.account().map(|a| lanes.take(a));
                                 run_action(&db, other, &ev, &sync_tx);
+                                drop(lane);
                                 if let Some((k, _)) = &turn {
                                     turns.done(k);
                                 }
@@ -1020,6 +1100,44 @@ mod tests {
         }
         assert_eq!(*log.lock().unwrap(), [0, 1, 2, 3, 4]);
         assert!(turns.state.lock().unwrap().is_empty(), "finished conversations are forgotten");
+    }
+
+    /// A burst of actions on one account never has more than
+    /// ACTIONS_PER_ACCOUNT connections open; another account isn't held up.
+    #[test]
+    fn actions_per_account_are_limited() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let lanes = Arc::new(Lanes::default());
+        let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let handles: Vec<_> = (0..ACTIONS_PER_ACCOUNT * 3)
+            .map(|_| {
+                let (lanes, now, most) = (lanes.clone(), now.clone(), most.clone());
+                std::thread::spawn(move || {
+                    let _lane = lanes.take(1);
+                    let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(n, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(40));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        // While account 1 is full, account 2 still gets a lane straight away.
+        std::thread::sleep(Duration::from_millis(10));
+        let started = Instant::now();
+        drop(lanes.take(2));
+        assert!(started.elapsed() < Duration::from_millis(30), "account 2 waited on account 1");
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(most.load(Ordering::SeqCst), ACTIONS_PER_ACCOUNT);
+        assert!(lanes.busy.lock().unwrap().is_empty(), "every lane is given back");
+    }
+
+    #[test]
+    fn mailbox_actions_name_their_account() {
+        assert_eq!(Cmd::Move(7, "t".into(), FolderRole::Trash).account(), Some(7));
+        assert_eq!(Cmd::SetUnread(3, "t".into(), true).account(), Some(3));
+        assert_eq!(Cmd::SyncAll.account(), None);
     }
 
     #[test]
