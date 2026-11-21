@@ -812,7 +812,7 @@ mod offscreen {
                 }
             }
             self.attachment_menu(ctx);
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("mail_view"))).with_clip_rect(rect);
+            let painter = ctx.layer_painter(pane_layer()).with_clip_rect(rect);
             painter.rect_filled(rect, 0.0, self.bg);
             if self.tiles.is_empty() || self.shown_key != self.requested.0 {
                 painter.text(rect.center_top() + egui::vec2(0.0, 40.0), egui::Align2::CENTER_TOP, "Loading…", egui::FontId::proportional(14.0), egui::Color32::GRAY);
@@ -842,6 +842,15 @@ mod offscreen {
         pub fn events(&mut self) -> Vec<ViewEvent> {
             std::mem::take(&mut self.events)
         }
+    }
+
+    /// The layer the email is painted on: the panels' own, so it sits in the
+    /// reading pane and under every window (Preferences, Show original).
+    /// `place_mail_view` runs after the panels, so it lands on top of them.
+    /// Not a layer of its own: egui draws a layer that isn't a window or area
+    /// after all of them at its level, which put the email over Preferences.
+    pub(super) fn pane_layer() -> egui::LayerId {
+        egui::LayerId::background()
     }
 
     enum Job {
@@ -1058,6 +1067,35 @@ mod offscreen {
 mod tests {
     use super::*;
     use nightpost_core::{Attachment, Contact};
+
+    /// Linux: the email is painted under windows such as Preferences, not
+    /// over them (it used to be a layer of its own, drawn after every window).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn email_is_painted_under_windows() {
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("the reading pane");
+                });
+                egui::Window::new("Preferences").show(ctx, |ui| {
+                    ui.label("a setting");
+                });
+                // As `place_mail_view` does: last, after the window.
+                let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 400.0));
+                ctx.layer_painter(offscreen::pane_layer()).rect_filled(r, 0.0, egui::Color32::from_rgb(1, 2, 3));
+            });
+            shapes = out.shapes;
+        }
+        let at = |want: &dyn Fn(&egui::Shape) -> bool| shapes.iter().position(|c| want(&c.shape));
+        let email = at(&|s| matches!(s, egui::Shape::Rect(r) if r.fill == egui::Color32::from_rgb(1, 2, 3))).expect("the email was painted");
+        let setting = at(&|s| matches!(s, egui::Shape::Text(t) if t.galley.text() == "a setting")).expect("the window was drawn");
+        let pane = at(&|s| matches!(s, egui::Shape::Text(t) if t.galley.text() == "the reading pane")).expect("the pane was drawn");
+        assert!(email < setting, "the window is drawn over the email");
+        assert!(pane < email, "the email is drawn over the reading pane");
+    }
 
     fn msg(id: i64, text: &str, html: Option<&str>) -> Message {
         Message {
