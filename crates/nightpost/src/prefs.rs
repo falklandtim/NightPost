@@ -205,6 +205,8 @@ pub struct Prefs {
     pub dark_emails: bool,
     /// Show sender photos and logos.
     pub faces: bool,
+    /// Linux: HTML email drawn by Blitz rather than WebKitGTK; set by the app.
+    pub blitz: bool,
 }
 
 pub enum PrefsAction {
@@ -229,12 +231,15 @@ pub enum PrefsAction {
     SetLoadImages(bool),
     SetDarkEmails(bool),
     SetFaces(bool),
+    /// Linux: draw HTML email with Blitz (true) or WebKitGTK (false).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    SetBlitz(bool),
     Close,
 }
 
 impl Prefs {
     pub fn new(tab: Tab) -> Self {
-        Self { tab, editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false, html_email: true, load_images: true, dark_emails: true, faces: true }
+        Self { tab, editing: None, message: None, sig_edit: None, push: Default::default(), google_ready: false, google_waiting: None, google_id: String::new(), google_secret: String::new(), google_edit: false, html_email: true, load_images: true, dark_emails: true, faces: true, blitz: false }
     }
 
     #[allow(clippy::too_many_arguments)] // one window, one call site
@@ -290,6 +295,11 @@ impl Prefs {
             act = PrefsAction::SetHtmlEmail(html);
         }
         ui.add_enabled_ui(self.html_email, |ui| {
+            // Linux only: the Mac always uses its own WebKit.
+            #[cfg(target_os = "linux")]
+            if let Some(blitz) = engine_choice(ui, self.blitz) {
+                act = PrefsAction::SetBlitz(blitz);
+            }
             let mut load = self.load_images;
             let tip = "On: pictures in emails load straight away, like Canary and Apple Mail. Off: they wait until you click Load images. \
                        Tracking pixels and known tracking addresses are removed. Any remote picture can still tell the sender you opened the email.";
@@ -539,6 +549,22 @@ impl Prefs {
         });
         act
     }
+}
+
+/// Linux: WebKit or Blitz for HTML email. Returns the new choice
+/// (true: Blitz) when it changes.
+#[cfg(target_os = "linux")]
+fn engine_choice(ui: &mut egui::Ui, blitz: bool) -> Option<bool> {
+    let mut chosen = blitz;
+    ui.horizontal(|ui| {
+        ui.label("Email engine:");
+        ui.selectable_value(&mut chosen, false, "WebKit").on_hover_text("WebKitGTK, the same engine as the Mac. Text in an email can't be selected yet.");
+        ui.selectable_value(&mut chosen, true, "Blitz (experimental)").on_hover_text(
+            "Blitz draws emails inside NightPost, so you can select and copy their text. It's a pre-release: some older emails look plainer \
+             than in WebKit, and pictures from the web aren't shown yet.",
+        );
+    });
+    (chosen != blitz).then_some(chosen)
 }
 
 fn theme_tile(ui: &mut egui::Ui, col: &Colors, t: &Theme, selected: bool) -> bool {

@@ -33,6 +33,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 mod actions;
+// Linux only: the Mac's WKWebView already lets you select text in an email.
+#[cfg(target_os = "linux")]
+mod blitz_body;
+#[cfg(target_os = "linux")]
+mod blitz_net;
 mod input;
 mod list;
 mod reader;
@@ -365,6 +370,10 @@ pub struct NightPostApp {
     /// The web view for HTML email (created on the first frame).
     mail_view: Option<crate::mail_view::MailView>,
     mail_view_tried: bool,
+    /// Linux: HTML email drawn by Blitz instead of WebKitGTK (`Some` when
+    /// that's the engine chosen in Preferences).
+    #[cfg(target_os = "linux")]
+    blitz: Option<blitz_body::Bodies>,
     /// Show emails as designed (HTML) rather than as text.
     html_email: bool,
     /// Load remote images straight away (trackers are stripped regardless).
@@ -432,6 +441,10 @@ const HTML_KEY: &str = "nightpost.html";
 const IMAGES_KEY: &str = "nightpost.images";
 const FACES_KEY: &str = "nightpost.faces";
 const DARK_EMAILS_KEY: &str = "nightpost.dark_emails";
+/// Linux: which engine draws HTML email, "webkit" (the default) or "blitz".
+/// A setting of its own, so builds without Blitz simply ignore it.
+#[cfg(target_os = "linux")]
+const ENGINE_KEY: &str = "nightpost.email_engine";
 /// Parent folders opened in the sidebar (`<account id>\t<path>` per line).
 const OPEN_FOLDERS_KEY: &str = "nightpost.open_folders";
 const COLLAPSED_ACCOUNTS_KEY: &str = "nightpost.collapsed_accounts";
@@ -459,6 +472,10 @@ impl NightPostApp {
         }
         if let Some(d) = get(DARK_EMAILS_KEY) {
             app.dark_emails = d != "0";
+        }
+        #[cfg(target_os = "linux")]
+        if get(ENGINE_KEY).as_deref() == Some("blitz") {
+            app.blitz = Some(blitz_body::Bodies::new());
         }
         if let Some(f) = get(FACES_KEY) {
             app.faces.enabled.set(f != "0");
@@ -565,6 +582,8 @@ impl NightPostApp {
             hidden_pinned: 0,
             mail_view: None,
             mail_view_tried: false,
+            #[cfg(target_os = "linux")]
+            blitz: None,
             html_email: true,
             load_images: true,
             dark_emails: true,
@@ -878,6 +897,8 @@ impl eframe::App for NightPostApp {
         storage.set_string(IMAGES_KEY, if self.load_images { "load" } else { "ask" }.into());
         storage.set_string(DARK_EMAILS_KEY, if self.dark_emails { "1" } else { "0" }.into());
         storage.set_string(FACES_KEY, if self.faces.enabled.get() { "1" } else { "0" }.into());
+        #[cfg(target_os = "linux")]
+        storage.set_string(ENGINE_KEY, if self.blitz.is_some() { "blitz" } else { "webkit" }.into());
         let mut open: Vec<&String> = self.open_folders.iter().collect();
         open.sort();
         storage.set_string(OPEN_FOLDERS_KEY, open.into_iter().cloned().collect::<Vec<_>>().join("\n"));

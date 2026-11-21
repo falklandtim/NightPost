@@ -57,6 +57,7 @@ The UI thread draws each frame and never waits on the network.
 | `actions` | Takes each `Cmd` from the UI and runs it on its own short-lived thread. Commands on the same conversation take turns in the order sent (`Turns`), so an undo never overtakes its action. | `worker::Worker::spawn` |
 | `avatars-N` | A few sender-picture lookups at a time (Contacts photo, BIMI logo, site icon). | `worker::Worker::spawn` |
 | GTK (Linux only) | GTK 4's main loop (a `glib::MainLoop`), for WebKitGTK 6.0: the composer windows and the off-screen HTML view. Other threads post work to it. | `web_host` |
+| `blitz-fetch-0` … `-3` (Linux, Blitz engine only) | Fetch an email's web pictures, style sheets and fonts for Blitz, once remote content is allowed, so the UI thread never waits on them. Started the first time they're needed; they end when the engine is switched back to WebKit. | `app/blitz_net.rs` `Pool::new` |
 
 Results come back to the UI as `worker::Event`s on a channel, and the UI repaints.
 
@@ -104,6 +105,8 @@ Older copies of NightPost ignore fields they don't know, and may rewrite the sta
 | `app/list.rs` | The message list: header, tabs, rows, hover actions, right-click menu |
 | `app/swipe.rs` | Swiping a row sideways: its buttons, the motion, and running the action |
 | `app/reader.rs` | The open conversation (cards, or the HTML web view), attachments |
+| `app/blitz_body.rs` | Linux, when Blitz is the chosen engine: each HTML email drawn by Blitz on the CPU into egui textures in its card, with text selection and copy |
+| `app/blitz_net.rs` | Where Blitz gets an email's pictures: `data:` at once, web content (when allowed) from four `blitz-fetch-N` threads through `email_view::fetch`, with a size check before decoding |
 | `app/toolbar.rs` | The toolbar and its pop-ups (Move, Label, More, Snooze calendar) |
 | `app/sheets.rs` | Dialogs and other windows: shortcuts, Sync activity, folders, new tab, Show original, composers, preferences |
 | `app/actions.rs` | What each command does, multi-select, undo, Undo Send |

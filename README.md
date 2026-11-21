@@ -78,6 +78,8 @@ A `.flatpak` file from a GitHub release installs with `flatpak install --user ni
 
 NightPost runs natively on Wayland (tested on KDE Plasma); `NIGHTPOST_X11=1` runs it through XWayland instead. HTML email on Linux is drawn off screen by WebKitGTK 6.0 (in a GTK 4 window that's never shown) and shown as a picture, with links, folds, Reply and attachments (including their right-click menu) clickable. Text in it can't be selected yet.
 
+**Blitz (experimental, Linux only):** Preferences → Appearance → Email engine → **Blitz** draws HTML email inside NightPost instead, with [Blitz](https://github.com/DioxusLabs/blitz) (a pre-release, pinned at 0.3.0-beta.4), so you can **select text and copy it** (drag, then Ctrl+C or right-click → Copy). Each message is a card, as with HTML turned off, and the email sits inside it; in a dark theme it's shown on white. Blitz runs no scripts. Pictures from the web follow the same rules as in WebKit: they load straight away with **Load remote images** on, or after you click **Load images** under the email, and known trackers are removed first. NightPost fetches them itself, in the background, never from this computer or your local network, at most 8 MB each, and refuses any picture larger than 25 million pixels. Pictures sent inside the email (`cid:`) aren't shown yet, as in WebKit. Very long emails are cut off near 20,000 points, with a note. Some older emails look plainer than in WebKit: Blitz ignores `<font>` colours and sizes and table `border="1"`, and draws emoji poorly. If Blitz can't draw an email, its text is shown instead. WebKit stays the default, and the Mac always uses its own WebKit, where text can already be selected.
+
 The app icon lives in `crates/nightpost/assets/icon-1024.png`. After changing it, run `cargo run -p nightpost --example icon_assets` to regenerate the padded macOS version. The bundle script also does this automatically when the source is newer.
 
 ## Connecting Gmail and iCloud
@@ -142,7 +144,7 @@ Data lives in `~/Library/Application Support/co.timson.NightPost/` (override wit
 
 ## Not yet implemented
 
-Inline (cid:) images in the app's HTML view (the MCP `view_message` tool does include them), selecting text in an HTML email on Linux, and send-later or read receipts.
+Inline (cid:) images in the app's HTML view (the MCP `view_message` tool does include them), selecting text in an HTML email on Linux with the WebKit engine (choose Blitz to select it), and send-later or read receipts.
 
 ## Snooze sync
 

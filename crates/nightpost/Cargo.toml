@@ -52,6 +52,16 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 webkit6 = "=0.6.1"
+# Blitz (DioxusLabs: Stylo, Taffy, Parley), the optional HTML email engine
+# on Linux: it draws into egui, so text can be selected. Pre-release: Tim's
+# OK on 2026-11-21, pinned exactly as tested in trials/email-engines, so
+# `cargo update` never moves to the next beta unseen (AGENTS.md section 6).
+blitz-dom = "=0.3.0-beta.4"
+blitz-html = "=0.3.0-beta.4"
+blitz-paint = "=0.3.0-beta.4"
+blitz-traits = "=0.3.0-beta.4"
+anyrender = "=0.14.0"
+anyrender_vello_cpu = "=0.18.0"
 
 [dev-dependencies]
 egui_kittest = { version = "0.33", features = ["wgpu", "snapshot"] }

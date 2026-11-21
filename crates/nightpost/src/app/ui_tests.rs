@@ -1378,3 +1378,46 @@ fn welcome_screen() {
     h.run_steps(3);
     save(&mut h, "welcome");
 }
+
+/// Linux, Blitz chosen: the newsletter is drawn by Blitz in the message card,
+/// and dragging across it selects text that Ctrl+C copies.
+#[cfg(target_os = "linux")]
+#[test]
+fn blitz_draws_html_email_and_copies_a_selection() {
+    for theme in [theme::MOONLIT_LIGHT, theme::MOONLIT_DARK] {
+        // Remote images off: the test stays offline, and "Load images" shows.
+        let mut h = harness_with(theme, |app| {
+            app.blitz = Some(super::blitz_body::Bodies::new());
+            app.load_images = false;
+        });
+        h.run_steps(3);
+        let idx = h.state().rows.iter().position(|r| r.t.subject.contains("November roast")).unwrap();
+        h.state_mut().select(idx);
+        h.run_steps(3);
+        let id = h.state().open.as_ref().and_then(|o| o.messages.iter().find(|m| m.body_html.is_some())).map(|m| m.id).unwrap();
+        let at = h.state().blitz.as_ref().and_then(|b| b.shown_at(id)).expect("Blitz drew the email");
+        assert!(at.height() > 100.0, "the newsletter has its height: {at:?}");
+        save(&mut h, &format!("blitz-{theme}"));
+        {
+            use egui_kittest::kittest::Queryable;
+            assert!(h.query_by_label("Load images").is_some(), "the newsletter's web picture waits");
+        }
+        // Drag along the top of the email, where the heading is.
+        let (from, to) = (at.left_top() + egui::vec2(30.0, 40.0), at.right_top() + egui::vec2(-10.0, 40.0));
+        h.event(egui::Event::PointerMoved(from));
+        h.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        h.run_steps(1);
+        for i in 1..=8 {
+            h.event(egui::Event::PointerMoved(from + (to - from) * (i as f32 / 8.0)));
+            h.run_steps(1);
+        }
+        h.event(egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        h.run_steps(1);
+        save(&mut h, &format!("blitz-selected-{theme}"));
+        h.event(egui::Event::Copy);
+        h.run_steps(1);
+        let copied: Vec<String> = h.output().platform_output.commands.iter().filter_map(|c| if let egui::OutputCommand::CopyText(t) = c { Some(t.clone()) } else { None }).collect();
+        assert!(copied.iter().any(|t| !t.trim().is_empty()), "something was copied: {copied:?}");
+        assert!(h.state().mail_view.is_none(), "no web view in Blitz mode");
+    }
+}

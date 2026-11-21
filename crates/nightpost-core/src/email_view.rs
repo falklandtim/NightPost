@@ -148,12 +148,7 @@ fn load(src: &str, opts: &Options, raw: impl FnOnce() -> Result<Vec<u8>>) -> Res
         return inline_part(&raw()?, cid);
     }
     if lower.starts_with("data:") {
-        let (meta, data) = src[5..].split_once(',').ok_or_else(|| anyhow!("bad data: URL"))?;
-        if !meta.ends_with(";base64") {
-            return Err(anyhow!("unsupported data: URL"));
-        }
-        use base64::Engine;
-        return Ok(base64::engine::general_purpose::STANDARD.decode(data.trim())?);
+        return data_url(src);
     }
     let url = if lower.starts_with("//") { format!("https:{src}") } else { src.to_string() };
     if !(url.to_ascii_lowercase().starts_with("https://") || url.to_ascii_lowercase().starts_with("http://")) {
@@ -165,9 +160,30 @@ fn load(src: &str, opts: &Options, raw: impl FnOnce() -> Result<Vec<u8>>) -> Res
     fetch(&url)
 }
 
+/// The bytes in a base64 `data:` URL, such as a picture written into an
+/// email. Other `data:` forms (percent-encoded text) aren't pictures, so
+/// they're refused. Never touches the network.
+pub fn data_url(src: &str) -> Result<Vec<u8>> {
+    let rest = src.get(..5).filter(|p| p.eq_ignore_ascii_case("data:")).and_then(|_| src.get(5..)).ok_or_else(|| anyhow!("not a data: URL"))?;
+    let (meta, data) = rest.split_once(',').ok_or_else(|| anyhow!("bad data: URL"))?;
+    if !meta.to_ascii_lowercase().ends_with(";base64") {
+        return Err(anyhow!("unsupported data: URL"));
+    }
+    use base64::Engine;
+    // Line breaks and spaces are common in data: URLs pasted into HTML.
+    let clean: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    Ok(base64::engine::general_purpose::STANDARD.decode(clean)?)
+}
+
 /// Fetch a remote picture, never from this machine or the local network
-/// (the address comes from the email: crate::net_guard).
-fn fetch(url: &str) -> Result<Vec<u8>> {
+/// (the address comes from the email: crate::net_guard), and at most 8 MB.
+/// Blocks for up to 15 s: call it from a background thread, never the UI.
+/// Only `http:` and `https:` addresses.
+pub fn fetch(url: &str) -> Result<Vec<u8>> {
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err(anyhow!("unsupported image address"));
+    }
     let agent = crate::net_guard::agent(ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).user_agent("NightPost"));
     let resp = agent.get(url).call().map_err(|e| anyhow!("couldn't load: {}", e.to_string().chars().take(120).collect::<String>()))?;
     let mut buf = Vec::new();
@@ -278,6 +294,24 @@ mod tests {
         let opts = Options { remote: false, max_images: 8 };
         assert_eq!(load(&format!("data:image/png;base64,{b64}"), &opts, || unreachable!()).unwrap(), img);
         assert!(load("https://x.example/a.png", &opts, || unreachable!()).is_err());
+    }
+
+    #[test]
+    fn data_urls_decode_base64_only() {
+        assert_eq!(data_url("data:image/png;base64,aGk=").unwrap(), b"hi");
+        assert_eq!(data_url("DATA:image/png;BASE64,aG\n k=").unwrap(), b"hi", "case and line breaks don't matter");
+        assert!(data_url("data:text/plain,hi").is_err(), "not base64");
+        assert!(data_url("data:image/png;base64").is_err(), "no comma");
+        assert!(data_url("https://x.example/a.png").is_err());
+        assert!(data_url("da").is_err(), "short input doesn't panic");
+        assert!(data_url("dä").is_err(), "nor does a multi-byte character at the cut");
+    }
+
+    #[test]
+    fn fetch_refuses_other_schemes_without_network() {
+        for url in ["file:///etc/passwd", "ftp://x.example/a.png", "cid:x", "", "ht"] {
+            assert!(fetch(url).is_err(), "{url}");
+        }
     }
 
     #[test]

@@ -642,6 +642,7 @@ impl NightPostApp {
             }
         }
         // Preferences.
+        let blitz = self.blitz_engine();
         if let Some(prefs) = &mut self.prefs {
             prefs.push = self.push.clone();
             prefs.google_ready = self.google_ready;
@@ -649,6 +650,7 @@ impl NightPostApp {
             prefs.load_images = self.load_images;
             prefs.dark_emails = self.dark_emails;
             prefs.faces = self.faces.enabled.get();
+            prefs.blitz = blitz;
             prefs.google_waiting = self.google.as_ref().map(|g| g.1.clone());
             let act = prefs.ui(ctx, &col, &self.themes, &self.theme_id, &self.accounts, &mut self.list_settings, &self.sigs);
             match act {
@@ -684,6 +686,7 @@ impl NightPostApp {
                 PrefsAction::SetHtmlEmail(on) => self.html_email = on,
                 PrefsAction::SetLoadImages(on) => self.load_images = on,
                 PrefsAction::SetDarkEmails(on) => self.dark_emails = on,
+                PrefsAction::SetBlitz(on) => self.set_blitz_engine(on),
                 PrefsAction::SetFaces(on) => {
                     self.faces.enabled.set(on);
                     self.faces.clear();

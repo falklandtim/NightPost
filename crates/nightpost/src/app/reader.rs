@@ -63,8 +63,26 @@ impl NightPostApp {
 
                 // HTML email: the subject stays here and the web view shows
                 // the conversation below it.
-                let web = self.html_email && self.mail_view.is_some();
+                let web = self.html_email && self.mail_view.is_some() && !self.blitz_engine();
+                // Blitz (Linux): egui draws the message cards and Blitz each
+                // HTML body inside them, so their text can be selected.
+                #[cfg(target_os = "linux")]
+                let mut blitz = self.blitz.as_mut().filter(|_| self.html_email);
+                let remote = self.load_images || self.remote_images.contains(&thread_ref);
                 let Some(open) = &mut self.open else { return };
+                #[cfg(target_os = "linux")]
+                if let Some(b) = blitz.as_deref_mut() {
+                    b.keep_only(&open.messages);
+                }
+                // An HTML body drawn by Blitz, if that's the engine; false shows the text.
+                let mut html = |ui: &mut egui::Ui, m: &Message| -> bool {
+                    #[cfg(target_os = "linux")]
+                    if let Some(b) = blitz.as_deref_mut() {
+                        return b.show(ui, &col, m, remote);
+                    }
+                    let _ = (ui, m, remote);
+                    false
+                };
                 let mut draw = |ui: &mut egui::Ui| {
                     // Generous space around the conversation, like Canary.
                     let margin = egui::Margin { left: 48, right: 48, top: 34, bottom: if web { 4 } else { 36 } };
@@ -106,32 +124,7 @@ impl NightPostApp {
                             return;
                         }
                         ui.add_space(16.0);
-                        let n = open.messages.len();
-                        // Newest first, like the web view.
-                        for (i, m) in open.messages.iter().enumerate().rev() {
-                            let expanded = open.expanded.get(i).copied().unwrap_or(true);
-                            if i + 1 < n {
-                                ui.add_space(6.0);
-                            }
-                            let (r, clicked) = message_card(ui, &col, m, expanded, i + 1 == n, &downloading, &self.faces);
-                            if let Some((idx, what)) = clicked {
-                                attachment_req = Some((m.clone(), idx, what));
-                            }
-                            if r && i + 1 != n {
-                                if let Some(e) = open.expanded.get_mut(i) {
-                                    *e = !*e;
-                                }
-                            }
-                            ui.add_space(10.0);
-                        }
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            for (i, (icon, label)) in [(Icon::Reply, "Reply"), (Icon::ReplyAll, "Reply all"), (Icon::Forward, "Forward")].into_iter().enumerate() {
-                                if icons::labeled(ui, icon, label, col.text, col.bg).clicked() {
-                                    ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("reply_click"), i as u8));
-                                }
-                            }
-                        });
+                        attachment_req = cards(ui, &col, open, &downloading, &self.faces, &mut html);
                     });
                 };
                 let mut web_rect = None;
@@ -142,6 +135,7 @@ impl NightPostApp {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| draw(ui));
                 }
                 self.web_rect = web_rect;
+                self.blitz_clicks(ctx, &thread_ref);
                 if let Some(f) = remove_label {
                     self.set_label(thread_ref.0, &thread_ref.1, &f, false);
                 }
@@ -157,17 +151,55 @@ impl NightPostApp {
             });
     }
 
+    /// Whether Blitz is the chosen engine for HTML email (Linux only).
+    pub(super) fn blitz_engine(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.blitz.is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    /// Switch HTML email between Blitz and WebKitGTK (Linux only).
+    pub(super) fn set_blitz_engine(&mut self, on: bool) {
+        #[cfg(target_os = "linux")]
+        {
+            self.blitz = on.then(super::blitz_body::Bodies::new);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = on;
+    }
+
+    /// Act on clicks in emails drawn by Blitz (Linux): open links, and load
+    /// web pictures in `thread` after "Load images".
+    fn blitz_clicks(&mut self, ctx: &egui::Context, thread: &(AccountId, String)) {
+        #[cfg(target_os = "linux")]
+        for click in self.blitz.as_mut().map(|b| b.take_clicks()).unwrap_or_default() {
+            match click {
+                super::blitz_body::Click::Link(url) => Self::open_link(ctx, url),
+                super::blitz_body::Click::LoadImages => {
+                    self.remote_images.insert(thread.clone());
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (ctx, thread);
+    }
+
+    /// Open a link from an email in the browser. Only web and mail links:
+    /// anything else (`file:`, `javascript:`, the app's own) is ignored.
+    pub(super) fn open_link(ctx: &egui::Context, url: String) {
+        if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+            ctx.open_url(egui::OpenUrl::new_tab(url));
+        }
+    }
+
     /// Act on clicks and keys from the HTML message view.
     pub(super) fn mail_view_events(&mut self, ctx: &egui::Context) {
         use crate::mail_view::ViewEvent;
         let events = self.mail_view.as_mut().map(|v| v.events()).unwrap_or_default();
         for e in events {
             match e {
-                ViewEvent::OpenLink(url) => {
-                    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
-                        ctx.open_url(egui::OpenUrl::new_tab(url));
-                    }
-                }
+                ViewEvent::OpenLink(url) => Self::open_link(ctx, url),
                 ViewEvent::Attachment(id, i) | ViewEvent::SaveAttachment(id, i) | ViewEvent::SaveAttachmentAs(id, i) => {
                     let what = match e {
                         ViewEvent::SaveAttachment(..) => AttachmentClick::SaveToDownloads,
@@ -200,13 +232,15 @@ impl NightPostApp {
         // The macOS view is a native overlay, so it hides under menus and
         // windows; Linux draws the page inside egui, which layers correctly.
         let covered = cfg!(target_os = "macos") && (self.prefs.is_some() || self.setup.is_some() || self.new_tab.is_some() || self.show_keys || self.activity.is_some() || egui::Popup::is_any_open(ctx));
+        // With Blitz, the reading pane draws the emails itself.
+        let blitz = self.blitz_engine();
         let (Some(view), Some(rect), Some(open)) = (self.mail_view.as_mut(), self.web_rect, self.open.as_ref()) else {
             if let Some(v) = self.mail_view.as_mut() {
                 v.hide();
             }
             return;
         };
-        if covered || !self.html_email {
+        if covered || !self.html_email || blitz {
             view.hide();
             return;
         }
@@ -304,8 +338,51 @@ pub(super) fn label_chip(ui: &mut egui::Ui, text: &str, color: egui::Color32) ->
     r.inner.on_hover_text("Remove label")
 }
 
+/// The conversation as cards, newest first, then Reply, Reply all and
+/// Forward. Folds a card whose header was clicked, and returns an
+/// attachment that was clicked. `html` is as for [`message_card`].
+fn cards(
+    ui: &mut egui::Ui,
+    col: &Colors,
+    open: &mut OpenThread,
+    downloading: &HashSet<(MessageId, usize)>,
+    faces: &crate::avatars::Faces,
+    html: &mut dyn FnMut(&mut egui::Ui, &Message) -> bool,
+) -> Option<(Message, usize, AttachmentClick)> {
+    let mut req = None;
+    let n = open.messages.len();
+    // Newest first, like the web view.
+    for (i, m) in open.messages.iter().enumerate().rev() {
+        let expanded = open.expanded.get(i).copied().unwrap_or(true);
+        if i + 1 < n {
+            ui.add_space(6.0);
+        }
+        let (r, clicked) = message_card(ui, col, m, expanded, i + 1 == n, downloading, faces, html);
+        if let Some((idx, what)) = clicked {
+            req = Some((m.clone(), idx, what));
+        }
+        if r && i + 1 != n {
+            if let Some(e) = open.expanded.get_mut(i) {
+                *e = !*e;
+            }
+        }
+        ui.add_space(10.0);
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        for (i, (icon, label)) in [(Icon::Reply, "Reply"), (Icon::ReplyAll, "Reply all"), (Icon::Forward, "Forward")].into_iter().enumerate() {
+            if icons::labeled(ui, icon, label, col.text, col.bg).clicked() {
+                ui.ctx().memory_mut(|m| m.data.insert_temp(egui::Id::new("reply_click"), i as u8));
+            }
+        }
+    });
+    req
+}
+
 /// One message in the reader. Returns whether its header was clicked
-/// (to fold it) and any attachment that was clicked.
+/// (to fold it) and any attachment that was clicked. `html` draws the
+/// message's HTML body and returns true, or returns false for the text.
+#[allow(clippy::too_many_arguments)] // one call site, each a different part of the card
 pub(super) fn message_card(
     ui: &mut egui::Ui,
     col: &Colors,
@@ -314,6 +391,7 @@ pub(super) fn message_card(
     is_last: bool,
     downloading: &HashSet<(MessageId, usize)>,
     faces: &crate::avatars::Faces,
+    html: &mut dyn FnMut(&mut egui::Ui, &Message) -> bool,
 ) -> (bool, Option<(usize, AttachmentClick)>) {
     let mut toggled = false;
     let mut clicked = None;
@@ -369,7 +447,9 @@ pub(super) fn message_card(
                     hairline(ui, col);
                 }
                 ui.add_space(20.0);
-                body(ui, col, &m.body_text);
+                if !html(ui, m) {
+                    body(ui, col, &m.body_text);
+                }
             }
         });
     (toggled, clicked)
