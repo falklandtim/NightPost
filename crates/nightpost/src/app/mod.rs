@@ -40,6 +40,8 @@ mod blitz_body;
 mod blitz_net;
 mod input;
 mod list;
+#[cfg(target_os = "linux")]
+mod momentum;
 mod reader;
 mod sheets;
 mod sidebar;
@@ -396,6 +398,9 @@ pub struct NightPostApp {
     remote_images: HashSet<(AccountId, String)>,
     /// Keys pressed in the web view, fed to egui next frame.
     pending_input: Vec<egui::Event>,
+    /// Touchpad momentum, which Wayland leaves to the app (the Mac adds its own).
+    #[cfg(target_os = "linux")]
+    momentum: momentum::Momentum,
     swipe: Option<Swipe>,
     /// A row whose right-click menu should open at this point when the
     /// list next draws it (a swipe's More button).
@@ -595,6 +600,8 @@ impl NightPostApp {
             web_rect: None,
             remote_images: HashSet::new(),
             pending_input: vec![],
+            #[cfg(target_os = "linux")]
+            momentum: Default::default(),
             swipe: None,
             row_menu_for: None,
             last_wheel_x: None,
@@ -880,7 +887,13 @@ impl eframe::App for NightPostApp {
         self.frame(ctx);
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        #[cfg(target_os = "linux")]
+        if self.momentum.process(raw_input) {
+            ctx.request_repaint();
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = ctx;
         // Shortcuts typed while a message (the web view) had focus.
         for e in self.pending_input.drain(..) {
             if let egui::Event::Key { modifiers, .. } = &e {

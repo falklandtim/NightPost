@@ -107,6 +107,7 @@ Older copies of NightPost ignore fields they don't know, and may rewrite the sta
 | `app/reader.rs` | The open conversation (cards, or the HTML web view), attachments |
 | `app/blitz_body.rs` | Linux, when Blitz is the chosen engine: each HTML email drawn by Blitz on the CPU into egui textures in its card, with text selection and copy |
 | `app/blitz_net.rs` | Where Blitz gets an email's pictures: `data:` at once, web content (when allowed) from four `blitz-fetch-N` threads through `email_view::fetch`, with a size check before decoding |
+| `app/momentum.rs` | Linux: touchpad momentum after a flick, which Wayland leaves to the app (the Mac's system adds its own), fed through `raw_input_hook` |
 | `app/toolbar.rs` | The toolbar and its pop-ups (Move, Label, More, Snooze calendar) |
 | `app/sheets.rs` | Dialogs and other windows: shortcuts, Sync activity, folders, new tab, Show original, composers, preferences |
 | `app/actions.rs` | What each command does, multi-select, undo, Undo Send |
