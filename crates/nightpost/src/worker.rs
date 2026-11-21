@@ -916,14 +916,14 @@ mod push {
     const STALE: Duration = Duration::from_secs(idle::CYCLE.as_secs() + 3 * 60);
 
     #[derive(Clone)]
-    struct Watch {
-        generation: u64,
-        beat: Instant,
+    pub(super) struct Watch {
+        pub(super) generation: u64,
+        pub(super) beat: Instant,
         /// The server can't push: don't keep retrying.
-        unsupported: bool,
+        pub(super) unsupported: bool,
     }
 
-    type Watches = Arc<Mutex<HashMap<AccountId, Watch>>>;
+    pub(super) type Watches = Arc<Mutex<HashMap<AccountId, Watch>>>;
 
     pub fn spawn(db: PathBuf, sync_tx: Sender<SyncReq>, ev: Sender<Event>, ctx: eframe::egui::Context) {
         let watches: Watches = Default::default();
@@ -1004,7 +1004,7 @@ mod push {
         }
     }
 
-    fn run(db: &std::path::Path, id: AccountId, generation: u64, watches: &Watches, sync_tx: &Sender<SyncReq>, notify: &dyn Fn(&Store, PushState)) {
+    pub(super) fn run(db: &std::path::Path, id: AccountId, generation: u64, watches: &Watches, sync_tx: &Sender<SyncReq>, notify: &dyn Fn(&Store, PushState)) {
         let Ok(store) = Store::open(db) else { return };
         let mut failures = 0u32;
         while current(watches, id, generation) {
@@ -1044,6 +1044,12 @@ mod push {
                     notify(&store, PushState::Unavailable("the server doesn't support it".into()));
                     return;
                 }
+                // Replaced while it failed: after the Mac wakes, the
+                // supervisor starts a fresh thread at once, and this one
+                // only then finds its socket dead. Leave quietly, or the log
+                // says "Push dropped" right after "Push connected" and
+                // Preferences shows "reconnecting" over the live connection.
+                Err(_) if !current(watches, id, generation) => return,
                 Err(e) => {
                     failures += 1;
                     let wait = idle::backoff(failures);
@@ -1100,6 +1106,51 @@ mod tests {
         }
         assert_eq!(*log.lock().unwrap(), [0, 1, 2, 3, 4]);
         assert!(turns.state.lock().unwrap().is_empty(), "finished conversations are forgotten");
+    }
+
+    /// A push thread replaced while its connection was failing (as after
+    /// sleep) stops without reporting a drop over the new connection.
+    #[test]
+    fn replaced_push_threads_leave_quietly() {
+        use nightpost_core::{Security, ServerConfig};
+        use std::sync::Mutex;
+        let db = std::env::temp_dir().join(format!("np-push-stale-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = ServerConfig { host: "127.0.0.1".into(), port: listener.local_addr().unwrap().port(), security: Security::Tls };
+        let account = Account {
+            id: 0,
+            display_name: "A".into(),
+            email: "a@example.com".into(),
+            username: "a@example.com".into(),
+            imap: server.clone(),
+            smtp: server,
+            color: "#000".into(),
+            signature: String::new(),
+            demo: false,
+            auth: Auth::Password,
+        };
+        let id = store.add_account(&account).unwrap();
+        store.upsert_folder(id, "INBOX", FolderRole::Inbox).unwrap();
+        let watches: push::Watches = Default::default();
+        watches.lock().unwrap().insert(id, push::Watch { generation: 1, beat: Instant::now(), unsupported: false });
+        // The "server": the supervisor replaces the thread, then the
+        // connection dies before TLS can start.
+        let w = watches.clone();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            w.lock().unwrap().insert(id, push::Watch { generation: 2, beat: Instant::now(), unsupported: false });
+            drop(conn);
+        });
+        let (sync_tx, _sync_rx) = crossbeam_channel::unbounded();
+        let told = Mutex::new(vec![]);
+        push::run(&db, id, 1, &watches, &sync_tx, &|_, st| told.lock().unwrap().push(format!("{st:?}")));
+        server.join().unwrap();
+        let told = told.into_inner().unwrap();
+        assert!(!told.iter().any(|s| s.starts_with("Retrying")), "{told:?}");
+        assert_eq!(watches.lock().unwrap()[&id].generation, 2, "the replacement is left in charge");
+        let _ = std::fs::remove_file(&db);
     }
 
     /// A burst of actions on one account never has more than

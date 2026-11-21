@@ -23,7 +23,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -300,12 +300,26 @@ impl std::fmt::Display for SignInExpired {
 impl std::error::Error for SignInExpired {}
 
 /// Access tokens in memory, by account email, with when they expire.
-static TOKENS: Mutex<Option<HashMap<String, (String, Instant)>>> = Mutex::new(None);
+/// Wall-clock time, not `Instant`: on a Mac `Instant` stops while it
+/// sleeps, so after a night's sleep an hour-old token still looked fresh,
+/// Gmail refused it at every wake ("the server turned down the sign-in")
+/// and only the retry fetched a new one.
+static TOKENS: Mutex<Option<HashMap<String, (String, SystemTime)>>> = Mutex::new(None);
 
 fn remember(email: &str, token: &str, expires_in: Duration) {
+    remember_at(email, token, expires_in, SystemTime::now());
+}
+
+fn remember_at(email: &str, token: &str, expires_in: Duration, now: SystemTime) {
     // Renew a few minutes early so a token never expires mid-connection.
-    let until = Instant::now() + expires_in.saturating_sub(Duration::from_secs(300));
+    let until = now + expires_in.saturating_sub(Duration::from_secs(300));
     TOKENS.lock().unwrap().get_or_insert_with(HashMap::new).insert(email.to_ascii_lowercase(), (token.to_string(), until));
+}
+
+/// The cached token for `email`, if it's still good at `now`.
+fn cached(email: &str, now: SystemTime) -> Option<String> {
+    let (t, until) = TOKENS.lock().unwrap().as_ref()?.get(&email.to_ascii_lowercase())?.clone();
+    (now < until).then_some(t)
 }
 
 /// Save a completed sign-in for an account's email.
@@ -317,11 +331,8 @@ pub fn store_sign_in(s: &SignedIn) -> Result<()> {
 
 /// A valid access token for a Google account: cached, or refreshed.
 pub fn access_token(account: &Account) -> Result<String> {
-    let key = account.email.to_ascii_lowercase();
-    if let Some((t, until)) = TOKENS.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
-        if Instant::now() < until {
-            return Ok(t);
-        }
+    if let Some(t) = cached(&account.email, SystemTime::now()) {
+        return Ok(t);
     }
     let client = GoogleClient::load().ok_or_else(|| anyhow!("Google sign-in isn't set up — add your client ID in Preferences > Accounts"))?;
     let refresh = credentials::get_refresh_token(&account.email).map_err(|_| anyhow!(SignInExpired))?;
@@ -388,6 +399,19 @@ pub fn xoauth2_base64(user: &str, token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A token cached before the Mac slept is stale by the clock on the
+    /// wall when it wakes, however little the process ran meanwhile.
+    #[test]
+    fn cached_tokens_expire_by_the_wall_clock() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        remember_at("Sleepy@example.com", "tok", Duration::from_secs(3600), t0);
+        assert_eq!(cached("sleepy@example.com", t0 + Duration::from_secs(60)).as_deref(), Some("tok"));
+        // Renewed five minutes before Google's expiry, and after.
+        assert_eq!(cached("sleepy@example.com", t0 + Duration::from_secs(3300)), None);
+        assert_eq!(cached("sleepy@example.com", t0 + Duration::from_secs(8 * 3600)), None);
+        assert_eq!(cached("nobody@example.com", t0), None);
+    }
 
     #[test]
     fn pkce_challenge_is_base64url_sha256() {
