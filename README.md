@@ -180,3 +180,18 @@ Builds print `warning: the following packages contain code that will be rejected
 Planned fix: move to a maintained IMAP client that uses `imap-proto` 0.16, rather than patching the old copy. The choice between `async-imap` and `imap` 3.0 (still an alpha), and how to port and test it, is in [docs/imap-upgrade.md](docs/imap-upgrade.md).
 
 See the details with `cargo report future-incompatibilities --package imap-proto@0.10.2`.
+
+### Unmaintained crates that `cargo audit` warns about
+
+`cargo audit` reports no vulnerabilities in these crates, only that nobody maintains them now (or, for `lexical-core`, that old versions are unsound). NightPost doesn't use any of them directly except `chrono`. Each comes in through another crate, and goes when that one moves on.
+
+| Crate | Advisory | Comes from | Plan |
+|---|---|---|---|
+| `lexical-core` 0.7.6 (unsound) | RUSTSEC-2023-0086 | `nom` 5, used by `imap` 2.4.1 | Goes with the move off `imap` 2.4.1 ([docs/imap-upgrade.md](docs/imap-upgrade.md)) |
+| `chrono` 0.4 | RUSTSEC-2026-0543 | NightPost's own dates, and `imap` 2.4.1 | Watch for a maintained fork or successor; dates are used throughout, so moving is its own planned change |
+| `ttf-parser` 0.25 | RUSTSEC-2026-0192 | `egui`'s font drawing (`ab_glyph`) | Goes when `egui` moves to another font library |
+| `zbus_names`, `zvariant`, `zvariant_derive` | RUSTSEC-2026-0370 to -0372 | Linux accessibility in `egui` (`accesskit_unix`, `atspi`) | Goes with an `egui`/`accesskit` update |
+| `paste` 1.0 | RUSTSEC-2024-0436 | `wgpu` on the Mac (`metal`) | Goes with a `wgpu` update |
+| `basic-toml` 0.1 | RUSTSEC-2026-0374 | The iPhone bindings generator (`uniffi`, `askama`), at build time only | Goes with a `uniffi` update |
+
+These are checked each month with the code audit ([docs/code-audit.md](docs/code-audit.md)).
