@@ -52,6 +52,13 @@ CREATE TABLE IF NOT EXISTS folders (
     last_uid     INTEGER NOT NULL DEFAULT 0,
     UNIQUE(account_id, path)
 );
+-- Each folder's STATUS after its last full check, so the next sync can
+-- leave it alone if nothing changed (sync_plan.rs).
+CREATE TABLE IF NOT EXISTS folder_status (
+    folder_id    INTEGER PRIMARY KEY REFERENCES folders(id) ON DELETE CASCADE,
+    status       TEXT NOT NULL,
+    checked_at   INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY,
     account_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

@@ -105,6 +105,17 @@ impl Mail {
         Ok(folder_list(store.folders(account_id)?))
     }
 
+    /// Sync one folder straight away, for a folder just opened while the
+    /// full sync is still working through the others. Returns how many
+    /// new emails came. Blocks on the network; nothing for the demo.
+    pub fn sync_folder(&self, folder_id: i64) -> Result<u32> {
+        let store = self.worker()?;
+        let folder = store.folder(folder_id)?.ok_or_else(|| super::fail("that folder no longer exists"))?;
+        let account = self.account(&store, folder.account_id)?;
+        let n = nightpost_core::engine::sync_folder_now(&store, &account, &folder)?;
+        Ok(n.try_into().unwrap_or(u32::MAX))
+    }
+
     /// The conversations in one folder, newest first with pinned ones on
     /// top. `query` uses the desktop's search words; empty shows them all.
     pub fn folder_threads(&self, folder_id: i64, query: String, limit: u32) -> Result<Vec<ThreadRow>> {

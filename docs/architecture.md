@@ -23,6 +23,8 @@ nightpost (binary)
 └── uses nightpost-core
         ├── store/         SQLite: accounts, folders, mail, snoozes, pins, tabs (a file each)
         ├── engine.rs      IMAP sync and every server-side action
+        ├── sync_plan.rs   which folders sync first, and which can be skipped as unchanged (STATUS, CONDSTORE)
+        ├── slim_fetch.rs  big emails downloaded without their attachments (BODYSTRUCTURE)
         ├── idle.rs        push mail (IMAP IDLE)
         ├── snooze_sync.rs the state kept on each server (snoozes, pins, tabs)
         ├── smtp.rs, oauth.rs, credentials.rs, parse.rs, category.rs
@@ -52,7 +54,7 @@ The UI thread draws each frame and never waits on the network.
 | Thread | Does | Started in |
 |---|---|---|
 | UI (main) | egui: draws, handles input, changes the local store at once | `main.rs`, `app/` |
-| `sync` | One sync at a time, every 5 minutes or on request. Requests that queue up meanwhile are merged (`SyncPlan`). A pushed change syncs just that Inbox. After mail, each account's server state (snoozes, pins, tabs) is merged. | `worker::Worker::spawn` |
+| `sync` | One sync at a time, every 5 minutes or on request. Requests that queue up meanwhile are merged (`SyncPlan`). A pushed change syncs just that Inbox. The accounts run side by side, a scoped thread each with its own connection and database handle (`engine::sync_accounts`). Within an account, folders go in order of importance and unchanged ones are skipped (`sync_plan.rs`); big emails come without attachments (`slim_fetch.rs`). After mail, each account's server state (snoozes, pins, tabs) is merged. | `worker::Worker::spawn` |
 | push | One IMAP IDLE connection per account on its Inbox, run by a supervisor that replaces stalled ones, re-issued every 8 minutes and restarted after sleep. Every IMAP connection sends TCP keepalives after 60 quiet seconds (`engine::open_tcp`), so a silent IDLE isn't dropped on the way. A change from the server asks `sync` for that Inbox. | `worker::push` |
 | `actions` | Takes each `Cmd` from the UI and runs it on its own short-lived thread. Commands on the same conversation take turns in the order sent (`Turns`), so an undo never overtakes its action. At most three run against one account's server at once (`Lanes`), so a burst doesn't hit Gmail's connection limit. | `worker::Worker::spawn` |
 | `avatars-N` | A few sender-picture lookups at a time (Contacts photo, BIMI logo, site icon). | `worker::Worker::spawn` |
@@ -76,7 +78,7 @@ Archiving a conversation, for example:
 
 | What | Where |
 |---|---|
-| Accounts, folders, cached mail (headers, bodies, attachment names), snoozes, pins, tabs and rules, signatures, sync health and activity | SQLite (`store/`). Tables are created with `CREATE TABLE IF NOT EXISTS`; columns added later get guarded `ALTER TABLE` migrations in `Store::open`. The `outbox` table is created but unused: Undo Send holds the message in memory, and quitting sends it first. |
+| Accounts, folders (and each one's status at its last full check, `folder_status`), cached mail (headers, bodies, attachment names), snoozes, pins, tabs and rules, signatures, sync health and activity | SQLite (`store/`). Tables are created with `CREATE TABLE IF NOT EXISTS`; columns added later get guarded `ALTER TABLE` migrations in `Store::open`. The `outbox` table is created but unused: Undo Send holds the message in memory, and quitting sends it first. |
 | Passwords, Google refresh tokens, the Google client secret | The system keychain (`credentials.rs`): macOS Keychain, Secret Service on Linux. Never in the database. |
 | Window size, theme, list options, open folders, collapsed accounts | eframe's settings storage (keys `nightpost.*` in `app/mod.rs`) |
 | Attachment files | Fetched when first opened and cached in the system cache folder (`attachments/`); the server keeps the real copy |

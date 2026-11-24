@@ -448,29 +448,7 @@ impl Worker {
                             last = Instant::now();
                         }
                         let accounts: Vec<Account> = all_accounts.into_iter().filter(|a| plan.covers_fully(a.id)).collect();
-                        let mut new = 0;
-                        let mut errors = vec![];
-                        for a in accounts {
-                            let ev2 = ev.clone();
-                            let ctx2 = ctx.clone();
-                            let r = engine::sync_account(&store, &a, |p| {
-                                let msg = match p {
-                                    SyncProgress::Folder { name, done, total, .. } => {
-                                        format!("Syncing {} — {name} ({}/{total})", a.email, done + 1)
-                                    }
-                                    SyncProgress::NewMessages { .. } => {
-                                        let _ = ev2.send(Event::Changed);
-                                        return;
-                                    }
-                                };
-                                let _ = ev2.send(Event::Status(msg));
-                                ctx2.request_repaint();
-                            });
-                            match r {
-                                Ok(n) => new += n,
-                                Err(e) => errors.push(format!("{}: {e:#}", a.email)),
-                            }
-                        }
+                        let (new, errors) = sync_side_by_side(&store, accounts, &ev, &ctx);
                         let _ = ev.send(Event::SyncFinished { new, errors });
                         ctx.request_repaint();
                     }
@@ -1076,6 +1054,36 @@ mod push {
         }
     }
     impl std::error::Error for Unsupported {}
+}
+
+/// Sync these accounts side by side, so one big account doesn't hold up
+/// the rest, telling the window how far each has got. Returns the new
+/// emails and each account's error.
+fn sync_side_by_side(store: &Store, accounts: Vec<Account>, ev: &Sender<Event>, ctx: &eframe::egui::Context) -> (usize, Vec<String>) {
+    let emails: std::collections::HashMap<_, _> = accounts.iter().map(|a| (a.id, a.email.clone())).collect();
+    let report = |p: SyncProgress| {
+        let msg = match p {
+            SyncProgress::Folder { account_id, name, done, total } => {
+                let email = emails.get(&account_id).map(String::as_str).unwrap_or_default();
+                format!("Syncing {email} — {name} ({}/{total})", done + 1)
+            }
+            SyncProgress::NewMessages { .. } => {
+                let _ = ev.send(Event::Changed);
+                return;
+            }
+        };
+        let _ = ev.send(Event::Status(msg));
+        ctx.request_repaint();
+    };
+    let mut new = 0;
+    let mut errors = vec![];
+    for (a, r) in engine::sync_accounts(store, accounts, report) {
+        match r {
+            Ok(n) => new += n,
+            Err(e) => errors.push(format!("{}: {e:#}", a.email)),
+        }
+    }
+    (new, errors)
 }
 
 #[cfg(test)]

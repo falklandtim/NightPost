@@ -74,6 +74,25 @@ fn spam_goes_to_the_spam_folder() {
     assert!(mail.folder_threads(spam.id, String::new(), 500).unwrap().iter().any(|r| r.thread_key == key));
 }
 
+/// Opening a folder syncs it straight away: on the demo that's nothing
+/// to fetch (it never touches the network), and a folder that's gone says so.
+#[test]
+fn a_folder_syncs_on_its_own() {
+    let (mail, _) = demo();
+    let acc = mail.accounts().unwrap()[0].id;
+    let inbox = mail.folders(acc).unwrap().into_iter().find(|f| f.kind == FolderKind::Inbox).unwrap();
+    assert_eq!(mail.sync_folder(inbox.id).unwrap(), 0);
+    assert!(mail.sync_folder(i64::MAX).is_err());
+}
+
+/// Accounts sync side by side, so the caption adds their folders up.
+#[test]
+fn sync_progress_adds_up_the_accounts() {
+    let each = HashMap::from([(1, (10, 110)), (2, (3, 20))]);
+    assert_eq!(add_up(&each), (13, 130));
+    assert_eq!(add_up(&HashMap::new()), (0, 0));
+}
+
 #[test]
 fn snooze_and_wake() {
     let (mail, _) = demo();

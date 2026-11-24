@@ -19,6 +19,7 @@
 
 use nightpost_core::presets::Provider;
 use nightpost_core::{credentials, demo, engine, snooze_sync, Account, Auth, FolderRole, MailboxView, Store, ThreadSummary};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -174,17 +175,22 @@ pub struct SyncResult {
     pub error: Option<String>,
 }
 
-/// How far a running sync has got: which account, and how many of its
-/// folders are done, for the caption by the spinner.
+/// Every account's (folders done, folders) added together.
+fn add_up(each: &HashMap<i64, (usize, usize)>) -> (usize, usize) {
+    each.values().fold((0, 0), |(d, t), (a, b)| (d.saturating_add(*a), t.saturating_add(*b)))
+}
+
+/// How far a running sync has got, for the caption by the spinner. The
+/// accounts sync side by side, so the counts are theirs added together.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct SyncStatus {
-    /// The account being synced.
+    /// The account that last moved on to a folder.
     pub email: String,
-    /// The folder being synced now.
+    /// The folder it moved on to.
     pub folder: String,
-    /// Folders finished so far in this account.
+    /// Folders finished so far, in every account being synced.
     pub done: u32,
-    /// Folders in this account.
+    /// Folders in every account being synced (that has listed them yet).
     pub total: u32,
 }
 
@@ -338,9 +344,9 @@ impl Mail {
     }
 
     /// Fetch new mail and bring snoozes, pins and tabs into line with the
-    /// server, for one account or (with `None`) all of them. Wakes snoozes
-    /// that are due. One account failing doesn't stop the others. Blocks on
-    /// the network.
+    /// server, for one account or (with `None`) all of them, side by side.
+    /// Wakes snoozes that are due. One account failing doesn't stop the
+    /// others. Blocks on the network.
     pub fn sync(&self, account_id: Option<i64>) -> Result<Vec<SyncResult>> {
         let store = self.worker()?;
         let accounts: Vec<Account> = match account_id {
@@ -348,19 +354,24 @@ impl Mail {
             None => store.accounts()?,
         };
         let _ = snooze_sync::wake_due(&store);
-        let results = accounts
+        let emails: HashMap<i64, String> = accounts.iter().map(|a| (a.id, a.email.clone())).collect();
+        // Each account's (done, total), to add up for the caption.
+        let each = Mutex::new(HashMap::<i64, (usize, usize)>::new());
+        let report = |p: engine::SyncProgress| {
+            if let engine::SyncProgress::Folder { account_id, name, done, total } = p {
+                let mut each = each.lock().unwrap_or_else(|p| p.into_inner());
+                each.insert(account_id, (done, total));
+                let (done, total) = add_up(&each);
+                let n = |x: usize| x.try_into().unwrap_or(u32::MAX);
+                let email = emails.get(&account_id).cloned().unwrap_or_default();
+                self.set_progress(Some(SyncStatus { email, folder: name, done: n(done), total: n(total) }));
+            }
+        };
+        let results = engine::sync_accounts(&store, accounts, report)
             .into_iter()
-            .map(|a| {
-                let report = |p: engine::SyncProgress| {
-                    if let engine::SyncProgress::Folder { name, done, total, .. } = p {
-                        let n = |x: usize| x.try_into().unwrap_or(u32::MAX);
-                        self.set_progress(Some(SyncStatus { email: a.email.clone(), folder: name, done: n(done), total: n(total) }));
-                    }
-                };
-                match engine::sync_account(&store, &a, report) {
-                    Ok(n) => SyncResult { email: a.email, new_messages: n.try_into().unwrap_or(u32::MAX), error: None },
-                    Err(e) => SyncResult { email: a.email, new_messages: 0, error: Some(format!("{e:#}")) },
-                }
+            .map(|(a, r)| match r {
+                Ok(n) => SyncResult { email: a.email, new_messages: n.try_into().unwrap_or(u32::MAX), error: None },
+                Err(e) => SyncResult { email: a.email, new_messages: 0, error: Some(format!("{e:#}")) },
             })
             .collect();
         self.set_progress(None);

@@ -18,10 +18,12 @@ pub mod oauth;
 pub mod models;
 pub mod parse;
 pub mod presets;
+pub mod slim_fetch;
 pub mod smtp;
 pub mod snooze;
 pub mod snooze_sync;
 pub mod store;
+pub mod sync_plan;
 pub mod theme;
 
 pub use models::*;

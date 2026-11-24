@@ -258,6 +258,14 @@ final class MailModel {
         folder = f
         rows = []
         await reload()
+        // Don't wait for the full sync to reach it (it does the folders you
+        // look at most first). A failure is quiet: the folder shows what's
+        // here, and the full sync reports its own errors.
+        guard let f, let mail, !isDemo else { return }
+        // (Reloaded even with nothing new: reads and stars may have changed.)
+        if (try? await background { try mail.syncFolder(folderId: f.id) }) != nil, folder?.id == f.id {
+            await reload()
+        }
     }
 
     /// What the list is called: the folder's name, or the unified list's.

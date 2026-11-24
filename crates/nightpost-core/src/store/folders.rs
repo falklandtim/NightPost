@@ -64,8 +64,29 @@ impl Store {
         Ok(())
     }
 
+    /// The folder's status after its last full check (`sync_plan`), and
+    /// when that was, in seconds since 1970.
+    pub fn folder_status(&self, id: FolderId) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT status, checked_at FROM folder_status WHERE folder_id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
+    /// Save the folder's status after a full check.
+    pub fn set_folder_status(&self, id: FolderId, status: &str, checked_at: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO folder_status (folder_id, status, checked_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(folder_id) DO UPDATE SET status=excluded.status, checked_at=excluded.checked_at",
+            params![id, status, checked_at],
+        )?;
+        Ok(())
+    }
+
     /// Wipe a folder's cached messages (used when UIDVALIDITY changes).
     pub fn clear_folder(&self, id: FolderId) -> Result<()> {
+        // Its saved status no longer describes what's here.
+        self.conn.execute("DELETE FROM folder_status WHERE folder_id=?1", [id])?;
         self.conn.execute("DELETE FROM messages WHERE folder_id=?1", [id])?;
         self.conn.execute("UPDATE folders SET last_uid=0 WHERE id=?1", [id])?;
         Ok(())

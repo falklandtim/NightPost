@@ -56,7 +56,9 @@ Click either one for **Sync activity**, which you can also open with ⌘ Shift L
 
 Each account keeps a connection open to its Inbox, and the server tells NightPost about new mail as it arrives, usually within a couple of seconds. This is called push. Other folders are checked every 5 minutes. Preferences → Accounts shows how each account gets its mail: **instant (push)**, **reconnecting**, or **every 5 minutes** for servers that don't offer push.
 
-The first time an account syncs, NightPost downloads the newest 300 emails in each folder, starting with the Inbox. Older mail stays on the server.
+The first time an account syncs, NightPost downloads the newest 300 emails in each folder, starting with the ones you look at most: Inbox, Sent, Drafts and Archive (All Mail on Gmail). Older mail stays on the server. Accounts sync at the same time, each on its own. A big email comes down without its attachments, which are fetched when you open them, so a first sync takes far less time and data.
+
+After that, NightPost asks the server which folders have changed and checks only those, along with the Inbox every time. Each folder is still checked in full once a day (hourly on servers that can't report every change), in case something was missed.
 
 ## Changing or removing an account
 
