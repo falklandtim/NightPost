@@ -23,6 +23,17 @@ struct InboxView: View {
     var body: some View {
         @Bindable var model = model
         List {
+            // The tabs are the list's first row, so they scroll away with
+            // it. Pinned over the list in a bar (safeAreaBar), iOS 26 now and
+            // then put the bar behind the list, under a frosted layer over
+            // the title, the tabs and the first rows: on every first sync,
+            // when the tabs arrived after the list, and on coming back to
+            // the Inbox.
+            if model.tabsShown && !model.tabs.isEmpty {
+                TabStrip()
+                    .listRowInsets(EdgeInsets())
+                    .listRowSeparator(.hidden)
+            }
             if !pinned.isEmpty {
                 Section {
                     if !hidePinned {
@@ -36,7 +47,6 @@ struct InboxView: View {
                 ForEach(unpinned, id: \.self) { t in row(t) }
             }
         }
-        .modifier(TopBar(shown: model.tabsShown && !model.tabs.isEmpty) { TabStrip() })
         .listStyle(.plain)
         .overlay {
             if model.rows.isEmpty && model.started {
@@ -268,26 +278,6 @@ struct ThreadRowView: View {
             }
         }
         .padding(.vertical, 4)
-    }
-}
-
-/// A bar pinned under the navigation bar. On iOS 26 it joins the
-/// navigation bar's glass (a plain inset there is blurred over, title and
-/// all); before that, an inset with the bar's own background.
-struct TopBar<Bar: View>: ViewModifier {
-    let shown: Bool
-    @ViewBuilder let bar: () -> Bar
-
-    func body(content: Content) -> some View {
-        if #available(iOS 26, *) {
-            content.safeAreaBar(edge: .top, spacing: 0) {
-                if shown { bar() }
-            }
-        } else {
-            content.safeAreaInset(edge: .top, spacing: 0) {
-                if shown { bar().background(.bar) }
-            }
-        }
     }
 }
 

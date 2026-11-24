@@ -82,41 +82,6 @@ final class SwipeUITests: XCTestCase {
         XCTAssertTrue(app.buttons["New Folder…"].waitForExistence(timeout: 5), "and they work")
     }
 
-    /// The top rows stay uncovered while a sync runs. (More's actions were
-    /// once a dialog on the list, which on iOS 26 left a frosted layer over
-    /// the title, the tabs and the first rows.)
-    func testTopRowsStayUncoveredWhileSyncing() {
-        let app = XCUIApplication()
-        app.launchArguments = ["-demo", "-syncing"]
-        app.launch()
-        let all = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'All'")).firstMatch
-        XCTAssertTrue(all.waitForExistence(timeout: 10))
-        sleep(6)
-        // The layer only covered the screen, so look at it: the picked
-        // tab's blue shows through only when nothing is over it.
-        let uncovered = hasBlue(all.screenshot().image)
-        if !uncovered {
-            let shot = XCTAttachment(screenshot: app.screenshot())
-            shot.lifetime = .keepAlways
-            add(shot)
-        }
-        XCTAssertTrue(uncovered, "the All tab is drawn uncovered")
-    }
-
-    /// Whether any pixel is a strong blue (the accent colour), not the
-    /// washed-out grey of something seen through frosted glass.
-    private func hasBlue(_ image: UIImage) -> Bool {
-        guard let cg = image.cgImage else { return false }
-        let (w, h) = (cg.width, cg.height)
-        var px = [UInt8](repeating: 0, count: w * h * 4)
-        guard let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
-        return stride(from: 0, to: px.count, by: 4).contains { i in
-            Int(px[i + 2]) > 200 && Int(px[i]) < 90 && Int(px[i + 1]) < 170
-        }
-    }
-
     /// Picking Star for a full swipe right puts it first on that side, and
     /// Nothing turns the left side off.
     func testChoosingTheButtons() {

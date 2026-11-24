@@ -74,7 +74,8 @@ final class OrganiseUITests: XCTestCase {
     func testMoveToANewFolder() {
         let app = launch()
         XCTAssertTrue(tab(app, "All").waitForExistence(timeout: 10))
-        let cell = app.cells.element(boundBy: 0)
+        // The first conversation (the tabs are the list's first row).
+        let cell = app.cells.element(boundBy: 1)
         let subject = cell.staticTexts.element(boundBy: 1).label
         cell.press(forDuration: 1)
         app.buttons["Move or Label…"].tap()
@@ -119,7 +120,8 @@ final class OrganiseUITests: XCTestCase {
         XCTAssertTrue(invoices.waitForExistence(timeout: 5))
         invoices.tap()
         XCTAssertTrue(invoices.waitForSelected())
-        XCTAssertEqual(app.cells.count, 1, "just the one conversation")
+        // The tabs' row and the one conversation.
+        XCTAssertEqual(app.cells.count, 2, "just the one conversation")
     }
 }
 

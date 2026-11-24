@@ -21,6 +21,7 @@ struct TabStrip: View {
                 .padding(.horizontal)
                 .padding(.vertical, 6)
             }
+            .accessibilityIdentifier("Inbox Tabs")
             .onChange(of: model.tab) {
                 if let t = model.tabs.first(where: { $0.category == model.tab }) {
                     withAnimation { scroll.scrollTo(t.name, anchor: .center) }

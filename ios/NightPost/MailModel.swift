@@ -31,6 +31,9 @@ final class MailModel {
     /// How far the running sync has got (folder 12 of 110), for the
     /// caption by the spinner; `nil` when not syncing.
     private(set) var syncStatus: SyncStatus?
+    #if DEBUG
+    private let launched = Date()
+    #endif
     /// The demo accounts: seeded locally, never on the network.
     private(set) var isDemo = false
 
@@ -118,6 +121,13 @@ final class MailModel {
             if box == mailbox && folder == self.folder && search == self.search && shown == tabsShown && wanted == (shown ? tab : nil) {
                 rows = r
                 tabs = t
+                #if DEBUG
+                // UI tests: an account's first sync, when the tabs arrive
+                // only once it reaches the Inbox, after the list is up.
+                if ProcessInfo.processInfo.arguments.contains("-latetabs") && Date() < launched.addingTimeInterval(4) {
+                    tabs = []
+                }
+                #endif
                 if shown { tab = used }
             }
         } catch {
