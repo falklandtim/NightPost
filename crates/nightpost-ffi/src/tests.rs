@@ -64,6 +64,17 @@ fn actions_change_the_lists() {
 }
 
 #[test]
+fn spam_goes_to_the_spam_folder() {
+    let (mail, _) = demo();
+    let row = inbox(&mail).into_iter().find(|r| !r.pinned).unwrap();
+    let (acc, key) = (row.account_id, row.thread_key.clone());
+    mail.spam(acc, key.clone()).unwrap();
+    assert!(!inbox(&mail).iter().any(|r| r.thread_key == key && r.account_id == acc), "out of the Inbox");
+    let spam = mail.folders(acc).unwrap().into_iter().find(|f| f.kind == FolderKind::Spam).unwrap();
+    assert!(mail.folder_threads(spam.id, String::new(), 500).unwrap().iter().any(|r| r.thread_key == key));
+}
+
+#[test]
 fn snooze_and_wake() {
     let (mail, _) = demo();
     let row = inbox(&mail).into_iter().find(|r| !r.pinned).unwrap();

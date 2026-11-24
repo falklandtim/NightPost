@@ -30,7 +30,7 @@ ios/google-client-id.txt  the iOS OAuth client ID (not committed)
    - `threads(mailbox, query, limit)` for Inbox, Starred, Drafts, Sent, Archive, Trash and Snoozed across all accounts, with the desktop's search words;
    - `messages(accountId, threadKey)`: a conversation, oldest first, plain text;
    - `sync(accountId?)`: new mail, plus snoozes, pins and tabs from the server;
-   - `setRead`, `setStarred`, `setPinned`, `archive`, `trash`, `snooze(until)`, `unsnooze`;
+   - `setRead`, `setStarred`, `setPinned`, `archive`, `trash`, `spam`, `snooze(until)`, `unsnooze`;
    - `folders(accountId)`: an account's folders as the desktop sidebar lists them (standard first, then its own as a tree, with depth and parent), and `folderThreads(folderId, query, limit)`: one folder's conversations;
    - reading: `messagePage(messageId, remoteImages)`, an HTML email's page (or nothing for plain text); `inlineImage(messageId, cid)`, a picture sent inside an email; `attachmentFile(messageId, index)`, an attachment as a file;
    - writing: `startCompose(messageId, kind)` (reply, reply all, forward with its attachments), `openDraft`, `saveDraft`, `deleteDraft`, `send`, and `suggestContacts(prefix)`; a `Draft` carries the editor's HTML, the addresses as typed and attachments as files;
@@ -41,7 +41,7 @@ ios/google-client-id.txt  the iOS OAuth client ID (not committed)
 5. **The SwiftUI app, first screens:**
    - a welcome screen: add an account (app password, with where to make one; a Provider picker for your own domain) or try the demo;
    - Settings (☰ menu): accounts (add, or swipe to remove from the phone), appearance (Match iPhone, Light, Dark), leave the demo, version;
-   - the list across all accounts: unread dot, pin, star, attachment and count badges, account colour, pinned rows tinted; swipe right to archive or mark read, left to snooze, trash or pin; pull to sync; search with the desktop's words; a menu for the other lists (Snoozed, Starred, Drafts, Sent, Archive, Trash);
+   - the list across all accounts: unread dot, pin, star, attachment and count badges, account colour, pinned rows tinted; swipes as on the desktop (see 12 below); pull to sync; search with the desktop's words; a menu for the other lists (Snoozed, Starred, Drafts, Sent, Archive, Trash);
    - a conversation as cards, oldest first, in plain text, older read ones folded; archive, snooze, star, pin and trash at the bottom; opening it marks it read;
    - snooze: later today, this evening, tomorrow, this weekend, next week, or a date and time.
    
@@ -57,6 +57,8 @@ ios/google-client-id.txt  the iOS OAuth client ID (not committed)
 10. **Writing** (2026-11-14): the ✎ button (new), the reply arrow in a conversation (tap for Reply; hold for Reply All and Forward), a draft in Drafts, or a `mailto:` link. Native From, To, Cc, Bcc and Subject fields, with suggestions from mail you've had and the iPhone's contacts (iOS asks first). The body is a formatted editor: bold, italic, underline, lists and links. 📎 attaches from Photos (sent as JPEG) or Files; a forward keeps the original's attachments (the desktop doesn't yet). Cancel asks whether to save the draft to the server's Drafts folder, where the Mac sees it. Sending goes through the core's SMTP and files a copy in Sent. Over 25 MB is refused before sending.
 
 11. **Filing** (2026-11-15): press and hold a conversation in the list, or the folder button in a conversation, for the Move sheet: move it to a folder (searchable, or a new one), add or take off Gmail labels, put it in an Inbox tab, and choose which tab its sender's mail always goes to. Above the Inbox, a row of tabs (All, Primary, Promotions, Social and your own, each with its unread count) filters the list; a new tab can be made from the Move sheet, and pressing and holding your own tab removes it. Tabs and sorting rules sync with the computers through "NightPost Sync". Pinned conversations sit in their own section, which can be hidden. Seen in the simulator with the demo accounts only.
+
+12. **Swipes as on the desktop** (2026-11-24): ☰ → Settings → Swipes has the desktop's choices (Archive, Trash, Snooze, Move, More, Pin, Read/Unread, Star, Spam, Reply, Nothing) and its defaults: left for **Trash**, **Snooze** and **More**, right for **Archive** and **Read/Unread**. Up to three buttons a side; the first is what a full swipe does, and Nothing there turns that side off. **More** shows the press-and-hold actions. **Use the Desktop's Defaults** puts them back. They're kept on the phone, as each computer keeps its own (they don't sync). In Snoozed, Snooze becomes **Unsnooze**. Seen in the simulator with the demo accounts only.
 
 ## Sign in with Google
 
@@ -78,7 +80,7 @@ To set it up (done for timson.co on 2026-11-14):
 
 Debug launch options (*Edit Scheme > Run > Arguments*, or `xcrun simctl launch <device> co.timson.NightPost …`): `-demo` starts in the demo accounts; `-show thread|snooze|settings|add|folders|compose|new|move|html` opens that screen once the list loads, for screenshots. `-churn` reloads the list every second, as a long sync does. `-syncing` shows the sync spinner with a folder count.
 
-UI tests (`ios/NightPostUITests`, demo accounts only) tap and type in the composer, and file conversations from the Move sheet and tabs, as a finger would: `xcodebuild test -project ios/NightPost.xcodeproj -scheme NightPostUITests -destination 'id=<simulator>'`, or ⌘U in Xcode with that scheme.
+UI tests (`ios/NightPostUITests`, demo accounts only) tap and type in the composer, file conversations from the Move sheet and tabs, and check the swipes and Settings → Swipes, as a finger would: `xcodebuild test -project ios/NightPost.xcodeproj -scheme NightPostUITests -destination 'id=<simulator>'`, or ⌘U in Xcode with that scheme.
 
 ## Adding your accounts
 

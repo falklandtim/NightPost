@@ -271,6 +271,18 @@ final class MailModel {
         await act { try $0.trash(accountId: t.accountId, threadKey: t.threadKey) }
     }
 
+    /// Report as spam: into the account's Spam folder.
+    func spam(_ t: ThreadRow) async {
+        drop(t)
+        await act { try $0.spam(accountId: t.accountId, threadKey: t.threadKey) }
+    }
+
+    /// Reply to the newest email in `t` (the Reply swipe).
+    func reply(_ t: ThreadRow) async {
+        guard let id = await messages(t).last?.id else { return }
+        await startCompose(id, .reply)
+    }
+
     func snooze(_ t: ThreadRow, until: Date) async {
         drop(t)
         await act { try $0.snooze(accountId: t.accountId, threadKey: t.threadKey, until: Int64(until.timeIntervalSince1970)) }

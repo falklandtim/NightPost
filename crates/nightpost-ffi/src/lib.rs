@@ -414,6 +414,12 @@ impl Mail {
         self.move_to(account_id, &thread_key, FolderRole::Trash)
     }
 
+    /// Report a conversation as spam: move it to the account's Spam (or
+    /// Junk) folder, as the desktop's Spam swipe does.
+    pub fn spam(&self, account_id: i64, thread_key: String) -> Result<()> {
+        self.move_to(account_id, &thread_key, FolderRole::Spam)
+    }
+
     /// Hide a conversation until `until` (Unix seconds), on every device.
     pub fn snooze(&self, account_id: i64, thread_key: String, until: i64) -> Result<()> {
         let until = chrono::DateTime::from_timestamp(until, 0).ok_or_else(|| fail("that isn't a valid time"))?;

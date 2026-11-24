@@ -67,6 +67,10 @@ struct SettingsView: View {
                     Text("Swipe left on an account to remove it from this iPhone. The mail stays on the server.")
                 }
 
+                Section {
+                    NavigationLink { SwipeSettingsView() } label: { Label("Swipes", systemImage: "hand.draw") }
+                }
+
                 Section("Appearance") {
                     Picker("Appearance", selection: $appearance) {
                         ForEach(Appearance.allCases) { Text($0.title).tag($0) }

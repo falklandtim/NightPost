@@ -1,6 +1,6 @@
 // The message list: every account together (or one account's folder,
-// picked in Folders), with swipes as on the desktop (right to archive,
-// left to snooze), pull to refresh and search. Over an Inbox, the tabs
+// picked in Folders), with swipes chosen as on the desktop (Swipes.swift),
+// pull to refresh and search. Over an Inbox, the tabs
 // (TabStrip); pinned conversations in a section that can be hidden; press
 // and hold a conversation to move or label it (MoveSheet).
 
@@ -13,6 +13,10 @@ struct InboxView: View {
     @State private var foldersOpen = false
     @State private var debugAdd = false
     @State private var moving: ThreadRow?
+    /// The conversation whose More swipe is showing its actions.
+    @State private var more: ThreadRow?
+    @AppStorage(SwipeSide.leftKey) private var swipeLeft = SwipeSide.leftDefault.saved
+    @AppStorage(SwipeSide.rightKey) private var swipeRight = SwipeSide.rightDefault.saved
     /// Kept on this phone, like the desktop's Hide on each computer.
     @AppStorage("hidePinned") private var hidePinned = false
 
@@ -98,6 +102,10 @@ struct InboxView: View {
         .sheet(item: $moving) { t in
             MoveSheet(row: t)
         }
+        .sheet(item: $more) { t in
+            RowActionsSheet(row: t)
+                .presentationDetents([.medium])
+        }
         .sheet(isPresented: $settingsOpen) {
             SettingsView()
         }
@@ -134,35 +142,32 @@ struct InboxView: View {
                 }
             }
         }
-        .swipeActions(edge: .leading, allowsFullSwipe: true) {
-            if model.mailbox == .snoozed {
-                Button { Task { await model.unsnooze(t) } } label: { Label("Unsnooze", systemImage: "tray.and.arrow.down") }
-                    .tint(.blue)
-            } else {
-                Button { Task { await model.archive(t) } } label: { Label("Archive", systemImage: "archivebox") }
-                    .tint(.green)
-            }
-            Button { Task { await model.setRead(t, t.unread) } } label: {
-                Label(t.unread ? "Read" : "Unread", systemImage: t.unread ? "envelope.open" : "envelope.badge")
-            }
-            .tint(.blue)
-        }
-        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-            Button { snoozing = t } label: { Label("Snooze", systemImage: "clock") }
-                .tint(.orange)
-            Button(role: .destructive) { Task { await model.trash(t) } } label: { Label("Trash", systemImage: "trash") }
-            Button { Task { await model.setPinned(t, !t.pinned) } } label: { Label(t.pinned ? "Unpin" : "Pin", systemImage: t.pinned ? "pin.slash" : "pin") }
-                .tint(.yellow)
-        }
+        // A row dragged right shows the leading side; dragged left, the
+        // trailing one. The first button is the full swipe.
+        .swipeActions(edge: .leading, allowsFullSwipe: true) { swipes(swipeRight, SwipeSide.rightDefault, t) }
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) { swipes(swipeLeft, SwipeSide.leftDefault, t) }
         .contextMenu {
-            if !isDrafts {
-                Button { moving = t } label: { Label("Move or Label…", systemImage: "folder") }
-                Button { Task { await model.setPinned(t, !t.pinned) } } label: { Label(t.pinned ? "Unpin" : "Pin", systemImage: t.pinned ? "pin.slash" : "pin") }
-                Button { Task { await model.setStarred(t, !t.starred) } } label: { Label(t.starred ? "Unstar" : "Star", systemImage: t.starred ? "star.slash" : "star") }
-                Button { Task { await model.setRead(t, t.unread) } } label: { Label(t.unread ? "Mark as Read" : "Mark as Unread", systemImage: t.unread ? "envelope.open" : "envelope.badge") }
-            }
+            if !isDrafts { rowMenu(t) }
         }
         .listRowBackground(t.pinned ? Color.yellow.opacity(0.10) : nil)
+    }
+
+    private func swipes(_ saved: String, _ d: SwipeSide, _ t: ThreadRow) -> some View {
+        SwipeButtons(
+            side: SwipeSide(saved: saved, default: d), row: t,
+            inSnoozed: model.mailbox == .snoozed && model.folder == nil,
+            snooze: { snoozing = $0 }, move: { moving = $0 }, more: { more = $0 }
+        )
+    }
+
+    /// Press and hold: the conversation's other actions (the More swipe
+    /// shows the same in RowActionsSheet).
+    @ViewBuilder
+    private func rowMenu(_ t: ThreadRow) -> some View {
+        Button { moving = t } label: { Label("Move or Label…", systemImage: "folder") }
+        Button { Task { await model.setPinned(t, !t.pinned) } } label: { Label(t.pinned ? "Unpin" : "Pin", systemImage: t.pinned ? "pin.slash" : "pin") }
+        Button { Task { await model.setStarred(t, !t.starred) } } label: { Label(t.starred ? "Unstar" : "Star", systemImage: t.starred ? "star.slash" : "star") }
+        Button { Task { await model.setRead(t, t.unread) } } label: { Label(t.unread ? "Mark as Read" : "Mark as Unread", systemImage: t.unread ? "envelope.open" : "envelope.badge") }
     }
 
     /// Drafts (unified, or an account's Drafts folder) open in the composer.
