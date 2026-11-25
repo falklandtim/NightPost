@@ -69,6 +69,24 @@ final class OrganiseUITests: XCTestCase {
         XCTAssertTrue(row.waitForExistence(timeout: 5))
     }
 
+    /// A pinned row, for a look at its violet wash (as on the desktop): the
+    /// screenshot is kept with the test results. A colour can't be read
+    /// through accessibility, so this checks the pin took and leaves the
+    /// colour to the eye.
+    func testPinnedRowScreenshot() {
+        let app = launch()
+        XCTAssertTrue(tab(app, "All").waitForExistence(timeout: 10))
+        let cell = app.cells.element(boundBy: 1)
+        cell.press(forDuration: 1)
+        app.buttons["Pin"].tap()
+        if app.buttons["Show pinned"].waitForExistence(timeout: 2) { app.buttons["Show pinned"].tap() }
+        XCTAssertTrue(app.buttons["Hide pinned"].waitForExistence(timeout: 5))
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "pinned-row"
+        shot.lifetime = .keepAlways
+        add(shot)
+    }
+
     /// Press and hold, Move or Label…, a new folder: the conversation goes
     /// into it, out of the Inbox.
     func testMoveToANewFolder() {

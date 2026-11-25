@@ -41,7 +41,7 @@ ios/google-client-id.txt  the iOS OAuth client ID (not committed)
 5. **The SwiftUI app, first screens:**
    - a welcome screen: add an account (app password, with where to make one; a Provider picker for your own domain) or try the demo;
    - Settings (☰ menu): accounts (add, or swipe to remove from the phone), appearance (Match iPhone, Light, Dark), leave the demo, version;
-   - the list across all accounts: unread dot, pin, star, attachment and count badges, account colour, pinned rows tinted; swipes as on the desktop (see 12 below); pull to sync; search with the desktop's words; a menu for the other lists (Snoozed, Starred, Drafts, Sent, Archive, Trash);
+   - the list across all accounts: unread dot, pin, star, attachment and count badges, account colour, pinned rows tinted violet as on the desktop (deeper when unread); swipes as on the desktop (see 12 below); pull to sync; search with the desktop's words; a menu for the other lists (Snoozed, Starred, Drafts, Sent, Archive, Trash);
    - a conversation as cards, oldest first, in plain text, older read ones folded; archive, snooze, star, pin and trash at the bottom; opening it marks it read;
    - snooze: later today, this evening, tomorrow, this weekend, next week, or a date and time.
    

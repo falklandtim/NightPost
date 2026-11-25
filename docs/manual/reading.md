@@ -16,7 +16,7 @@ Emails that belong together (replies, and replies to replies) are shown as one c
 
 The list is grouped under headings: **Pinned**, **Today**, **Yesterday**, **Earlier this week**, **Last week**, then by month. **Hide** beside Pinned folds the pinned conversations away.
 
-Each row shows who's in the conversation, its subject and the start of its newest message (yours included), with the date. Unread conversations have a dot before the name and a light tint. Pinned conversations have a purple tint, which is deeper when they hold unread mail. A small box shows how many emails a conversation has, a star shows it's starred, and a paperclip shows it has attachments.
+Each row shows who's in the conversation, its subject and the start of its newest message (yours included), with the date. Unread conversations have a dot before the name and a light tint. Pinned conversations have a purple pin and a purple tint, which is deeper when they hold unread mail. A small box shows how many emails a conversation has, a star shows it's starred, and a paperclip shows it has attachments.
 
 Above the list:
 

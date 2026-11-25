@@ -37,13 +37,17 @@ fn unread_rows_are_tinted() {
             for (unread, what) in [(false, "read"), (true, "unread")] {
                 let want = pinned_wash(&col, false, unread);
                 let near = |p: &image::Rgba<u8>| (0..3).all(|c| (p[c] as i32 - want.to_array()[c] as i32).abs() <= 2);
-                assert!((0..img.height()).any(|y| near(img.get_pixel(x, y))), "{what} pinned rows are yellow ({name})");
+                assert!((0..img.height()).any(|y| near(img.get_pixel(x, y))), "{what} pinned rows are violet ({name})");
             }
+            // The pin itself is the full violet (it was the theme's amber).
+            let tint = PINNED_TINT.to_array();
+            let violet = |p: &image::Rgba<u8>| (0..3).all(|c| (p[c] as i32 - tint[c] as i32).abs() <= 6);
+            assert!(img.pixels().any(violet), "pinned rows show a violet pin ({name})");
         }
         // New mail in a pinned conversation stands out from the read ones,
         // as an unread row does from a read one: a stronger wash.
         let away = |c: egui::Color32| (0..3).map(|i| (c.to_array()[i] as i32 - col.list.to_array()[i] as i32).abs()).sum::<i32>();
-        assert!(away(pinned_wash(&col, false, true)) > away(pinned_wash(&col, false, false)) + 20, "unread pinned rows are a deeper yellow ({name})");
+        assert!(away(pinned_wash(&col, false, true)) > away(pinned_wash(&col, false, false)) + 20, "unread pinned rows are a deeper violet ({name})");
     }
 }
 

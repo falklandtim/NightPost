@@ -8,6 +8,7 @@ import SwiftUI
 
 struct InboxView: View {
     @Environment(MailModel.self) private var model
+    @Environment(\.colorScheme) private var colorScheme
     @State private var snoozing: ThreadRow?
     @State private var settingsOpen = false
     @State private var foldersOpen = false
@@ -159,7 +160,7 @@ struct InboxView: View {
         .contextMenu {
             if !isDrafts { rowMenu(t) }
         }
-        .listRowBackground(t.pinned ? Color.yellow.opacity(0.10) : nil)
+        .listRowBackground(t.pinned ? Color.pinnedWash(dark: colorScheme == .dark, unread: t.unread) : nil)
     }
 
     private func swipes(_ saved: String, _ d: SwipeSide, _ t: ThreadRow) -> some View {
@@ -259,7 +260,7 @@ struct ThreadRowView: View {
                         .font(.subheadline.weight(row.unread ? .semibold : .regular))
                         .lineLimit(1)
                     Spacer(minLength: 4)
-                    if row.pinned { Image(systemName: "pin.fill").foregroundStyle(.yellow) }
+                    if row.pinned { Image(systemName: "pin.fill").foregroundStyle(Color.pinnedTint) }
                     if row.hasAttachments { Image(systemName: "paperclip").foregroundStyle(.secondary) }
                     if row.starred { Image(systemName: "star.fill").foregroundStyle(.yellow) }
                     if row.count > 1 {

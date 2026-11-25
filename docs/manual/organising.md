@@ -56,7 +56,7 @@ Deleting asks first. On Gmail, the label goes but its mail stays in All Mail. On
 
 ## Pins
 
-Pin a conversation to keep it above everything else, in every list it appears in: press `p`, click the pin in the toolbar, or right-click → **Pin to top**. Pinned conversations have a purple tint, deeper when they hold unread mail. Press `p` again to unpin.
+Pin a conversation to keep it above everything else, in every list it appears in: press `p`, click the pin in the toolbar, or right-click → **Pin to top**. Pinned conversations have a purple pin and a purple tint, deeper when they hold unread mail. Press `p` again to unpin.
 
 ## Snooze
 

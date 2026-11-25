@@ -380,7 +380,8 @@ impl NightPostApp {
             });
         }
         if t.pinned {
-            let pin = if selected { fg } else { col.warning };
+            // The pin wears the rows' violet, as on the phone.
+            let pin = if selected { fg } else { PINNED_TINT };
             badge(p, 12.0, &|p, c| icons::paint(p, c, 12.0, Icon::PinFilled, pin));
         }
         let subject_font = egui::FontId::proportional(13.5);
@@ -713,9 +714,10 @@ pub(super) fn unread_wash(col: &Colors, hovered: bool) -> egui::Color32 {
     style::blend(col.sidebar_active, col.list, if hovered { base + 0.25 } else { base })
 }
 
-/// The colour pinned rows are washed with: a violet, the same in every
-/// theme (themes have no colour of their own for it).
-const PINNED_TINT: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x5c, 0xf6);
+/// The colour pinned rows are washed with, and their pin drawn in: a
+/// violet, the same in every theme (themes have no colour of their own for
+/// it). The iPhone's `Color.pinnedTint` is the same.
+pub(super) const PINNED_TINT: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x5c, 0xf6);
 
 /// A pinned row's background: a pale wash of [`PINNED_TINT`], deeper when
 /// it has unread mail. Pinned rows don't get the unread wash, so without

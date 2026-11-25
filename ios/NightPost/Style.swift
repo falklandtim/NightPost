@@ -38,6 +38,24 @@ struct Avatar: View {
 }
 
 extension Color {
+    /// Pinned rows are washed with this violet, and their pin drawn in it:
+    /// the desktop's PINNED_TINT (`crates/nightpost/src/app/list.rs`), the
+    /// same in every theme.
+    static let pinnedTint = Color(hex: "8b5cf6")
+
+    /// A pinned row's background, as strong as the desktop's: a pale wash,
+    /// deeper when the conversation has unread mail (pinned rows get no
+    /// other unread wash, so new mail would show only as the dot).
+    static func pinnedWash(dark: Bool, unread: Bool) -> Color {
+        let strength: Double = switch (dark, unread) {
+        case (true, false): 0.08
+        case (false, false): 0.10
+        case (true, true): 0.18
+        case (false, true): 0.24
+        }
+        return pinnedTint.opacity(strength)
+    }
+
     /// `#rrggbb`, as the core stores account colours; grey if unreadable.
     init(hex: String) {
         let s = hex.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
