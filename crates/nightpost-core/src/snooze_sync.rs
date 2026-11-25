@@ -25,6 +25,12 @@
 //! back to the Inbox and marks it unread. If another got there first, the
 //! conversation is no longer in the Snoozed folder and nothing happens twice.
 //!
+//! A sync can move other people's mail and cancel snoozes made elsewhere,
+//! so it only acts on what it has just seen: it syncs the Snoozed folder
+//! first, and if that fails it cancels, parks and releases nothing
+//! (`Local::folder_checked`). A state that can't be read is an error, never
+//! "nothing snoozed", and a copy it can't read is never deleted.
+//!
 //! NightPost was called OwlPost, and its folders were "OwlPost Snoozed" and
 //! "OwlPost Sync". The first NightPost to sync an account renames them on the
 //! server (`migrate_legacy_folders`), so snoozes, pins and tabs carry over.
@@ -32,6 +38,7 @@
 //! old names; NightPost hides them and sends any mail parked in the old
 //! Snoozed folder back to the Inbox, so nothing stays hidden there.
 
+use crate::activity::Level;
 use crate::engine;
 use crate::models::*;
 use crate::store::Store;
@@ -348,6 +355,12 @@ pub struct Local {
     pub ids: HashMap<String, Vec<String>>,
     /// Threads with a copy in the Snoozed folder.
     pub parked: HashSet<String>,
+    /// Whether `parked` was read from the server just now. When it wasn't,
+    /// nothing is cancelled, parked or released on its say-so: on 24 Nov
+    /// 2026 a phone whose first sync dropped after a few folders hadn't yet
+    /// downloaded the Snoozed folder, took every snooze for one taken out
+    /// of it elsewhere, and cancelled all ten on every device.
+    pub folder_checked: bool,
 }
 
 impl Local {
@@ -403,7 +416,9 @@ pub fn plan(mut state: State, local: &Local, now: i64) -> Plan {
                 (e.removed, e.updated) = (true, now);
             }
             // Taken out of the Snoozed folder elsewhere (e.g. on the phone).
-            Some(k) if !local.parked.contains(&k) && e.updated < now - GRACE_SECS => {
+            // Only when this machine has just looked in the folder (see
+            // `Local::folder_checked`).
+            Some(k) if local.folder_checked && !local.parked.contains(&k) && e.updated < now - GRACE_SECS => {
                 if local.snoozes.contains_key(&k) {
                     p.unsnooze.push(k);
                 }
@@ -437,13 +452,17 @@ pub fn plan(mut state: State, local: &Local, now: i64) -> Plan {
         }
         state.set(&ids, Some(*until), now);
         live.insert(k.clone());
-        if !local.parked.contains(k) {
+        if local.folder_checked && !local.parked.contains(k) {
             p.park.push(k.clone());
         }
     }
-    let mut stray: Vec<&String> = local.parked.iter().filter(|k| !live.contains(*k) && !p.wake.contains(k) && !p.release.contains(k)).collect();
-    stray.sort();
-    p.release.extend(stray.into_iter().cloned());
+    // Unknown to the server: back to the Inbox. Not when the folder wasn't
+    // checked: a stale copy of it isn't grounds for moving anyone's mail.
+    if local.folder_checked {
+        let mut stray: Vec<&String> = local.parked.iter().filter(|k| !live.contains(*k) && !p.wake.contains(k) && !p.release.contains(k)).collect();
+        stray.sort();
+        p.release.extend(stray.into_iter().cloned());
+    }
     if state != before {
         p.write = Some(State::merge([state], now));
     }
@@ -463,20 +482,43 @@ fn thread_ids(store: &Store, account: &Account, key: &str) -> Result<Vec<String>
 /// that has never snoozed has no state folder: empty.
 fn read_state(account: &Account) -> Result<(Vec<u32>, State)> {
     let mut s = engine::connect(account)?;
-    if s.select(STATE_FOLDER).is_err() {
-        let _ = s.logout();
-        return Ok((vec![], State::default()));
+    let r = read_state_in(&mut s);
+    let _ = s.logout();
+    r
+}
+
+/// The work of [`read_state`], on an open session.
+///
+/// Anything short of a clean read is an error, never an empty state: the
+/// caller would take empty to mean nothing is snoozed, send every snoozed
+/// conversation back to the Inbox, and the other machines would then cancel
+/// those snoozes. So a folder that won't open counts as missing only when
+/// the server says it isn't there, and a copy that can't be read (a newer
+/// NightPost's, perhaps) stops the sync instead of being skipped, which
+/// also keeps it from being deleted when the state is written back.
+fn read_state_in<T: std::io::Read + std::io::Write>(s: &mut imap::Session<T>) -> Result<(Vec<u32>, State)> {
+    if let Err(e) = s.select(STATE_FOLDER) {
+        // The imap crate sends LIST's pattern as is, so quote it (the name has spaces).
+        let listed = s.list(Some(""), Some(&format!("\"{STATE_FOLDER}\""))).map_err(|l| anyhow!("couldn't open {STATE_FOLDER}: {e} ({l})"))?;
+        if listed.is_empty() {
+            return Ok((vec![], State::default()));
+        }
+        return Err(anyhow!("couldn't open {STATE_FOLDER}: {e}"));
     }
-    let uids: Vec<u32> = s.uid_search("ALL")?.into_iter().collect();
+    let found: Vec<u32> = s.uid_search("ALL")?.into_iter().collect();
+    // Only copies actually read are returned for deleting: one the server
+    // listed but didn't send stays, to be merged next time.
+    let mut uids = Vec::new();
     let mut docs = Vec::new();
-    if !uids.is_empty() {
-        for f in s.uid_fetch(engine::uid_set(&uids), "(UID BODY.PEEK[])")?.iter() {
-            if let Some(st) = f.body().and_then(State::from_message) {
-                docs.push(st);
-            }
+    if !found.is_empty() {
+        for f in s.uid_fetch(engine::uid_set(&found), "(UID BODY.PEEK[])")?.iter() {
+            let st = f.body().and_then(State::from_message).ok_or_else(|| {
+                anyhow!("a copy of the snooze list in {STATE_FOLDER} couldn't be read (written by a newer NightPost?); leaving snoozes, pins and tabs as they are")
+            })?;
+            uids.extend(f.uid);
+            docs.push(st);
         }
     }
-    let _ = s.logout();
     Ok((uids, State::merge(docs, Utc::now().timestamp())))
 }
 
@@ -616,32 +658,11 @@ pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
     migrate_legacy_folders(store, account)?;
     release_legacy_snoozed(store, account);
     let snoozed = store.folders(account.id)?.into_iter().find(|f| f.path == SNOOZED_FOLDER);
-    let mut local = Local::default();
-    for (k, until) in store.account_snoozes(account.id)? {
-        local.snoozes.insert(k, until.timestamp());
-    }
-    if let Some(f) = &snoozed {
-        local.parked = store.thread_keys_in_folder(f.id)?.into_iter().collect();
-    }
+    // The folder before the state: see `local_view`.
+    let mut local = local_view(store, account, snoozed.as_ref())?;
     let (old, mut state) = read_state(account)?;
-    // Tabs and their rules: pool this machine's with the server's, keep the
-    // result here, and write it back if the server was missing anything.
     let now = Utc::now().timestamp();
-    let tabs = merge_tabs(state.tabs.iter().cloned().chain(store.all_tabs()?), now);
-    for t in &tabs {
-        store.put_tab(t)?;
-    }
-    let rules = merge_rules(state.senders.iter().cloned().chain(store.sender_rules()?), now);
-    for r in &rules {
-        store.put_sender_rule(r)?;
-    }
-    let threads = merge_thread_rules(state.threads.iter().cloned().chain(store.thread_rules()?), now);
-    for r in &threads {
-        store.put_thread_rule(r)?;
-    }
-    let (pins, pins_changed) = pool_pins(store, account.id, &state.pins, now)?;
-    let rules_changed = rules != state.senders || tabs != state.tabs || threads != merge_thread_rules(state.threads.clone(), now) || pins_changed;
-    (state.senders, state.tabs, state.threads, state.pins) = (rules, tabs, threads, pins);
+    let rules_changed = pool_tabs_and_pins(store, account, &mut state, now)?;
     // Never snoozed anywhere: nothing else to do.
     if local.snoozes.is_empty() && local.parked.is_empty() && state.entries.iter().all(|e| e.removed) {
         if rules_changed {
@@ -665,19 +686,79 @@ pub fn sync_snoozes(store: &Store, account: &Account) -> Result<usize> {
         }
     }
     let p = plan(state, &local, now);
+    if !p.unsnooze.is_empty() || !p.release.is_empty() {
+        // Snoozes changing without a word made the 24 Nov 2026 loss hard to trace.
+        store.note(Some(account.id), Level::Info, format!("Snoozes: {} cancelled elsewhere, {} back in the Inbox", p.unsnooze.len(), p.release.len()));
+    }
     if let Some(st) = &p.write {
         write_state(store, account, &old, st)?;
     } else if rules_changed {
         write_state(store, account, &old, &unplanned)?;
     }
+    carry_out(store, account, snoozed, &p, &local)
+}
+
+/// This machine's snoozes and what's in the Snoozed folder, after syncing
+/// the folder from the server (see `Local::folder_checked`).
+///
+/// Called before the state is read: a snooze made elsewhere in between is
+/// then in the state but not yet in our copy of the folder, which the grace
+/// period allows for. The other way round, it would be in the folder but
+/// not in the state, and go back to the Inbox.
+fn local_view(store: &Store, account: &Account, snoozed: Option<&Folder>) -> Result<Local> {
+    let folder_checked = match snoozed {
+        Some(f) => match engine::sync_folder_now(store, account, f) {
+            Ok(_) => true,
+            Err(e) => {
+                store.note(Some(account.id), Level::Warn, format!("Couldn't check {SNOOZED_FOLDER}, so no snoozes were cancelled this time: {e:#}"));
+                false
+            }
+        },
+        None => false,
+    };
+    let mut local = Local { folder_checked, ..Local::default() };
+    for (k, until) in store.account_snoozes(account.id)? {
+        local.snoozes.insert(k, until.timestamp());
+    }
+    if let Some(f) = snoozed {
+        local.parked = store.thread_keys_in_folder(f.id)?.into_iter().collect();
+    }
+    Ok(local)
+}
+
+/// Tabs, their rules and pins: pool this machine's with the server's, keep
+/// the result here and in `state`. Returns whether the server was missing
+/// anything, so the state needs writing back.
+fn pool_tabs_and_pins(store: &Store, account: &Account, state: &mut State, now: i64) -> Result<bool> {
+    let tabs = merge_tabs(state.tabs.iter().cloned().chain(store.all_tabs()?), now);
+    for t in &tabs {
+        store.put_tab(t)?;
+    }
+    let rules = merge_rules(state.senders.iter().cloned().chain(store.sender_rules()?), now);
+    for r in &rules {
+        store.put_sender_rule(r)?;
+    }
+    let threads = merge_thread_rules(state.threads.iter().cloned().chain(store.thread_rules()?), now);
+    for r in &threads {
+        store.put_thread_rule(r)?;
+    }
+    let (pins, pins_changed) = pool_pins(store, account.id, &state.pins, now)?;
+    let changed = rules != state.senders || tabs != state.tabs || threads != merge_thread_rules(state.threads.clone(), now) || pins_changed;
+    (state.senders, state.tabs, state.threads, state.pins) = (rules, tabs, threads, pins);
+    Ok(changed)
+}
+
+/// Do what `plan` decided, here and on the server, once the state is
+/// written. Returns how many woke.
+fn carry_out(store: &Store, account: &Account, snoozed: Option<Folder>, p: &Plan, local: &Local) -> Result<usize> {
     for (k, until) in &p.snooze {
         store.snooze(account.id, k, DateTime::from_timestamp(*until, 0).unwrap_or_default())?;
     }
     for k in &p.unsnooze {
         store.unsnooze(account.id, k)?;
     }
-    let snoozed = match (&snoozed, p.park.is_empty()) {
-        (Some(f), _) => Some(f.clone()),
+    let snoozed = match (snoozed, p.park.is_empty()) {
+        (Some(f), _) => Some(f),
         (None, false) => Some(snoozed_folder(store, account)?),
         (None, true) => None,
     };
@@ -1099,6 +1180,7 @@ mod tests {
             snoozes: snoozes.iter().map(|(k, u)| (k.to_string(), *u)).collect(),
             parked: parked.iter().map(|k| k.to_string()).collect(),
             ids: threads.iter().map(|(k, i)| (k.to_string(), ids(i))).collect(),
+            folder_checked: true,
         }
     }
 
@@ -1151,6 +1233,62 @@ mod tests {
         let fresh = State { version: 1, entries: vec![entry(&["m1"], NOW + 3600, NOW - 30, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
         let p = plan(fresh, &local(&[("t1", NOW + 3600)], &[], &[("t1", &["m1"])]), NOW);
         assert!(p.unsnooze.is_empty() && p.write.is_none());
+    }
+
+    #[test]
+    fn an_unchecked_snoozed_folder_cancels_and_moves_nothing() {
+        // The phone on 24 Nov 2026: it had the conversation from another
+        // folder, but hadn't downloaded the Snoozed folder yet.
+        let st = State { version: 1, entries: vec![entry(&["m1"], NOW + 86_400, NOW - 3600, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
+        let mut l = local(&[("t2", NOW + 3600)], &["t9"], &[("t1", &["m1"]), ("t2", &["m2"]), ("t9", &["m9"])]);
+        l.folder_checked = false;
+        let p = plan(st, &l, NOW);
+        assert!(p.unsnooze.is_empty(), "nothing cancelled: {p:?}");
+        assert!(p.release.is_empty() && p.park.is_empty(), "no mail moved: {p:?}");
+        // The snooze still shows here, and the local one still goes up.
+        assert_eq!(p.snooze, vec![("t1".into(), NOW + 86_400)]);
+        let w = p.write.expect("the local snooze is uploaded");
+        assert!(w.entries.iter().all(|e| !e.removed), "no tombstones: {w:?}");
+    }
+
+    /// Read the state through a pretend server that gives these replies
+    /// after the login.
+    fn read_scripted(replies: &str) -> Result<(Vec<u32>, State)> {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let all = format!("a1 OK logged in\r\n{replies}");
+        let script = crate::engine::tests_support::Script::new(all.as_bytes(), sent);
+        let mut s = imap::Client::new(script).login("u", "p").map_err(|e| e.0)?;
+        read_state_in(&mut s)
+    }
+
+    fn fetched(uid: u32, raw: &[u8]) -> String {
+        format!("* {uid} FETCH (UID {uid} BODY[] {{{}}}\r\n{})\r\n", raw.len(), String::from_utf8_lossy(raw))
+    }
+
+    #[test]
+    fn a_missing_state_folder_means_nothing_snoozed() {
+        let (uids, st) = read_scripted("a2 NO [NONEXISTENT] no such folder\r\na3 OK listed\r\n").unwrap();
+        assert!(uids.is_empty() && st.entries.is_empty());
+    }
+
+    #[test]
+    fn a_state_folder_that_wont_open_is_an_error() {
+        let r = read_scripted("a2 NO server busy\r\n* LIST (\\HasNoChildren) \"/\" \"NightPost Sync\"\r\na3 OK listed\r\n");
+        assert!(r.is_err(), "{r:?}");
+        // A connection gone entirely: no answer to the LIST either.
+        assert!(read_scripted("a2 NO server busy\r\n").is_err());
+    }
+
+    #[test]
+    fn an_unreadable_copy_stops_the_sync() {
+        let good = State { version: 1, entries: vec![entry(&["m1"], NOW + 60, NOW, false)], senders: vec![], tabs: vec![], threads: vec![], pins: vec![] };
+        let good = good.to_message(Utc::now());
+        let head = "* 2 EXISTS\r\na2 OK [READ-WRITE] selected\r\n* SEARCH 5 6\r\na3 OK searched\r\n";
+        let (uids, st) = read_scripted(&format!("{head}{}a4 OK fetched\r\n", fetched(5, &good))).unwrap();
+        assert_eq!((uids, st.entries.len()), (vec![5], 1));
+        let junk = b"From: someone\r\nSubject: hello\r\n\r\nnot a state\r\n";
+        let r = read_scripted(&format!("{head}{}{}a4 OK fetched\r\n", fetched(5, &good), fetched(6, junk)));
+        assert!(r.is_err(), "an unreadable copy must not be skipped (it would be deleted): {r:?}");
     }
 
     #[test]

@@ -154,7 +154,7 @@ Inline (cid:) images in the app's HTML view (the MCP `view_message` tool does in
 
 Each account gets two extra folders (labels on Gmail):
 
-- **NightPost Snoozed** holds snoozed conversations until they wake. Other mail apps show the folder, so you can find snoozed mail there. Moving a conversation out of it elsewhere (on your phone, say) cancels the snooze.
+- **NightPost Snoozed** holds snoozed conversations until they wake. Other mail apps show the folder, so you can find snoozed mail there. Moving a conversation out of it elsewhere (on your phone, say) cancels the snooze. NightPost checks the folder on the server before deciding that, so a sync that was cut short (a phone losing its connection, say) never cancels snoozes. If it can't check the folder, or can't read the snooze list, it leaves your snoozes alone and says so in the activity log, which also records snoozes cancelled elsewhere.
 - **NightPost Sync** holds one small message, "NightPost snoozes", listing each snooze by Message-ID with its wake time, plus your pins, inbox tabs and sorting rules. Leave it alone. NightPost hides both folders and never shows the message as mail.
 
 NightPost used to be called OwlPost, and these folders were **OwlPost Snoozed** and **OwlPost Sync**. The first NightPost to sync an account renames them on the server, so snoozes, pins, tabs and rules carry over; if the rename fails, snooze sync waits and tries again rather than guess. An OwlPost that hasn't been updated makes new, empty folders under the old names; NightPost hides them, and sends any mail that OwlPost snoozes into its old folder back to the Inbox, so nothing stays out of sight. Update every copy (each computer, the MCP server, the iPhone app) to keep snoozes in step.
